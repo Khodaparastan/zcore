@@ -1,0 +1,9 @@
+---
+description: A complete, modular, and cross-platform ZSH configuration designed for developers, system administrators, and DevOps professionals.
+globs:
+alwaysApply: true
+---
+# File structure
+
+modules are at @modules/
+main config @.zshrc

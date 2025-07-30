@@ -1,0 +1,1407 @@
+#!/usr/bin/env zsh
+# vim: set ft=zsh ts=2 sw=2 et:
+
+# ============================================
+# Enhanced Cross-Platform Network Info Aliases (net.*)
+# ============================================
+# Compatible with: Linux, macOS, FreeBSD, OpenBSD, NetBSD
+# Requires: zsh 5+
+# Version: 2.5 (Refactored with audit fixes: locking, optimizations, bug fixes)
+# ============================================
+
+# Global configuration
+typeset -g NET_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/net-tools"
+typeset -g NET_CACHE_FILE="$NET_CONFIG_DIR/cache"
+typeset -g NET_DEBUG="${NET_DEBUG:-0}"
+typeset -g NET_COLOR="${NET_COLOR:-auto}"
+typeset -g NET_TIMEOUT="${NET_TIMEOUT:-30}"
+
+# Ensure config directory exists with proper permissions
+[[ ! -d "$NET_CONFIG_DIR" ]] && mkdir -p "$NET_CONFIG_DIR" && chmod 700 "$NET_CONFIG_DIR"
+
+# ============================================
+# Core Utility Functions
+# ============================================
+
+# --- Logging and output functions ---
+_net_log() {
+  local level="$1"
+  shift
+  local message="$*"
+
+  case "$level" in
+  DEBUG) [[ $NET_DEBUG -ge 2 ]] && { local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"; echo "[DEBUG $timestamp] $message" >&2; } ;;
+  INFO) [[ $NET_DEBUG -ge 1 ]] && { local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"; echo "[INFO  $timestamp] $message" >&2; } ;;
+  WARN) local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"; echo "[WARN  $timestamp] $message" >&2 ;;
+  ERROR) local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"; echo "[ERROR $timestamp] $message" >&2 ;;
+  esac
+}
+
+# --- Color output support ---
+_net_color() {
+  local color="$1"
+  shift
+  local text="$*"
+
+  if [[ "$NET_COLOR" == "never" ]] || [[ "$NET_COLOR" == "auto" && ! -t 1 ]]; then
+    print -r -- "$text"
+    return
+  fi
+
+  case "$color" in
+  red) print -P "%F{red}$text%f" ;;
+  green) print -P "%F{green}$text%f" ;;
+  yellow) print -P "%F{yellow}$text%f" ;;
+  blue) print -P "%F{blue}$text%f" ;;
+  bold) print -P "%B$text%b" ;;
+  *) print -r -- "$text" ;;
+  esac
+}
+
+# --- Input validation and sanitization ---
+_net_validate_input() {
+  local input="$1"
+  local type="${2:-hostname}"
+
+  # Sanitize input to prevent injection
+  input="${input//[^a-zA-Z0-9.:-]/}"
+
+  case "$type" in
+  hostname)
+    if [[ ! "$input" =~ ^[a-zA-Z0-9.-]+$ ]]; then  # Simplified for common cases; IDNs not supported
+      _net_log ERROR "Invalid hostname: $input"
+      return 1
+    fi
+    ;;
+  ip)
+    if [[ "$input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      # Validate IPv4 octets
+      local octets=("${(@s/./)input}")
+      for o in "${octets[@]}"; do
+        (( o >= 0 && o <= 255 )) || {
+          _net_log ERROR "Invalid IPv4 address: $input"
+          return 1
+        }
+      done
+    elif [[ "$input" =~ ^[0-9a-fA-F:]+$ ]]; then
+      # Simplified IPv6 validation (handles common patterns, compression)
+      if [[ ! "$input" =~ ^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-fA-F]{1,4}:){1,4}:([0-9]{1,3}\.){3}[0-9]{1,3})$ ]]; then
+        _net_log ERROR "Invalid IPv6 address: $input"
+        return 1
+      fi
+    else
+      _net_log ERROR "Invalid IP address: $input"
+      return 1
+    fi
+    ;;
+  port)
+    if [[ ! "$input" =~ ^[0-9]+$ ]] || (( input < 1 || input > 65535 )); then
+      _net_log ERROR "Invalid port number: $input"
+      return 1
+    fi
+    ;;
+  target)  # New type: hostname or IP
+    _net_validate_input "$input" hostname && return 0
+    _net_validate_input "$input" ip && return 0
+    return 1
+    ;;
+  esac
+  return 0
+}
+
+# --- Safe command execution with timeout ---
+_net_exec() {
+  local timeout_duration="$NET_TIMEOUT"
+  local cmd=("$@")
+
+  _net_log DEBUG "Executing: ${cmd[*]}"
+
+  if command -v timeout >/dev/null 2>&1; then
+    command timeout "$timeout_duration" "${cmd[@]}" || return $?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    command gtimeout "$timeout_duration" "${cmd[@]}" || return $?
+  else
+    _net_log WARN "No timeout tool available; running without timeout"
+    "${cmd[@]}" || return $?
+  fi
+}
+
+# --- Enhanced OS detection with caching ---
+_net_get_os() {
+  local cache_file="$NET_CACHE_FILE"
+  local cache_key="os_type"
+  local lock_file="$cache_file.lock"
+
+  # Ensure cache file permissions
+  [[ -f "$cache_file" ]] || touch "$cache_file" && chmod 600 "$cache_file"
+
+  # Use flock for locking if available, else fallback
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_file"
+    flock -x 9 || { _net_log ERROR "Failed to lock cache"; return 1; }
+  fi
+
+  # Atomic read/write with temp
+  local tmp_cache="$(mktemp "${cache_file}.XXXXXX")" || { _net_log ERROR "Failed to create temp cache"; return 1; }
+  trap "rm -f '$tmp_cache' '$lock_file'" EXIT
+  cp "$cache_file" "$tmp_cache" 2>/dev/null
+
+  # Check cache first
+  local cached_os
+  cached_os="$(awk -F= -v key="$cache_key" '$1 == key {print substr($0, index($0,$2)); exit}' "$tmp_cache" 2>/dev/null)"
+
+  # Validate cached value
+  if [[ -n "$cached_os" ]] && [[ "$cached_os" =~ ^(Linux|macOS|FreeBSD|OpenBSD|NetBSD|Unknown)$ ]]; then
+    _net_log DEBUG "Valid cached OS: $cached_os"
+    echo "$cached_os"
+    return 0
+  elif [[ -n "$cached_os" ]]; then
+    _net_log WARN "Invalid cached OS value: $cached_os - recomputing and recaching"
+  fi
+
+  local os_type
+  case "$(uname -s)" in
+  Linux*) os_type="Linux" ;;
+  Darwin*) os_type="macOS" ;;
+  FreeBSD*) os_type="FreeBSD" ;;
+  OpenBSD*) os_type="OpenBSD" ;;
+  NetBSD*) os_type="NetBSD" ;;
+  *) os_type="Unknown" ;;
+  esac
+
+  # Cache uniquely if valid
+  grep -v "^$cache_key=" "$tmp_cache" > "${tmp_cache}.new" 2>/dev/null
+  echo "$cache_key=$os_type" >> "${tmp_cache}.new"
+  mv "${tmp_cache}.new" "$cache_file"
+  _net_log DEBUG "Cached OS type: $os_type"
+
+  echo "$os_type"
+}
+
+# --- Tool availability detection with caching ---
+_net_has_tool() {
+  local tool="$1"
+  local cache_file="$NET_CACHE_FILE"
+  local cache_key="tool_$tool"
+  local lock_file="$cache_file.lock"
+
+  # Use flock for locking if available
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_file"
+    flock -x 9 || { _net_log ERROR "Failed to lock cache"; return 1; }
+  fi
+
+  local tmp_cache="$(mktemp "${cache_file}.XXXXXX")" || { _net_log ERROR "Failed to create temp cache"; return 1; }
+  trap "rm -f '$tmp_cache' '$lock_file'" EXIT
+  cp "$cache_file" "$tmp_cache" 2>/dev/null
+
+  # Check cache first
+  local cached_result
+  cached_result="$(awk -F= -v key="$cache_key" '$1 == key {print substr($0, index($0,$2)); exit}' "$tmp_cache" 2>/dev/null)"
+
+  # Validate cached value
+  if [[ -n "$cached_result" ]] && [[ "$cached_result" =~ ^[01]$ ]]; then
+    _net_log DEBUG "Valid cached tool: $tool=$cached_result"
+    [[ "$cached_result" == "1" ]]
+    return $?
+  elif [[ -n "$cached_result" ]]; then
+    _net_log WARN "Invalid cached tool value for $tool: $cached_result - recomputing and recaching"
+  fi
+
+  local result=0
+  if command -v "$tool" >/dev/null 2>&1; then
+    result=1
+  fi
+
+  # Cache uniquely
+  grep -v "^$cache_key=" "$tmp_cache" > "${tmp_cache}.new" 2>/dev/null
+  echo "$cache_key=$result" >> "${tmp_cache}.new"
+  mv "${tmp_cache}.new" "$cache_file"
+  _net_log DEBUG "Cached tool availability: $tool=$result"
+
+  [[ $result -eq 1 ]]
+}
+
+# --- Privilege escalation check ---
+_net_need_sudo() {
+  local operation="$1"
+  if [[ $EUID -eq 0 ]]; then
+    return 1 # Already root
+  fi
+
+  case "$operation" in
+  lsof | ss | netstat | pfctl | ufw | firewall-cmd | dscacheutil | killall | resolvectl | systemd-resolve | systemctl | rcctl | ipfw)
+    return 0 # Needs sudo
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# --- Execute command with appropriate privileges ---
+_net_exec_priv() {
+  local operation="$1"
+  shift
+  local cmd=("$@")
+
+  if _net_need_sudo "$operation"; then
+    if ! command sudo -n true 2>/dev/null; then
+      if [[ ! -t 0 ]]; then  # Non-interactive: skip prompt, fail
+        _net_log ERROR "Non-interactive session; cannot prompt for sudo"
+        return 1
+      fi
+      _net_color yellow "This operation requires administrator privileges."
+      _net_color yellow "Command will be executed with sudo (password may be prompted)."
+      echo -n "Proceed? [y/N]: "
+      local response
+      read -r response
+      if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        _net_log INFO "Operation cancelled by user"
+        return 1
+      fi
+    fi
+    _net_exec command sudo "${cmd[@]}" || return $?
+  else
+    _net_exec "${cmd[@]}" || return $?
+  fi
+}
+
+# ============================================
+# Enhanced Network Information Functions
+# ============================================
+
+# --- Function to show IP addresses with enhanced formatting ---
+_net_show_ip() {
+  local os="$(_net_get_os)"
+  local show_ipv6="${1:-true}"
+
+  _net_color bold "Network Interface IP Addresses"
+  printf "%s\n" "=============================="
+
+  case "$os" in
+  macOS)
+    if _net_has_tool ifconfig; then
+      command ifconfig | awk '
+        /^[a-z]/ { iface=$1; gsub(/:$/, "", iface); if (iface == "lo0") next }  # Exclude loopback
+        /inet / && !/127\.0\.0\.1/ { printf "%-12s IPv4: %s\n", iface, $2 }
+        /inet6 / && !/::1/ && !/fe80:/ { if ("'"$show_ipv6"'" == "true") printf "%-12s IPv6: %s\n", iface, $2 }
+        /status: active/ { printf "%-12s Status: %s\n", iface, "UP" }
+        /status: inactive/ { printf "%-12s Status: %s\n", iface, "DOWN" }
+      '
+    else
+      _net_log ERROR "ifconfig not available"
+      _net_color red "Error: ifconfig not available"
+      return 1
+    fi
+    ;;
+  Linux)
+    if _net_has_tool ip; then
+      command ip -br addr show | awk '
+        {
+          iface = $1; if (iface == "lo") next  # Exclude loopback
+          status = $2
+          ips = ""
+          for (i=3; i<=NF; i++) {
+            if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
+              if ($i !~ /127\.0\.0\.1/) ips = ips (ips ? " " : "") "IPv4: " $i
+            } else if ($i ~ /:/ && "'"${show_ipv6}"'" == "true") {
+              if ($i !~ /::1/ && $i !~ /fe80:/) ips = ips (ips ? " " : "") "IPv6: " $i
+            }
+          }
+          if (ips) printf "%-12s %s (Status: %s)\n", iface, ips, status
+        }
+      '
+    elif _net_has_tool ifconfig; then
+      command ifconfig | awk '
+        /^[a-z]/ { iface=$1; gsub(/:$/, "", iface); if (iface == "lo") next }  # Exclude loopback
+        /inet / && !/127\.0\.0\.1/ { printf "%-12s IPv4: %s\n", iface, $2 }
+        /inet6 / && !/::1/ && !/fe80:/ { if ("'"$show_ipv6"'" == "true") printf "%-12s IPv6: %s\n", iface, $2 }
+      '
+    else
+      _net_log ERROR "Neither ip nor ifconfig available"
+      _net_color red "Error: Neither ip nor ifconfig available"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if _net_has_tool ifconfig; then
+      command ifconfig | awk '
+        /^[a-z]/ { iface=$1; gsub(/:$/, "", iface); if (iface == "lo0") next }  # Exclude loopback
+        /inet / && !/127\.0\.0\.1/ { printf "%-12s IPv4: %s\n", iface, $2 }
+        /inet6 / && !/::1/ && !/fe80:/ { if ("'"$show_ipv6"'" == "true") printf "%-12s IPv6: %s\n", iface, $2 }
+      '
+    else
+      _net_log ERROR "ifconfig not available"
+      _net_color red "Error: ifconfig not available"
+      return 1
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Function to show interface statistics ---
+_net_show_stats() {
+  local os="$(_net_get_os)"
+  local interface="${1:-}"
+
+  _net_color bold "Network Interface Statistics"
+  printf "%s\n" "============================"
+
+  case "$os" in
+  macOS)
+    if [[ -n "$interface" ]]; then
+      command netstat -I "$interface" -b
+    else
+      command netstat -i -b
+    fi
+    ;;
+  Linux)
+    if [[ -n "$interface" ]]; then
+      if [[ -f "/sys/class/net/$interface/statistics/rx_bytes" ]]; then
+        local rx_bytes="$(cat "/sys/class/net/$interface/statistics/rx_bytes")"
+        local tx_bytes="$(cat "/sys/class/net/$interface/statistics/tx_bytes")"
+        local rx_packets="$(cat "/sys/class/net/$interface/statistics/rx_packets")"
+        local tx_packets="$(cat "/sys/class/net/$interface/statistics/tx_packets")"
+
+        printf "Interface: %s\n" "$interface"
+        printf "RX Bytes:  %d\n" "$rx_bytes"
+        printf "TX Bytes:  %d\n" "$tx_bytes"
+        printf "RX Packets: %d\n" "$rx_packets"
+        printf "TX Packets: %d\n" "$tx_packets"
+      else
+        _net_log ERROR "Interface $interface not found"
+        _net_color red "Error: Interface $interface not found"
+        return 1
+      fi
+    else
+      cat /proc/net/dev | awk '
+        NR>2 {
+          gsub(/:/, "", $1)
+          if ($1 == "lo") next  # Exclude loopback
+          printf "%-12s RX: %d bytes %d packets  TX: %d bytes %d packets\n",
+                 $1, $2, $3, $10, $11
+        }
+      '
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if [[ -n "$interface" ]]; then
+      command netstat -I "$interface" -b
+    else
+      command netstat -i -b
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced function to show interface link status ---
+_net_show_links() {
+  local os="$(_net_get_os)"
+  local show_details="${1:-false}"
+
+  _net_color bold "Network Interface Link Status"
+  printf "%s\n" "============================="
+
+  case "$os" in
+  macOS)
+    if [[ "$show_details" == "true" ]]; then
+      command networksetup -listallhardwareports
+    else
+      command ifconfig -a | awk '
+        BEGIN { iface = ""; status = "DOWN" }
+        /^[a-z]/ {
+          if (iface != "") { if (iface != "lo0") printf "%-12s %s\n", iface, status }  # Exclude loopback
+          iface = $1; gsub(/:$/, "", iface)
+          status = "DOWN"
+        }
+        /status: active/ { status = "UP" }
+        /status: inactive/ { status = "DOWN" }
+        /flags=/ && /UP/ { if (status == "DOWN") status = "UP" }
+        END { if (iface != "" && iface != "lo0") printf "%-12s %s\n", iface, status }
+      '
+    fi
+    ;;
+  Linux)
+    if _net_has_tool ip; then
+      if [[ "$show_details" == "true" ]]; then
+        command ip -details link show
+      else
+        command ip link show | awk '
+          /^[0-9]+:/ {
+            gsub(/:$/, "", $2)
+            iface = $2; if (iface == "lo") next  # Exclude loopback
+          }
+          /state / { status = $9 }
+          /link\// { if (iface) printf "%-12s %s\n", iface, (status ? status : "UNKNOWN") }
+        '
+      fi
+    elif _net_has_tool ifconfig; then
+      command ifconfig -a | awk '
+        BEGIN { iface = ""; status = "DOWN" }
+        /^[a-z]/ {
+          if (iface != "") { if (iface != "lo") printf "%-12s %s\n", iface, status }  # Exclude loopback
+          iface = $1; gsub(/:$/, "", iface)
+          status = "DOWN"
+        }
+        /UP/ && /RUNNING/ { status = "UP" }
+        END { if (iface != "" && iface != "lo") printf "%-12s %s\n", iface, status }
+      '
+    else
+      _net_log ERROR "Neither ip nor ifconfig available"
+      _net_color red "Error: Neither ip nor ifconfig available"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    command ifconfig -a | awk '
+      BEGIN { iface = ""; status = "DOWN" }
+      /^[a-z]/ {
+        if (iface != "") { if (iface != "lo0") printf "%-12s %s\n", iface, status }  # Exclude loopback
+        iface = $1; gsub(/:$/, "", iface)
+        status = "DOWN"
+      }
+      /flags=/ && /UP/ { status = "UP" }
+      END { if (iface != "" && iface != "lo0") printf "%-12s %s\n", iface, status }
+    '
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced routing table display ---
+_net_show_routes() {
+  local os="$(_net_get_os)"
+  local family="${1:-all}" # all, ipv4, ipv6
+
+  _net_color bold "Routing Table"
+  printf "%s\n" "============="
+
+  case "$os" in
+  macOS)
+    if ! _net_has_tool netstat; then
+      _net_log ERROR "netstat not available"
+      _net_color red "Error: netstat not available"
+      return 1
+    fi
+    case "$family" in
+    ipv4) command netstat -rn -f inet ;;
+    ipv6) command netstat -rn -f inet6 ;;
+    *) command netstat -rn ;;
+    esac
+    ;;
+  Linux)
+    if _net_has_tool ip; then
+      case "$family" in
+      ipv4) command ip -4 route show ;;
+      ipv6) command ip -6 route show ;;
+      *)
+        command ip route show
+        echo
+        command ip -6 route show
+        ;;
+      esac
+    elif _net_has_tool route; then
+      command route -n
+    else
+      _net_log ERROR "Neither ip nor route available"
+      _net_color red "Error: Neither ip nor route available"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if ! _net_has_tool netstat; then
+      _net_log ERROR "netstat not available"
+      _net_color red "Error: netstat not available"
+      return 1
+    fi
+    case "$family" in
+    ipv4) command netstat -rn -f inet ;;
+    ipv6) command netstat -rn -f inet6 ;;
+    *) command netstat -rn ;;
+    esac
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced default gateway display ---
+_net_show_gw() {
+  local os="$(_net_get_os)"
+  local family="${1:-ipv4}" # ipv4, ipv6, all
+
+  _net_color bold "Default Gateway Information"
+  printf "%s\n" "==========================="
+
+  case "$os" in
+  macOS)
+    if ! _net_has_tool netstat; then
+      _net_log ERROR "netstat not available"
+      _net_color red "Error: netstat not available"
+      return 1
+    fi
+    case "$family" in
+    ipv4) command netstat -rn -f inet | grep '^default' ;;
+    ipv6) command netstat -rn -f inet6 | grep '^default' ;;
+    *) command netstat -rn | grep '^default' ;;
+    esac
+    ;;
+  Linux)
+    if _net_has_tool ip; then
+      case "$family" in
+      ipv4) command ip -4 route show default ;;
+      ipv6) command ip -6 route show default ;;
+      *)
+        printf "%s\n" "IPv4 Default Routes:"
+        command ip -4 route show default
+        printf "\n%s\n" "IPv6 Default Routes:"
+        command ip -6 route show default
+        ;;
+      esac
+    elif _net_has_tool route; then
+      command route -n | grep '^0\.0\.0\.0'
+    else
+      _net_log ERROR "Neither ip nor route available"
+      _net_color red "Error: Neither ip nor route available"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if ! _net_has_tool netstat; then
+      _net_log ERROR "netstat not available"
+      _net_color red "Error: netstat not available"
+      return 1
+    fi
+    case "$family" in
+    ipv4) command netstat -rn -f inet | grep '^default' ;;
+    ipv6) command netstat -rn -f inet6 | grep '^default' ;;
+    *) command netstat -rn | grep '^default' ;;
+    esac
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced DNS configuration display ---
+_net_show_dns() {
+  local os="$(_net_get_os)"
+  local detailed="${1:-false}"
+
+  _net_color bold "DNS Configuration"
+  printf "%s\n" "================="
+
+  case "$os" in
+  macOS)
+    if [[ "$detailed" == "true" ]]; then
+      printf "%s\n" "DNS Servers (via scutil):"
+      command scutil --dns | grep -E 'nameserver|domain|search'
+      printf "\n%s\n" "DNS Servers (per network service):"
+      command networksetup -listallnetworkservices | grep -v '^\*' | while IFS= read -r service; do
+        printf "\n%s:\n" "$service"
+        command networksetup -getdnsservers "$service" 2>/dev/null || echo "  No DNS servers configured"
+        local search_domains="$(command networksetup -getsearchdomains "$service" 2>/dev/null)"
+        [[ -n "$search_domains" && ! "$search_domains" =~ "There aren't any" ]] && echo "  Search domains: $search_domains"
+      done
+    else
+      command scutil --dns | grep 'nameserver\[' | awk '{print $3}' | sort -u
+    fi
+    ;;
+  Linux)
+    if _net_has_tool resolvectl; then
+      if [[ "$detailed" == "true" ]]; then
+        command resolvectl status
+      else
+        command resolvectl dns | grep -v '^Link' | awk '{for(i=2;i<=NF;i++) print $i}' | sort -u
+      fi
+    elif [[ -f /etc/resolv.conf ]]; then
+      if [[ "$detailed" == "true" ]]; then
+        printf "%s\n" "DNS Configuration (/etc/resolv.conf):"
+        cat /etc/resolv.conf
+      else
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}'
+      fi
+    else
+      _net_log ERROR "No DNS resolution method found"
+      _net_color red "Error: No DNS resolution method found"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if [[ -f /etc/resolv.conf ]]; then
+      if [[ "$detailed" == "true" ]]; then
+        printf "%s\n" "DNS Configuration (/etc/resolv.conf):"
+        cat /etc/resolv.conf
+      else
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}'
+      fi
+    else
+      _net_log ERROR "/etc/resolv.conf not found"
+      _net_color red "Error: /etc/resolv.conf not found"
+      return 1
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced DNS cache flushing with better error handling ---
+_net_flush_dns() {
+  local os="$(_net_get_os)"
+
+  _net_color yellow "Attempting to flush DNS cache..."
+
+  case "$os" in
+  macOS)
+    if _net_exec_priv dscacheutil command dscacheutil -flushcache; then
+      if _net_exec_priv killall command sudo killall -HUP mDNSResponder 2>/dev/null; then
+        _net_color green "macOS DNS cache flushed successfully"
+      else
+        _net_color yellow "DNS cache flushed, but couldn't restart mDNSResponder"
+      fi
+    else
+      _net_log ERROR "Failed to flush DNS cache"
+      _net_color red "Error: Failed to flush DNS cache"
+      return 1
+    fi
+    ;;
+  Linux)
+    local success="false"
+
+    if _net_has_tool resolvectl; then
+      if _net_exec_priv resolvectl command sudo resolvectl flush-caches; then
+        _net_color green "systemd-resolved cache flushed"
+        success="true"
+      fi
+    fi
+
+    if [[ "$success" != "true" ]] && _net_has_tool nscd; then
+      if _net_exec_priv systemctl command sudo systemctl restart nscd; then
+        _net_color green "nscd service restarted (cache flushed)"
+        success="true"
+      fi
+    fi
+
+    if [[ "$success" != "true" ]] && _net_has_tool dnsmasq; then
+      if _net_exec_priv systemctl command sudo systemctl restart dnsmasq; then
+        _net_color green "dnsmasq service restarted (cache flushed)"
+        success="true"
+      fi
+    fi
+
+    if [[ "$success" != "true" ]]; then
+      _net_log ERROR "No suitable DNS cache flushing method found"
+      _net_color red "Error: No suitable DNS cache flushing method found"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    _net_color yellow "BSD systems typically don't cache DNS by default"
+    _net_color blue "If using a local DNS cache (like unbound), restart the service manually"
+    return 0  # Not an error
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced port listening display ---
+_net_show_listeners() {
+  local os="$(_net_get_os)"
+  local protocol="${1:-all}" # all, tcp, udp
+  local show_processes="${2:-true}"
+
+  _net_color bold "Listening Ports"
+  printf "%s\n" "==============="
+
+  case "$os" in
+  macOS)
+    if [[ "$show_processes" == "true" ]]; then
+      case "$protocol" in
+      tcp) _net_exec_priv lsof command sudo lsof -i TCP -P -n | grep LISTEN ;;
+      udp) _net_exec_priv lsof command sudo lsof -i UDP -P -n ;;
+      *) _net_exec_priv lsof command sudo lsof -i -P -n | grep -E "LISTEN|UDP" ;;
+      esac
+    else
+      if ! _net_has_tool netstat; then
+        _net_log ERROR "netstat not available"
+        _net_color red "Error: netstat not available"
+        return 1
+      fi
+      case "$protocol" in
+      tcp) command netstat -an -p tcp | grep LISTEN ;;
+      udp) command netstat -an -p udp ;;
+      *) command netstat -an | grep -E "LISTEN|UDP" ;;
+      esac
+    fi
+    ;;
+  Linux)
+    if _net_has_tool ss; then
+      local ss_opts="-ln"
+      [[ "$show_processes" == "true" ]] && ss_opts="${ss_opts}p"
+
+      case "$protocol" in
+      tcp) _net_exec_priv ss command sudo ss -t $ss_opts ;;
+      udp) _net_exec_priv ss command sudo ss -u $ss_opts ;;
+      *) _net_exec_priv ss command sudo ss -tu $ss_opts ;;
+      esac
+    elif _net_has_tool netstat; then
+      local netstat_opts="-ln"
+      [[ "$show_processes" == "true" ]] && netstat_opts="${netstat_opts}p"
+
+      case "$protocol" in
+      tcp) _net_exec_priv netstat command sudo netstat -t $netstat_opts ;;
+      udp) _net_exec_priv netstat command sudo netstat -u $netstat_opts ;;
+      *) _net_exec_priv netstat command sudo netstat -tu $netstat_opts ;;
+      esac
+    else
+      _net_log ERROR "Neither ss nor netstat available"
+      _net_color red "Error: Neither ss nor netstat available"
+      return 1
+    fi
+    ;;
+  FreeBSD | OpenBSD | NetBSD)
+    if [[ "$show_processes" == "true" ]]; then
+      case "$protocol" in
+      tcp) _net_exec_priv lsof command sudo lsof -i TCP -P -n | grep LISTEN ;;
+      udp) _net_exec_priv lsof command sudo lsof -i UDP -P -n ;;
+      *) _net_exec_priv lsof command sudo lsof -i -P -n | grep -E "LISTEN|UDP" ;;
+      esac
+    else
+      if ! _net_has_tool netstat; then
+        _net_log ERROR "netstat not available"
+        _net_color red "Error: netstat not available"
+        return 1
+      fi
+      case "$protocol" in
+      tcp) command netstat -an -p tcp | grep LISTEN ;;
+      udp) command netstat -an -p udp ;;
+      *) command netstat -an | grep -E "LISTEN|UDP" ;;
+      esac
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced wireless information display ---
+_net_show_wireless() {
+  local os="$(_net_get_os)"
+  local interface="${1:-}"
+
+  _net_color bold "Wireless Network Information"
+  printf "%s\n" "============================"
+
+  case "$os" in
+  macOS)
+    local airport="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+    if [[ -n "$interface" ]]; then
+      "$airport" -I "$interface"
+    else
+      "$airport" -I
+    fi
+    ;;
+  Linux)
+    if _net_has_tool iwconfig; then
+      if [[ -n "$interface" ]]; then
+        command iwconfig "$interface"
+      else
+        command iwconfig 2>/dev/null | grep -v "no wireless extensions"
+      fi
+    elif _net_has_tool iw; then
+      if [[ -n "$interface" ]]; then
+        command iw dev "$interface" info
+        echo
+        command iw dev "$interface" link
+      else
+        local found=false
+        for dev in /sys/class/net/*/wireless; do
+          if [[ -d "$dev" ]]; then
+            local iface="$(basename "$(dirname "$dev")")"
+            printf "%s\n" "=== $iface ==="
+            command iw dev "$iface" info
+            echo
+            command iw dev "$iface" link
+            echo
+            found=true
+          fi
+        done
+        [[ $found == false ]] && _net_log WARN "No wireless interfaces found"
+      fi
+    else
+      _net_log ERROR "Neither iwconfig nor iw available"
+      _net_color red "Error: Neither iwconfig nor iw available"
+      return 1
+    fi
+    ;;
+  FreeBSD)
+    if [[ -n "$interface" ]]; then
+      command ifconfig "$interface"
+    else
+      command ifconfig | awk '/^[a-z0-9]+:/ { iface=$1; gsub(/:$/, "", iface) } /ieee80211/ { print "=== " iface " ==="; print }'
+    fi
+    ;;
+  OpenBSD | NetBSD)
+    _net_color yellow "Wireless information display not yet implemented for $os"
+    _net_log DEBUG "Wireless stub called for $os - consider adding ifconfig parsing"
+    return 0  # Not an error
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# ============================================
+# Enhanced Network Diagnostic Functions
+# ============================================
+
+# --- Enhanced ping with better defaults ---
+_net_ping() {
+  local target="$1"
+  local count="${2:-4}"
+  local interval="${3:-1}"
+
+  if ! _net_validate_input "$target" "target"; then
+    _net_color red "Error: Invalid target"
+    return 1
+  fi
+
+  _net_color bold "Pinging $target ($count packets, ${interval}s interval)"
+  printf "%s\n" "=================================================="
+
+  local os="$(_net_get_os)"
+  case "$os" in
+  macOS | FreeBSD | OpenBSD | NetBSD | Linux)
+    _net_exec ping -c "$count" -i "$interval" "$target"
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced traceroute ---
+_net_traceroute() {
+  local target="$1"
+  local max_hops="${2:-30}"
+
+  if ! _net_validate_input "$target" "target"; then
+    _net_color red "Error: Invalid target"
+    return 1
+  fi
+
+  _net_color bold "Tracing route to $target (max $max_hops hops)"
+  printf "%s\n" "============================================"
+
+  if _net_has_tool traceroute; then
+    _net_exec traceroute -m "$max_hops" "$target"
+  elif _net_has_tool tracepath; then
+    _net_exec tracepath "$target"
+  else
+    _net_log ERROR "Neither traceroute nor tracepath available"
+    _net_color red "Error: Neither traceroute nor tracepath available"
+    return 1
+  fi
+}
+
+# --- Enhanced public IP detection with multiple sources ---
+_net_show_public_ip() {
+  local protocol="${1:-4}" # 4 for IPv4, 6 for IPv6
+
+  _net_color bold "Public IP Address (IPv$protocol)"
+  printf "%s\n" "==============================="
+
+  local sources
+  if [[ "$protocol" == "6" ]]; then
+    sources=(
+      "https://ipv6.icanhazip.com"
+      "https://v6.ident.me"
+      "https://ipv6.jsonip.com"
+    )
+  else
+    sources=(
+      "https://ipv4.icanhazip.com"
+      "https://v4.ident.me"
+      "https://ifconfig.me/ip"
+      "https://api.ipify.org"
+    )
+  fi
+
+  for source in "${sources[@]}"; do
+    _net_log DEBUG "Trying source: $source"
+    local result
+    result="$(_net_exec curl -s --max-time 10 --fail "$source" 2>/dev/null)"
+    if [[ -n "$result" ]]; then
+      # Handle JSON if needed
+      if [[ "$source" =~ jsonip ]]; then
+        result="$(echo "$result" | awk -F'"' '/ip/ {print $4}')"
+      fi
+      # Validate
+      if [[ "$protocol" == "6" && "$result" =~ : ]] || [[ "$protocol" != "6" && "$result" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$result"
+        return 0
+      fi
+    fi
+  done
+
+  _net_log ERROR "Could not determine public IP address"
+  _net_color red "Error: Could not determine public IP address"
+  return 1
+}
+
+# --- Enhanced HTTP timing analysis ---
+_net_http_timing() {
+  local url="$1"
+  local method="${2:-GET}"
+
+  if [[ -z "$url" ]]; then
+    _net_log ERROR "URL required"
+    _net_color red "Error: URL required"
+    return 1
+  fi
+
+  _net_color bold "HTTP Timing Analysis: $url"
+  printf "%s\n" "=========================="
+
+  if ! _net_has_tool curl; then
+    _net_log ERROR "curl not available"
+    _net_color red "Error: curl not available"
+    return 1
+  fi
+
+  local timing_format='
+DNS Lookup:        %{time_namelookup}s
+TCP Connect:       %{time_connect}s
+TLS Handshake:     %{time_appconnect}s
+Server Processing: %{time_starttransfer}s
+Total Time:        %{time_total}s
+
+HTTP Status:       %{http_code}
+Size Downloaded:   %{size_download} bytes
+Speed:             %{speed_download} bytes/sec
+'
+
+  _net_exec curl -X "$method" -w "$timing_format" -o /dev/null -s --max-time "$NET_TIMEOUT" "$url" || {
+    _net_log ERROR "HTTP request failed"
+    _net_color red "Error: HTTP request failed"
+  }
+}
+
+# ============================================
+# System Service and Firewall Functions
+# ============================================
+
+# --- Enhanced service status check ---
+_net_service_status() {
+  local service="$1"
+  local os="$(_net_get_os)"
+
+  _net_color bold "Service Status: $service"
+  printf "%s\n" "======================="
+
+  case "$os" in
+  macOS)
+    if _net_has_tool launchctl; then
+      command launchctl print "system/$service" 2>/dev/null ||
+        command launchctl print "user/$(id -u)/$service" 2>/dev/null ||
+        { _net_log ERROR "Service $service not found"; _net_color red "Error: Service $service not found"; }
+    else
+      _net_log ERROR "launchctl not available"
+      _net_color red "Error: launchctl not available"
+      return 1
+    fi
+    ;;
+  Linux)
+    if _net_has_tool systemctl; then
+      command systemctl status "$service" --no-pager
+    elif _net_has_tool service; then
+      command service "$service" status
+    else
+      _net_log ERROR "Neither systemctl nor service available"
+      _net_color red "Error: Neither systemctl nor service available"
+      return 1
+    fi
+    ;;
+  FreeBSD)
+    if _net_has_tool service; then
+      command service "$service" status
+    else
+      _net_log ERROR "service command not available"
+      _net_color red "Error: service command not available"
+      return 1
+    fi
+    ;;
+  OpenBSD | NetBSD)
+    if _net_has_tool rcctl; then
+      command rcctl check "$service"
+    else
+      _net_log ERROR "rcctl not available"
+      _net_color red "Error: rcctl not available"
+      return 1
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# --- Enhanced firewall status ---
+_net_firewall_status() {
+  local os="$(_net_get_os)"
+
+  _net_color bold "Firewall Status"
+  printf "%s\n" "==============="
+
+  case "$os" in
+  macOS)
+    if _net_has_tool pfctl; then
+      printf "%s\n" "PF Firewall Status:"
+      _net_exec_priv pfctl command sudo pfctl -s info
+      printf "\n%s\n" "Application Firewall Status:"
+      command sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+    else
+      _net_log ERROR "pfctl not available"
+      _net_color red "Error: pfctl not available"
+      return 1
+    fi
+    ;;
+  Linux)
+    local found_firewall=false
+
+    if _net_has_tool ufw; then
+      printf "%s\n" "UFW Status:"
+      _net_exec_priv ufw command sudo ufw status verbose
+      found_firewall=true
+    fi
+
+    if _net_has_tool firewall-cmd; then
+      printf "\n%s\n" "firewalld Status:"
+      if _net_exec_priv firewall-cmd command sudo firewall-cmd --state >/dev/null 2>&1; then
+        _net_exec_priv firewall-cmd command sudo firewall-cmd --list-all
+      else
+        echo "firewalld is not running"
+      fi
+      found_firewall=true
+    fi
+
+    if _net_has_tool iptables; then
+      printf "\n%s\n" "iptables Rules (filter table):"
+      _net_exec_priv iptables command sudo iptables -L -n -v --line-numbers
+      found_firewall=true
+    fi
+
+    if ! $found_firewall; then
+      _net_log ERROR "No firewall tools found (ufw, firewalld, iptables)"
+      _net_color red "Error: No firewall tools found"
+      return 1
+    fi
+    ;;
+  FreeBSD)
+    if _net_has_tool pfctl; then
+      printf "%s\n" "PF Firewall Status:"
+      _net_exec_priv pfctl command sudo pfctl -s info
+      printf "\n%s\n" "PF Rules:"
+      _net_exec_priv pfctl command sudo pfctl -s rules
+    elif _net_has_tool ipfw; then
+      printf "%s\n" "IPFW Status:"
+      _net_exec_priv ipfw command sudo ipfw list
+    else
+      _net_log ERROR "Neither pfctl nor ipfw available"
+      _net_color red "Error: Neither pfctl nor ipfw available"
+      return 1
+    fi
+    ;;
+  OpenBSD | NetBSD)
+    if _net_has_tool pfctl; then
+      printf "%s\n" "PF Firewall Status:"
+      _net_exec_priv pfctl command sudo pfctl -s info
+      printf "\n%s\n" "PF Rules:"
+      _net_exec_priv pfctl command sudo pfctl -s rules
+    else
+      _net_log ERROR "pfctl not available"
+      _net_color red "Error: pfctl not available"
+      return 1
+    fi
+    ;;
+  *)
+    _net_log ERROR "Unsupported OS: $os"
+    _net_color red "Error: Unsupported OS: $os"
+    return 1
+    ;;
+  esac
+}
+
+# ============================================
+# Enhanced Aliases with Improved Functionality
+# ============================================
+
+# --- Core Network Information ---
+alias net.ip='_net_show_ip'
+alias net.ip4='_net_show_ip false' # IPv4 only
+alias net.ip6='_net_show_ip true'  # Include IPv6
+alias net.links='_net_show_links'
+alias net.links.detailed='_net_show_links true'
+alias net.stats='_net_show_stats'
+alias net.wireless='_net_show_wireless'
+
+# --- Routing Information ---
+alias net.routes='_net_show_routes'
+alias net.routes.ipv4='_net_show_routes ipv4'
+alias net.routes.ipv6='_net_show_routes ipv6'
+alias net.gw='_net_show_gw'
+alias net.gw.ipv4='_net_show_gw ipv4'
+alias net.gw.ipv6='_net_show_gw ipv6'
+
+# --- DNS Information ---
+alias net.dns='_net_show_dns'
+alias net.dns.detailed='_net_show_dns true'
+alias net.dns.flush='_net_flush_dns'
+
+# --- Port and Socket Information ---
+alias net.ports='_net_show_listeners'
+alias net.ports.tcp='_net_show_listeners tcp'
+alias net.ports.udp='_net_show_listeners udp'
+alias net.ports.simple='_net_show_listeners all false'
+
+# --- Network Diagnostics ---
+alias net.ping='_net_ping'
+alias net.trace='_net_traceroute'
+alias net.myip='_net_show_public_ip'
+alias net.myip6='_net_show_public_ip 6'
+alias net.http='_net_http_timing'
+
+# --- Service Management ---
+alias net.svc.nm='_net_service_status NetworkManager'
+alias net.svc.networkd='_net_service_status systemd-networkd'
+alias net.svc.resolved='_net_service_status systemd-resolved'
+
+# --- Firewall Status ---
+alias net.firewall='_net_firewall_status'
+
+# --- Advanced Diagnostics (if tools available) ---
+if _net_has_tool mtr; then
+  net.mtr() {
+    local host="$1"
+    if [[ -z "$host" ]]; then
+      _net_color red "Error: Host required"
+      return 1
+    fi
+    if ! _net_validate_input "$host" "target"; then
+      _net_color red "Error: Invalid host"
+      return 1
+    fi
+    _net_exec_priv mtr command sudo mtr -b -z -w -n "$host"
+  }
+fi
+
+if _net_has_tool iperf3; then
+  alias net.iperf.server='iperf3 -s'
+  alias net.iperf.client='iperf3 -c'
+fi
+
+if _net_has_tool nmap; then
+  net.scan.local() {
+    if [[ "$(_net_get_os)" == "Linux" ]]; then
+      local subnet="$(ip route | grep "scope link" | head -1 | awk '{print $1}')"
+      _net_exec_priv nmap command sudo nmap -sn "$subnet"
+    else
+      _net_log ERROR "Local scan only implemented for Linux"
+      _net_color red "Error: Local scan only implemented for Linux"
+      return 1
+    fi
+  }
+fi
+# --- Advanced Diagnostics (if tools available) ---
+# if _net_has_tool nmap; then
+#   alias net.scan.local='if [[ "$(_net_get_os)" == "Linux" ]]; then nmap -sn $(ip route | grep "scope link" | head -1 | awk "{print \$1}"); else echo "Local scan only supported on Linux"; fi'
+#   net.scan.port() {
+#     local host="$1"
+#     local ports="${2:-1-1000}"
+#     if _net_validate_input "$host" "hostname"; then
+#       nmap -p "$ports" "$host"
+#     fi
+#   }
+# fi
+
+# --- Network Configuration (if tools available) ---
+if _net_has_tool nmcli; then
+  alias net.conf.wifi='nmcli dev wifi'
+  alias net.conf.conn='nmcli conn show'
+  alias net.conf.devices='nmcli dev status'
+fi
+
+if _net_has_tool networkctl; then
+  alias net.conf.networkctl='networkctl status'
+fi
+
+# --- Container Network Diagnostics ---
+if _net_has_tool docker; then
+  alias net.docker.networks='docker network ls'
+  alias net.docker.inspect='docker network inspect'
+fi
+
+# ============================================
+# Enhanced Help System
+# ============================================
+
+net.help() {
+  _net_color bold "Enhanced Network Information Commands (net.*)"
+  echo "=============================================="
+  echo
+  _net_color blue "BASIC INFORMATION:"
+  echo "  net.ip                Show all IP addresses"
+  echo "  net.ip4               Show IPv4 addresses only"
+  echo "  net.ip6               Show IPv4 and IPv6 addresses"
+  echo "  net.links             Show network interface status"
+  echo "  net.links.detailed    Show detailed interface information"
+  echo "  net.stats [interface] Show network interface statistics"
+  echo "  net.wireless [iface]  Show wireless network information"
+  echo
+  _net_color blue "ROUTING INFORMATION:"
+  echo "  net.routes            Show routing table (all)"
+  echo "  net.routes.ipv4       Show IPv4 routing table"
+  echo "  net.routes.ipv6       Show IPv6 routing table"
+  echo "  net.gw                Show default gateway"
+  echo "  net.gw.ipv4           Show IPv4 default gateway"
+  echo "  net.gw.ipv6           Show IPv6 default gateway"
+  echo
+  _net_color blue "DNS INFORMATION:"
+  echo "  net.dns               Show DNS servers"
+  echo "  net.dns.detailed      Show detailed DNS configuration"
+  echo "  net.dns.flush         Flush DNS cache (requires admin)"
+  echo
+  _net_color blue "PORT AND SOCKET INFORMATION:"
+  echo "  net.ports             Show all listening ports with processes"
+  echo "  net.ports.tcp         Show TCP listening ports only"
+  echo "  net.ports.udp         Show UDP listening ports only"
+  echo "  net.ports.simple      Show listening ports without process info"
+  echo
+  _net_color blue "NETWORK DIAGNOSTICS:"
+  echo "  net.ping <host> [count] [interval]  Ping host"
+  echo "  net.trace <host> [max_hops]         Traceroute to host"
+  echo "  net.myip              Show public IPv4 address"
+  echo "  net.myip6             Show public IPv6 address"
+  echo "  net.http <url> [method]             HTTP timing analysis"
+  echo
+  _net_color blue "SYSTEM SERVICES:"
+  echo "  net.svc.nm            NetworkManager status"
+  echo "  net.svc.networkd      systemd-networkd status"
+  echo "  net.svc.resolved      systemd-resolved status"
+  echo
+  _net_color blue "FIREWALL STATUS:"
+  echo "  net.firewall          Show firewall status and rules"
+  echo
+  _net_color blue "ADVANCED TOOLS (if available):"
+  echo "  net.mtr <host>        MTR network diagnostic"
+  echo "  net.iperf.server      Start iperf3 server"
+  echo "  net.iperf.client <host> Connect to iperf3 server"
+  echo "  net.scan.local        Scan local network (Linux only)"
+  echo "  net.scan.port <host> [ports] Port scan"
+  echo
+  _net_color blue "CONFIGURATION (if available):"
+  echo "  net.conf.wifi         WiFi networks (NetworkManager)"
+  echo "  net.conf.conn         Network connections"
+  echo "  net.conf.devices      Network devices status"
+  echo
+  _net_color blue "CONTAINER NETWORKS (if available):"
+  echo "  net.docker.networks   List Docker networks"
+  echo "  net.docker.inspect <network> Inspect Docker network"
+  echo
+  _net_color blue "ENVIRONMENT VARIABLES:"
+  echo "  NET_DEBUG=1           Enable debug output"
+  echo "  NET_COLOR=never       Disable colored output"
+  echo "  NET_TIMEOUT=30        Set command timeout (seconds)"
+  echo
+  _net_color blue "EXAMPLES:"
+  echo "  net.ping google.com 10 2           # Ping 10 times, 2s interval"
+  echo "  net.trace github.com 20            # Traceroute with max 20 hops"
+  echo "  net.http https://example.com POST  # POST request timing"
+  echo "  net.stats eth0                     # Statistics for eth0"
+  echo
+  _net_color green "Supported OS: Linux, macOS, FreeBSD, OpenBSD, NetBSD"
+}
+
+# --- Configuration management ---
+net.config() {
+  echo "Network Tools Configuration"
+  echo "=========================="
+  echo "Config Directory: $NET_CONFIG_DIR"
+  echo "Cache File: $NET_CACHE_FILE"
+  echo "Debug Level: $NET_DEBUG"
+  echo "Color Output: $NET_COLOR"
+  echo "Command Timeout: ${NET_TIMEOUT}s"
+  echo "Detected OS: $(_net_get_os)"
+  echo
+  echo "Available Tools:"
+  local tools=(ip ifconfig ss netstat curl dig host nmap mtr iperf3 nmcli networkctl)
+  for tool in "${tools[@]}"; do
+    if _net_has_tool "$tool"; then
+      _net_color green "  ✓ $tool"
+    else
+      _net_color red "  ✗ $tool"
+    fi
+  done
+}
+
+# --- Cache management ---
+net.cache.clear() {
+  if [[ -f "$NET_CACHE_FILE" ]]; then
+    rm "$NET_CACHE_FILE"
+    _net_color green "Cache cleared"
+  else
+    _net_color yellow "No cache file found"
+  fi
+}
+
+net.cache.show() {
+  if [[ -f "$NET_CACHE_FILE" ]]; then
+    echo "Cache Contents:"
+    echo "==============="
+    cat "$NET_CACHE_FILE"
+  else
+    _net_color yellow "No cache file found"
+  fi
+}
+
+# Initialize on first load
+_net_log DEBUG "Network tools initialized for $(_net_get_os)"
