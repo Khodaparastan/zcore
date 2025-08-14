@@ -1,4 +1,4 @@
-safe_utils
-lib
-modules/deps
+tmp
+aliases
 .idea
+zsh-runtime-detect

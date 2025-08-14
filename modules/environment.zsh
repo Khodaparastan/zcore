@@ -1,5 +1,8 @@
+# environment.zsh
+
 _detect_platform() {
-  [[ -n "${_PLATFORM_DETECTED:-}" ]] && return 0
+  emulate -L zsh
+  [[ -n ${_PLATFORM_DETECTED:-} ]] && return 0
 
   if ! command -v uname >/dev/null 2>&1; then
     print -u2 "Warning: uname command not available. Platform detection might be inaccurate."
@@ -9,10 +12,9 @@ _detect_platform() {
   typeset -gx ARCH="${HOSTTYPE:-$(uname -m 2>/dev/null || echo 'unknown')}"
 
   local is_macos=0 is_linux=0 is_arm=0
-
-  [[ "$PLATFORM" == "darwin" ]] && is_macos=1
-  [[ "$PLATFORM" == "linux"* ]] && is_linux=1
-  [[ "$ARCH" == "arm64" || "$ARCH" == "aarch64" ]] && is_arm=1
+  [[ $PLATFORM == "darwin" ]] && is_macos=1
+  [[ $PLATFORM == linux* ]]    && is_linux=1
+  [[ $ARCH == (arm64|aarch64) ]] && is_arm=1
 
   typeset -grix IS_MACOS=$is_macos
   typeset -grix IS_LINUX=$is_linux
@@ -23,27 +25,30 @@ _detect_platform() {
 }
 
 _detect_homebrew() {
-  if [[ -n "${HOMEBREW_PREFIX:-}" && -x "$HOMEBREW_PREFIX/bin/brew" ]]; then
+  emulate -L zsh
+  if [[ -n ${HOMEBREW_PREFIX:-} && -x $HOMEBREW_PREFIX/bin/brew ]]; then
     return 0
   fi
 
-  ((IS_MACOS)) || return 1
+  (( IS_MACOS )) || return 1
 
   local -a search_paths=()
-  ((IS_ARM)) && search_paths+=("/opt/homebrew")
+  (( IS_ARM )) && search_paths+=("/opt/homebrew")
   search_paths+=("/usr/local")
 
-  local path
-  for path in "${search_paths[@]}"; do
-    if [[ -x "$path/bin/brew" ]]; then
-      typeset -gx HOMEBREW_PREFIX="$path"
+  local p
+  for p in "${search_paths[@]}"; do
+    if [[ -x $p/bin/brew ]]; then
+      typeset -gx HOMEBREW_PREFIX="$p"
       return 0
     fi
   done
   return 1
 }
+
 _setup_package_managers() {
-  if ((IS_MACOS)) && command -v brew >/dev/null 2>&1; then
+  emulate -L zsh
+  if (( IS_MACOS )) && command -v brew >/dev/null 2>&1; then
     typeset -gx HOMEBREW_NO_ANALYTICS=1
     typeset -gx HOMEBREW_NO_AUTO_UPDATE=1
     typeset -gx HOMEBREW_NO_INSTALL_CLEANUP=1
@@ -56,19 +61,18 @@ _setup_package_managers() {
   fi
 
   if command -v pacman >/dev/null 2>&1; then
-    typeset -gx PACMAN_CACHE_DIR="$XDG_CACHE_HOME/pacman/pkg"
-    [[ ! -d "$PACMAN_CACHE_DIR" ]] && mkdir -p "$PACMAN_CACHE_DIR" 2>/dev/null
+    typeset -gx PACMAN_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pacman/pkg"
+    [[ ! -d $PACMAN_CACHE_DIR ]] && mkdir -p -- "$PACMAN_CACHE_DIR" 2>/dev/null
   fi
 }
 
 _create_xdg_dirs() {
+  emulate -L zsh
   # Ensure XDG variables are set
-  if [[ -z "$XDG_CONFIG_HOME" || -z "$XDG_DATA_HOME" ||
-    -z "$XDG_CACHE_HOME" || -z "$XDG_STATE_HOME" ]]; then
+  if [[ -z $XDG_CONFIG_HOME || -z $XDG_DATA_HOME || -z $XDG_CACHE_HOME || -z $XDG_STATE_HOME ]]; then
     _setup_xdg || return 1
   fi
 
-  # Create directories with proper permissions
   local -a dirs=(
     "$XDG_CONFIG_HOME:700"
     "$XDG_DATA_HOME:700"
@@ -80,39 +84,38 @@ _create_xdg_dirs() {
     "$XDG_CONFIG_HOME/ssh:700"
   )
 
-  local dir perm
+  local entry dir perm
   for entry in "${dirs[@]}"; do
     dir="${entry%:*}"
     perm="${entry#*:}"
-    [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null
-    chmod "$perm" "$dir" 2>/dev/null
+    [[ -d $dir ]] || mkdir -p -- "$dir" 2>/dev/null
+    chmod "$perm" -- "$dir" 2>/dev/null
   done
 }
 
 _setup_xdg() {
-  # Validate HOME is set first
-  if [[ -z "$HOME" ]]; then
+  emulate -L zsh
+  if [[ -z $HOME ]]; then
     print -u2 "ERROR: HOME environment variable is not set"
     return 1
   fi
 
-  # Set XDG Base Directory defaults per specification
   typeset -gx XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
   typeset -gx XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
   typeset -gx XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
   typeset -gx XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-
   return 0
 }
 
 _initialize_environment() {
+  emulate -L zsh
   _setup_xdg || return 1
   _detect_platform || return 1
   _create_xdg_dirs
   _detect_homebrew
   _setup_package_managers || return 1
 
-  if [[ "${ZSH_DEBUG:-0}" == "1" ]]; then
+  if [[ ${ZSH_DEBUG:-0} == 1 ]]; then
     print "Core environment initialized:"
     print "  Platform: $PLATFORM ($ARCH), IS_MACOS: $IS_MACOS, IS_LINUX: $IS_LINUX, IS_ARM: $IS_ARM"
     print "  XDG Config: $XDG_CONFIG_HOME"
@@ -125,6 +128,7 @@ _initialize_environment() {
 }
 
 _safe_exec() {
+  emulate -L zsh
   local cmd="$1"
   [[ $# -eq 0 ]] && return 1
   shift
@@ -138,6 +142,7 @@ _safe_exec() {
 }
 
 _check_network() {
+  emulate -L zsh
   local timeout="${1:-2}"
   local -a endpoints=(
     "https://1.1.1.1"
@@ -158,15 +163,18 @@ _check_network() {
 }
 
 _setup_environment() {
+  emulate -L zsh
+
   _setup_editor_environment() {
+    emulate -L zsh
     local editor_preference
-    if [[ -n "$SSH_CONNECTION" ]]; then
+    if [[ -n $SSH_CONNECTION ]]; then
       if command -v vim >/dev/null 2>&1; then
         editor_preference="vim"
       elif command -v vi >/dev/null 2>&1; then
         editor_preference="vi"
       else
-        editor_preference="vi" # Ultimate fallback for SSH
+        editor_preference="vi"
       fi
     else
       if command -v nvim >/dev/null 2>&1; then
@@ -176,10 +184,9 @@ _setup_environment() {
       elif command -v vi >/dev/null 2>&1; then
         editor_preference="vi"
       else
-        editor_preference="vi" # Ultimate fallback
+        editor_preference="vi"
       fi
     fi
-
     typeset -gx EDITOR="$editor_preference"
     typeset -gx VISUAL="$EDITOR"
     typeset -gx SUDO_EDITOR="$EDITOR"
@@ -187,17 +194,15 @@ _setup_environment() {
   }
 
   _setup_development_environment() {
+    emulate -L zsh
     if command -v go >/dev/null 2>&1; then
       typeset -gx GOPATH="${GOPATH:-$HOME/go}"
       typeset -gx GOBIN="$GOPATH/bin"
       local -a go_dirs=("$GOPATH" "$GOPATH/src" "$GOPATH/bin" "$GOPATH/pkg")
-      local dir
-      for dir in "${go_dirs[@]}"; do
-        [[ ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
-      done
+      local d; for d in "${go_dirs[@]}"; do [[ -d $d ]] || mkdir -p -- "$d" 2>/dev/null; done
     fi
 
-    if command -v cargo >/dev/null 2>&1 || [[ -d "$HOME/.cargo" ]]; then
+    if command -v cargo >/dev/null 2>&1 || [[ -d $HOME/.cargo ]]; then
       typeset -gx CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
       typeset -gx RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
       typeset -gx CARGO_INCREMENTAL=1
@@ -206,22 +211,22 @@ _setup_environment() {
 
     if command -v node >/dev/null 2>&1; then
       typeset -gx NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
-      [[ ! -d "$NPM_CONFIG_PREFIX" ]] && mkdir -p "$NPM_CONFIG_PREFIX" 2>/dev/null
+      [[ -d $NPM_CONFIG_PREFIX ]] || mkdir -p -- "$NPM_CONFIG_PREFIX" 2>/dev/null
     fi
 
     if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
       typeset -gx PYTHONDONTWRITEBYTECODE=1
       typeset -gx PYTHONUNBUFFERED=1
-      typeset -gx PIP_CACHE_DIR="$XDG_CACHE_HOME/pip"
+      typeset -gx PIP_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pip"
       typeset -gx PIPENV_VENV_IN_PROJECT=1
-      [[ ! -d "$PIP_CACHE_DIR" ]] && mkdir -p "$PIP_CACHE_DIR" 2>/dev/null
+      [[ -d $PIP_CACHE_DIR ]] || mkdir -p -- "$PIP_CACHE_DIR" 2>/dev/null
     fi
 
     if command -v java >/dev/null 2>&1; then
-      if [[ -z "$JAVA_HOME" ]]; then
-        if ((IS_MACOS)) && [[ -x /usr/libexec/java_home ]]; then
+      if [[ -z $JAVA_HOME ]]; then
+        if (( IS_MACOS )) && [[ -x /usr/libexec/java_home ]]; then
           typeset -gx JAVA_HOME="$(/usr/libexec/java_home 2>/dev/null)"
-        elif ((IS_LINUX)); then
+        elif (( IS_LINUX )); then
           local -a java_paths=(
             "/usr/lib/jvm/default-java"
             "/usr/lib/jvm/java-17-openjdk-amd64"
@@ -230,7 +235,7 @@ _setup_environment() {
           )
           local jpath
           for jpath in "${java_paths[@]}"; do
-            if [[ -d "$jpath" ]]; then
+            if [[ -d $jpath ]]; then
               typeset -gx JAVA_HOME="$jpath"
               break
             fi
@@ -238,8 +243,8 @@ _setup_environment() {
         fi
       fi
       typeset -gx MAVEN_OPTS="${MAVEN_OPTS:--Xmx1024m -XX:MaxMetaspaceSize=256m}"
-      typeset -gx M2_HOME="${M2_HOME:-$XDG_CONFIG_HOME/maven}"
-      [[ ! -d "$M2_HOME" ]] && mkdir -p "$M2_HOME" 2>/dev/null
+      typeset -gx M2_HOME="${M2_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maven}"
+      [[ -d $M2_HOME ]] || mkdir -p -- "$M2_HOME" 2>/dev/null
     fi
 
     if command -v docker >/dev/null 2>&1; then
@@ -249,6 +254,7 @@ _setup_environment() {
   }
 
   _setup_xdg_compliance() {
+    emulate -L zsh
     local state_dir="$XDG_STATE_HOME"
     local cache_dir="$XDG_CACHE_HOME"
     local config_dir="$XDG_CONFIG_HOME"
@@ -261,16 +267,13 @@ _setup_environment() {
       "$config_dir/maven"
       "$config_dir/readline"
     )
-    local dir
-    for dir in "${xdg_app_dirs[@]}"; do
-      [[ -n "$dir" && ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
-    done
+    local d; for d in "${xdg_app_dirs[@]}"; do [[ -n $d && -d $d ]] || mkdir -p -- "$d" 2>/dev/null; done
 
     typeset -gx HISTFILE="$XDG_STATE_HOME/zsh/history"
-    if [[ ! -d "${HISTFILE:h}" ]]; then
-      mkdir -p -m 700 "${HISTFILE:h}" 2>/dev/null
+    if [[ ! -d ${HISTFILE:h} ]]; then
+      mkdir -p -m 700 -- "${HISTFILE:h}" 2>/dev/null
     else
-      chmod 700 "${HISTFILE:h}" 2>/dev/null
+      chmod 700 -- "${HISTFILE:h}" 2>/dev/null
     fi
 
     typeset -gx NODE_REPL_HISTORY="$XDG_STATE_HOME/node_repl_history"
@@ -290,12 +293,13 @@ _setup_environment() {
   }
 
   _setup_security_environment() {
+    emulate -L zsh
     if command -v gpg >/dev/null 2>&1 || command -v gpg2 >/dev/null 2>&1; then
-      typeset -gx GNUPGHOME="$XDG_DATA_HOME/gnupg"
-      if [[ ! -d "$GNUPGHOME" ]]; then
-        mkdir -p -m 700 "$GNUPGHOME" 2>/dev/null
+      typeset -gx GNUPGHOME="${XDG_DATA_HOME:-$HOME/.local/share}/gnupg"
+      if [[ ! -d $GNUPGHOME ]]; then
+        mkdir -p -m 700 -- "$GNUPGHOME" 2>/dev/null
       else
-        chmod 700 "$GNUPGHOME" 2>/dev/null
+        chmod 700 -- "$GNUPGHOME" 2>/dev/null
       fi
       if [[ -t 0 ]]; then
         typeset -gx GPG_TTY="$(tty 2>/dev/null || echo '/dev/tty')"
@@ -304,9 +308,10 @@ _setup_environment() {
   }
 
   _setup_performance_environment() {
+    emulate -L zsh
     if command -v make >/dev/null 2>&1; then
       local cores
-      if ((IS_MACOS)); then
+      if (( IS_MACOS )); then
         cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
       else
         cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 2)
@@ -316,6 +321,7 @@ _setup_environment() {
   }
 
   _setup_terminal_environment() {
+    emulate -L zsh
     typeset -gx LANG="${LANG:-en_US.UTF-8}"
     typeset -gx LC_ALL="${LC_ALL:-$LANG}"
     typeset -gx TERM="${TERM:-xterm-256color}"
@@ -323,7 +329,8 @@ _setup_environment() {
 
     if command -v less >/dev/null 2>&1; then
       typeset -gx PAGER="less"
-      typeset -gx LESS="-RSiM -j.5 --mouse --wheel-lines=3"
+      # Trim to widely-supported flags
+      typeset -gx LESS="-R -Si -M -j.5"
 
       if command -v lesspipe.sh >/dev/null 2>&1; then
         typeset -gx LESSOPEN="|lesspipe.sh %s"
@@ -344,13 +351,14 @@ _setup_environment() {
   }
 
   _setup_cloud_environment() {
+    emulate -L zsh
     if command -v aws >/dev/null 2>&1; then
       typeset -gx AWS_CLI_AUTO_PROMPT=on-partial
       typeset -gx AWS_PAGER=""
     fi
     if command -v terraform >/dev/null 2>&1; then
       local cores
-      if ((IS_MACOS)); then
+      if (( IS_MACOS )); then
         cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 10)
       else
         cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 10)
@@ -373,3 +381,4 @@ _setup_environment() {
 
   return 0
 }
+

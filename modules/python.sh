@@ -26,116 +26,117 @@ function repeat {
 
     printf '%s' "${(pl:num::$string:)}"
 }
+# Setup Python and Poetry aliases
+_setup_python_poetry_aliases() {
+	local cmd
+	local -A available_commands=()
 
-# Initialize Python and Poetry aliases
-() {
-    local cmd
-    local -A available_commands=()
+	# Check and cache available commands
+	for cmd in python python3 pip poetry; do
+		if command -v "$cmd" >/dev/null 2>&1; then
+			available_commands[$cmd]=1
+		fi
+	done
 
-    # Check and cache available commands
-    for cmd in python python3 pip poetry; do
-        if command -v "$cmd" >/dev/null 2>&1; then
-            available_commands[$cmd]=1
-        fi
-    done
+	# Python aliases
+	if command -v python >/dev/null 2>&1; then
+		alias 'py'='python'
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		alias 'py3'='python3'
+	fi
 
-    # Python aliases
-    if (( ${+available_commands[python]} )); then
-        alias 'py'='python'
-    fi
-    if (( ${+available_commands[python3]} )); then
-        alias 'py3'='python3'
-    fi
+	# Pip aliases
+	if command -v pip >/dev/null 2>&1; then
+		alias 'piprm'='pip uninstall -y'
+		alias 'pipl'='pip list'
+		alias 'pipf'='pip freeze'
+		alias 'pipu'='pip install --upgrade'
+		alias 'pipr'='pip install -r requirements.txt'
+		alias 'piprt'='pip install -r requirements-test.txt'
+		alias 'piprd'='pip install -r requirements-dev.txt'
+		alias 'pips'='pip show'
+		alias 'pipc'='pip check'
+	fi
 
-    # Pip aliases
-    if (( ${+available_commands[pip]} )); then
-        alias 'piprm'='pip uninstall -y'
-        alias 'pipl'='pip list'
-        alias 'pipf'='pip freeze'
-        alias 'pipu'='pip install --upgrade'
-        alias 'pipr'='pip install -r requirements.txt'
-        alias 'piprt'='pip install -r requirements-test.txt'
-        alias 'piprd'='pip install -r requirements-dev.txt'
-        alias 'pips'='pip show'
-        alias 'pipc'='pip check'
-    fi
+	# Poetry aliases
+	if command -v poetry >/dev/null 2>&1; then
+		# Project management
+		alias 'poinit'='poetry init'
+		alias 'ponew'='poetry new'
+		alias 'pocheck'='poetry check'
 
-    # Poetry aliases
-    if (( ${+available_commands[poetry]} )); then
-        # Project management
-        alias 'poinit'='poetry init'
-        alias 'ponew'='poetry new'
-        alias 'pocheck'='poetry check'
+		# Dependency management
+		alias 'poadd'='poetry add'
+		alias 'poadd-dev'='poetry add --group dev'
+		alias 'poadd-test'='poetry add --group test'
+		alias 'porm'='poetry remove'
+		alias 'porm-dev'='poetry remove --group dev'
+		alias 'porm-test'='poetry remove --group test'
+		alias 'poshow'='poetry show'
+		alias 'poshow-tree'='poetry show --tree'
+		alias 'poshow-outdated'='poetry show --outdated'
 
-        # Dependency management
-        alias 'poadd'='poetry add'
-        alias 'poadd-dev'='poetry add --group dev'
-        alias 'poadd-test'='poetry add --group test'
-        alias 'porm'='poetry remove'
-        alias 'porm-dev'='poetry remove --group dev'
-        alias 'porm-test'='poetry remove --group test'
-        alias 'poshow'='poetry show'
-        alias 'poshow-tree'='poetry show --tree'
-        alias 'poshow-outdated'='poetry show --outdated'
+		# Installation
+		alias 'poi'='poetry install'
+		alias 'poin'='poetry install --no-root'
+		alias 'poi-dev'='poetry install --with dev'
+		alias 'poi-test'='poetry install --with test'
+		alias 'poi-all'='poetry install --with dev,test'
+		alias 'poi-sync'='poetry install --sync'
+		alias 'pou'='poetry update'
+		alias 'por'='poetry lock --no-update && poetry install'
 
-        # Installation
-        alias 'poi'='poetry install'
-        alias 'poin'='poetry install --no-root'
-        alias 'poi-dev'='poetry install --with dev'
-        alias 'poi-test'='poetry install --with test'
-        alias 'poi-all'='poetry install --with dev,test'
-        alias 'poi-sync'='poetry install --sync'
-        alias 'pou'='poetry update'
-        alias 'por'='rm -f poetry.lock && poetry install'
+		# Lock file management
+		alias 'polock'='poetry lock'
+		alias 'polock-check'='poetry lock --check'
+		alias 'polock-no-update'='poetry lock --no-update'
 
-        # Lock file management
-        alias 'polock'='poetry lock'
-        alias 'polock-check'='poetry lock --check'
-        alias 'polock-update'='poetry lock --no-update'
+		# Environment management
+		alias 'poenv'='poetry env'
+		alias 'poenv-info'='poetry env info'
+		alias 'poenv-list'='poetry env list'
+		alias 'poenv-remove'='poetry env remove'
+		alias 'poenv-use'='poetry env use'
+		alias 'poshell'='poetry shell'
+		alias 'porun'='poetry run'
 
-        # Environment management
-        alias 'poenv'='poetry env'
-        alias 'poenv-info'='poetry env info'
-        alias 'poenv-list'='poetry env list'
-        alias 'poenv-remove'='poetry env remove'
-        alias 'poenv-use'='poetry env use'
-        alias 'poshell'='poetry shell'
-        alias 'porun'='poetry run'
+		# Export and build
+		alias 'poexport'='poetry export'
+		alias 'poexport-dev'='poetry export --with dev'
+		alias 'poexport-req'='poetry export --format requirements.txt --output requirements.txt'
+		alias 'pobuild'='poetry build'
+		alias 'popublish'='poetry publish'
 
-        # Export and build
-        alias 'poexport'='poetry export'
-        alias 'poexport-dev'='poetry export --with dev'
-        alias 'poexport-req'='poetry export --format requirements.txt --output requirements.txt'
-        alias 'pobuild'='poetry build'
-        alias 'popublish'='poetry publish'
+		# Configuration and cache
+		alias 'poconfig'='poetry config'
+		alias 'poconfig-list'='poetry config --list'
+		alias 'pocache'='poetry cache'
+		alias 'pocache-clear'='poetry cache clear --all pypi'
 
-        # Configuration and cache
-        alias 'poconfig'='poetry config'
-        alias 'poconfig-list'='poetry config --list'
-        alias 'pocache'='poetry cache'
-        alias 'pocache-clear'='poetry cache clear --all .'
+		# Version management
+		alias 'poversion'='poetry version'
+		alias 'poversion-patch'='poetry version patch'
+		alias 'poversion-minor'='poetry version minor'
+		alias 'poversion-major'='poetry version major'
+	fi
 
-        # Version management
-        alias 'poversion'='poetry version'
-        alias 'poversion-patch'='poetry version patch'
-        alias 'poversion-minor'='poetry version minor'
-        alias 'poversion-major'='poetry version major'
-    fi
-
-    # Python build aliases
-    local python_cmd
-    for python_cmd in python python3; do
-        if (( ${+available_commands[$python_cmd]} )); then
-            if "$python_cmd" -c "import build" 2>/dev/null; then
-                alias 'pybuild'="$python_cmd -m build"
-                alias 'pysdist'="$python_cmd -m build --sdist"
-                alias 'pywheel'="$python_cmd -m build --wheel"
-                break
-            fi
-        fi
-    done
+	# Python build aliases
+	local python_cmd
+	for python_cmd in python python3; do
+		if command -v "$python_cmd" >/dev/null 2>&1; then
+			if "$python_cmd" -m build --help >/dev/null 2>&1; then
+				alias 'pybuild'="$python_cmd -m build"
+				alias 'pysdist'="$python_cmd -m build --sdist"
+				alias 'pywheel'="$python_cmd -m build --wheel"
+				break
+			fi
+		fi
+	done
 }
 
+# Call the function to set up aliases
+_setup_python_poetry_aliases
 # Get Python command with caching and validation
 function _get_python_cmd {
     local cache_key="${1:-default}"
@@ -302,7 +303,7 @@ function _validate_venv_path {
     )
 
     # Check if path is in reserved names
-    if (( ${reserved_names[(Ie)$path]} )); then
+    if (( ${reserved_names[(I)$path]} )); then
         print -u2 "Error: '$path' is a reserved name"
         return 1
     fi
