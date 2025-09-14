@@ -55,7 +55,7 @@ setup_platform_aliases() {
 # and sources the necessary shell integration files.
 ###
 _setup_gcloud_sdk() {
-  _detect_platform
+  z::runtime::check_interrupted || return $?
 
   # --- Find GCloud SDK Base Path ---
   local gcloud_base="${GCLOUD_SDK_PATH:-}" # 1. Check environment variable first.
@@ -75,7 +75,7 @@ _setup_gcloud_sdk() {
   fi
 
   if [[ -z "$gcloud_base" || ! -d "$gcloud_base" ]]; then
-    _log_debug "Google Cloud SDK not found."
+    z::log::debug "Google Cloud SDK not found."
     return 1
   fi
 
@@ -85,8 +85,10 @@ _setup_gcloud_sdk() {
   )
   local -i success_count=0
   for file in "${gcloud_files[@]}"; do
-    if _safe_source "$file"; then
+    if z::path::source "$file"; then
       ((success_count++))
+    else
+      z::log::debug "Failed to source gcloud file: $file"
     fi
   done
 
@@ -104,11 +106,11 @@ _setup_gcloud_sdk() {
 
   if [[ -n "$gcloud_python" && -x "$gcloud_python" ]]; then
     export CLOUDSDK_PYTHON="$gcloud_python"
-    _log_debug "Set CLOUDSDK_PYTHON to: $gcloud_python"
+    z::log::debug "Set CLOUDSDK_PYTHON to: $gcloud_python"
   fi
 
   if ((success_count > 0)); then
-    _log_debug "Google Cloud SDK initialized ($success_count files loaded)"
+    z::log::debug "Google Cloud SDK initialized ($success_count files loaded)"
     return 0
   fi
   return 1
@@ -118,26 +120,38 @@ _setup_gcloud_sdk() {
 # Sets up external shell tools if available.
 ###
 _setup_external_tools() {
-  if command -v mise >/dev/null 2>&1; then
-    _safe_eval "$(mise activate zsh)" 10 true
+  z::runtime::check_interrupted || return $?
+
+  if z::cmd::exists mise; then
+    if z::exec::eval "$(mise activate zsh)" 10 true; then
+      z::log::debug "mise activated successfully"
+    else
+      z::log::warn "Failed to activate mise"
+    fi
   fi
 
-  if command -v direnv >/dev/null 2>&1; then
-    _safe_eval "$(direnv hook zsh)" 10 true
+  if z::cmd::exists direnv; then
+    if z::exec::eval "$(direnv hook zsh)" 10 true; then
+      z::log::debug "direnv hook installed successfully"
+    else
+      z::log::warn "Failed to install direnv hook"
+    fi
   fi
 
-  if ((IS_MACOS)); then
-    local -a autojump_scripts=(
-      '/opt/homebrew/etc/profile.d/autojump.sh'
-      '/usr/local/etc/profile.d/autojump.sh'
-    )
-    for script in "${autojump_scripts[@]}"; do
-      if _safe_source "$script"; then
-        _log_debug "autojump loaded from: $script"
-        break
-      fi
-    done
-  fi
+#  if ((IS_MACOS)); then
+#    local -a autojump_scripts=(
+#      '/opt/homebrew/etc/profile.d/autojump.sh'
+#      '/usr/local/etc/profile.d/autojump.sh'
+#    )
+#    for script in "${autojump_scripts[@]}"; do
+#      if z::path::source "$script"; then
+#        z::log::debug "autojump loaded from: $script"
+#        break
+#      fi
+#    done
+#  fi
+
+  z::log::debug "External tools setup completed"
 }
 
 ###
@@ -145,8 +159,9 @@ _setup_external_tools() {
 ###
 _create_stub_functions() {
   # Stub for a common Git prompt function.
-  if ! _function_exists _git_prompt_info; then
+  if ! z::func::exists _git_prompt_info; then
     _git_prompt_info() { return 0; }
+    z::log::debug "Created stub for _git_prompt_info"
   fi
 
   # Stubs for Zconvey, a testing tool that might not be present.
@@ -156,8 +171,25 @@ _create_stub_functions() {
     __zconvey_on_period_passed
   )
   for func in "${zconvey_functions[@]}"; do
-    if ! _function_exists "$func"; then
+    if ! z::func::exists "$func"; then
       eval "$func() { return 0; }"
+      z::log::debug "Created stub for $func"
     fi
   done
+
+  z::log::debug "Stub functions created successfully"
 }
+
+# Main setup function - call all setup functions
+_setup_extra_module() {
+  z::runtime::check_interrupted || return $?
+
+#  _setup_gcloud_sdk
+#  _setup_external_tools
+  _create_stub_functions
+
+  z::log::debug "Extra module setup completed successfully"
+}
+
+# Execute setup when module is sourced
+_setup_extra_module
