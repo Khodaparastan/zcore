@@ -1,595 +1,1127 @@
 #!/usr/bin/env zsh
-#
-# Description:
-# A comprehensive, production-ready utility library for Zsh. It provides a
-# robust framework for logging, safe execution, command handling, filesystem
-# operations, state management, and UI feedback in complex shell environments.
-#
-# Last Modified: 2025-08-01
-
-# --- Table of Contents ---
-# 1. Core Framework (Config, Logging, Interrupts, Fatal Errors)
-# 2. Command & Alias Handling
-# 3. Dynamic & Safe Execution
-# 4. Filesystem & Sourcing
-# 5. Function Introspection & Caching
-# 6. State Management
-# 7. User Interface (UI)
-# 8. Initialization
 
 # ==============================================================================
 # 1. CORE FRAMEWORK
 # ==============================================================================
 
-typeset -gA _zsh_config
-_zsh_config[log_error]=0
-_zsh_config[log_warn]=1
-_zsh_config[log_info]=2
-_zsh_config[log_debug]=3
-_zsh_config[exit_general_error]=1
-_zsh_config[exit_interrupted]=130
-_zsh_config[progress_update_interval]=10
-_zsh_config[timeout_default]=30
-_zsh_config[log_max_depth]=100
-_zsh_config[cache_max_size]=100
-_zsh_config[performance_mode]=false
+# Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
+zmodload -F zsh/datetime b:EPOCHSECONDS 2> /dev/null \
+  || true
 
-# Global verbosity level.
-typeset -gi _zsh_config_verbose
-if [[ -n ${zsh_config_verbose:-} && ${zsh_config_verbose} == <-> ]]; then
-	_zsh_config_verbose=${zsh_config_verbose}
+typeset -gA _zcore_config
+_zcore_config[log_error]=0
+_zcore_config[log_warn]=1
+_zcore_config[log_info]=2
+_zcore_config[log_debug]=3
+_zcore_config[exit_general_error]=1
+_zcore_config[exit_interrupted]=130
+_zcore_config[progress_update_interval]=10
+_zcore_config[timeout_default]=30
+_zcore_config[log_max_depth]=50
+_zcore_config[cache_max_size]=100
+_zcore_config[performance_mode]=${ZCORE_CONFIG_PERFORMANCE_MODE:-false}
+_zcore_config[show_progress]=${ZCORE_CONFIG_SHOW_PROGRESS:-true}
+
+# Global verbosity level
+# 0 = error only, 1 = warn, 2 = info (default), 3 = debug
+typeset -gi _zcore_verbose_level
+if [[ -n ${zcore_config_verbose:-} && ${zcore_config_verbose} == <-> ]]; then
+	if ((zcore_config_verbose > _zcore_config[log_info])) \
+	  && [[ "${_zcore_config[performance_mode]:-}" != "true" ]]; then
+		_zcore_verbose_level=${zcore_config_verbose}
+	else
+		_zcore_verbose_level=${_zcore_config[log_info]}
+	fi
 else
-	_zsh_config_verbose=${_zsh_config[log_info]}
+	_zcore_verbose_level=${_zcore_config[log_info]}
 fi
 
-# Override performance mode with an environment variable if set.
-if [[ -n ${ZSH_CONFIG_PERFORMANCE_MODE:-} ]]; then
-	_zsh_config[performance_mode]="${ZSH_CONFIG_PERFORMANCE_MODE}"
+# Function to enable debug mode
+z::log::enable_debug()
+{
+	emulate -L zsh
+	_zcore_verbose_level=${_zcore_config[log_debug]}
+	z::log::info "Debug mode enabled"
+}
+
+# Function to check current verbosity level
+z::log::get_level()
+{
+	emulate -L zsh
+	local level_name
+	case $_zcore_verbose_level in
+		(${_zcore_config[log_error]}) level_name="error" ;;
+		(${_zcore_config[log_warn]}) level_name="warn" ;;
+		(${_zcore_config[log_info]}) level_name="info" ;;
+		(${_zcore_config[log_debug]}) level_name="debug" ;;
+		(*) level_name="unknown" ;;
+	esac
+	print -r -- "Current verbosity level: $_zcore_verbose_level ($level_name)"
+}
+
+# Function to toggle progress bars on/off
+z::log::toggle_progress()
+{
+	emulate -L zsh
+	if [[ "${_zcore_config[show_progress]:-}" == "true" ]]; then
+		_zcore_config[show_progress]=false
+		z::log::info "Progress bars disabled"
+	else
+		_zcore_config[show_progress]=true
+		z::log::info "Progress bars enabled"
+	fi
+}
+
+# Function to clear any lingering progress output
+z::ui::progress::clear()
+{
+	emulate -L zsh
+	if [[ -t 2 ]]; then
+		printf '\r\e[K' >&2
+	fi
+}
+
+# Performance mode override
+if [[ -n ${ZCORE_CONFIG_PERFORMANCE_MODE:-} ]]; then
+	_zcore_config[performance_mode]="${ZCORE_CONFIG_PERFORMANCE_MODE}"
 fi
-# Global state variables.
-typeset -gi _zsh_config_interrupted=0
+
+# Progress bar override
+if [[ -n ${ZCORE_CONFIG_SHOW_PROGRESS:-} ]]; then
+	_zcore_config[show_progress]="${ZCORE_CONFIG_SHOW_PROGRESS}"
+fi
+
+# Global state variables
+typeset -gi _zcore_config_interrupted=0
 typeset -gi _log_depth=0
-typeset -gi _in_function_check=0     # reserved for future use
-typeset -gi _cached_term_width=0     # reserved for future use
+typeset -gi _cached_term_width=0
+typeset -gi _zcore_prev_columns=0
 
-# Centralized cache initialization.
-typeset -gA _function_cache
-typeset -ga _cache_order
-typeset -gi _cache_size=0
+# Function existence cache
+typeset -gA _func_cache
+typeset -ga _func_cache_order
+typeset -gi _func_cache_size=0
 
-# Color setup (cached once for performance).
-typeset -gA _zsh_colors
-if [[ -t 2 && -z ${NO_COLOR:-} ]] && (( $+commands[tput] )) && tput setaf 1 >/dev/null 2>&1; then
-	_zsh_colors=(
-		[red]="$(tput setaf 1)" [green]="$(tput setaf 2)" [blue]="$(tput setaf 4)"
-		[yellow]="$(tput setaf 3)" [reset]="$(tput sgr0)"
+# Command existence cache
+typeset -gA _cmd_cache
+typeset -ga _cmd_cache_order
+typeset -gi _cmd_cache_size=0
+
+# Timeout command detection (GNU timeout or coreutils gtimeout on macOS)
+typeset -g _zcore_timeout_cmd=""
+if (($+commands[timeout])); then
+	_zcore_timeout_cmd="timeout"
+elif (($+commands[gtimeout])); then
+	_zcore_timeout_cmd="gtimeout"
+fi
+
+typeset -gA _zcore_colors
+if [[ -t 2 && -z ${NO_COLOR:-} ]] \
+  && (($+commands[tput])) \
+  && tput setaf 1 > /dev/null 2>&1; then
+	_zcore_colors=(
+		[red]="$(tput setaf 1)"
+		[green]="$(tput setaf 2)"
+		[blue]="$(tput setaf 4)"
+		[yellow]="$(tput setaf 3)"
+		[reset]="$(tput sgr0)"
 	)
 else
-	_zsh_colors=([red]="" [green]="" [blue]="" [yellow]="" [reset]="")
+	_zcore_colors=([red]="" [green]="" [blue]="" [yellow]="" [reset]="")
 fi
+
+# Timestamp caching for performance
+typeset -g _cached_timestamp=""
+typeset -gi _timestamp_epoch=0
 
 # --- Logging ---
 
-###
-# Logs a message to stderr with a level, timestamp, and color.
-# @param integer Log level.
-# @param string ... Message to log.
-###
-_log_engine() {
+z::log::_update_ts()
+{
 	emulate -L zsh
+	local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2> /dev/null)}
+	if ((current_epoch != _timestamp_epoch)); then
+		_timestamp_epoch=$current_epoch
+		if print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2> /dev/null; then
+			:
+		else
+			_cached_timestamp=$(
+				date '+%Y-%m-%d %H:%M:%S' 2> /dev/null \
+				  || date
+			)
+		fi
+	fi
+}
 
-	if (( _log_depth > _zsh_config[log_max_depth] )); then
-		print -r -- "FATAL: Recursion in _log_engine" >&2
+z::log::_engine()
+{
+	emulate -L zsh
+	setopt localoptions no_unset warn_create_global
+
+	# Prevent infinite recursion
+	if ((_log_depth > _zcore_config[log_max_depth])); then
+		print -r -- "FATAL: Recursion in z::log::_engine" >&2
 		return 1
 	fi
-	(( _log_depth++ ))
+	((_log_depth++))
 
+	# Validate log level
 	local -i level
 	if [[ -z ${1-} || $1 != <-> ]]; then
 		print -r -- "[error] Invalid log level: '${1-}'" >&2
-		(( _log_depth-- ))
+		((_log_depth--))
 		return 1
 	fi
 	level=$1
 	shift
 
-	if (( level > _zsh_config_verbose )); then
-		(( _log_depth-- ))
+	# Early return for filtered messages
+	if ((level > _zcore_verbose_level)); then
+		((_log_depth--))
 		return 0
 	fi
 
+	# Get timestamp
+	z::log::_update_ts
+
+	# Map level to prefix and color
 	local prefix=""
 	case $level in
-		(${_zsh_config[log_error]}) prefix="${_zsh_colors[red]}[error]${_zsh_colors[reset]}" ;;
-		(${_zsh_config[log_warn]})  prefix="${_zsh_colors[yellow]}[warn]${_zsh_colors[reset]}" ;;
-		(${_zsh_config[log_info]})  prefix="${_zsh_colors[blue]}[info]${_zsh_colors[reset]}" ;;
-		(${_zsh_config[log_debug]}) prefix="${_zsh_colors[green]}[debug]${_zsh_colors[reset]}" ;;
-		(*)                         prefix="[unknown]" ;;
+		(${_zcore_config[log_error]}) prefix="${_zcore_colors[red]}[error]${_zcore_colors[reset]}" ;;
+		(${_zcore_config[log_warn]}) prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
+		(${_zcore_config[log_info]}) prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
+		(${_zcore_config[log_debug]}) prefix="${_zcore_colors[green]}[debug]${_zcore_colors[reset]}" ;;
+		(*) prefix="[unknown]" ;;
 	esac
 
-	# Build timestamp via prompt expansion only for the time part
-	local ts
-	print -P -v ts -- "%D{%Y-%m-%d %H:%M:%S}"
+	local msg="${(j: :)@}"
+	print -r -- "${_cached_timestamp} ${prefix} ${msg}" >&2
 
-	# Compose and emit (avoid -P here to prevent prompt escape expansion in user text)
-	print -r -- "${ts} ${prefix} $*" >&2
-
-	(( _log_depth-- ))
-	return 0
-}
-_log_error() { _log_engine ${_zsh_config[log_error]} "$@"; }
-_log_warn()  { _log_engine ${_zsh_config[log_warn]}  "$@"; }
-_log_info()  { _log_engine ${_zsh_config[log_info]}  "$@"; }
-_log_debug() { _log_engine ${_zsh_config[log_debug]} "$@"; }
-
-# --- Interrupt Handling ---
-# --- Interrupt Handling ---
-
-###
-# Trap handler for INT and TERM signals.
-###
-_handle_interrupt() {
-	emulate -L zsh
-	if (( _zsh_config_interrupted == 0 )); then
-		_zsh_config_interrupted=1
-		_log_warn "Interrupt received. Gracefully shutting down..."
-	fi
-	# zsh traps persist; no need to re-arm here
-}
-
-###
-# Checks if an interrupt has been received.
-###
-_check_interrupted() {
-	emulate -L zsh
-	if (( _zsh_config_interrupted )); then
-		_log_info "Operation cancelled by user."
-		return ${_zsh_config[exit_interrupted]}
-	fi
+	((_log_depth--))
 	return 0
 }
 
-# --- Fatal Errors ---
+# Logging interface functions
+z::log::error()
+{
+	z::log::_engine ${_zcore_config[log_error]} "$@"
+}
+z::log::warn()
+{
+	z::log::_engine ${_zcore_config[log_warn]} "$@"
+}
+z::log::info()
+{
+	z::log::_engine ${_zcore_config[log_info]} "$@"
+}
+z::log::debug()
+{
+	z::log::_engine ${_zcore_config[log_debug]} "$@"
+}
 
-###
-# Logs a fatal error and exits or returns.
-# @param string Error message.
-# @param integer Exit code (optional).
-###
-_die() {
+# --- Interrupt Handling ---
+
+z::runtime::handle_interrupt()
+{
+	emulate -L zsh
+
+	# Only handle actual interrupts, not normal editing
+	if [[ -n ${ZLE_STATE:-} ]]; then
+		return 0 # Don't handle interrupts during ZLE (line editing)
+	fi
+
+	if ((_zcore_config_interrupted == 0)); then
+		_zcore_config_interrupted=1
+		z::ui::progress::clear
+		z::log::warn "Interrupt received. Gracefully shutting down..."
+	fi
+}
+
+z::runtime::check_interrupted()
+{
+	emulate -L zsh
+	if ((_zcore_config_interrupted)); then
+		z::log::info "Operation cancelled by user."
+		return ${_zcore_config[exit_interrupted]}
+	fi
+	return 0
+}
+
+z::config::set()
+{
+	emulate -L zsh
+	local key="${1-}" value="${2-}"
+
+	if [[ -z "$key" ]]; then
+		z::log::error "z::config::set: Configuration key cannot be empty."
+		return 1
+	fi
+
+	if ((!${+_zcore_config[$key]})); then
+		z::log::warn "z::config::set: Unknown configuration key: '$key'."
+		return 1
+	fi
+
+	case "$key" in
+		log_* | exit_* | *interval | *timeout | *depth | *size)
+			if [[ "$value" != <-> ]]; then
+				z::log::error "z::config::set: Value for '$key' must be an integer, but got '$value'."
+				return 1
+			fi
+			;;
+		*mode | show_progress)
+			if [[ "$value" != "true" && "$value" != "false" ]]; then
+				z::log::error "z::config::set: Value for '$key' must be 'true' or 'false', but got '$value'."
+				return 1
+			fi
+			;;
+	esac
+
+	_zcore_config[$key]="$value"
+	z::log::debug "Configuration updated: $key = $value"
+	return 0
+}
+
+# --- Fatal Error Handling ---
+
+z::runtime::die()
+{
 	emulate -L zsh
 	local message="${1-}"
-	local -i exit_code=${2:-${_zsh_config[exit_general_error]}}
+	local -i exit_code=${2:-${_zcore_config[exit_general_error]}}
 
-	_log_error "FATAL: $message"
+	z::ui::progress::clear
+	z::log::error "FATAL: $message"
 
-	# If running code sourced from a file, return; otherwise exit the process
-	local ctx="${ZSH_EVAL_CONTEXT:-}"
-	if [[ $ctx == *:file:* ]]; then
+	# Return in sourced context, exit otherwise
+	if [[ -n $ZSH_EVAL_CONTEXT && $ZSH_EVAL_CONTEXT == *:file:* ]]; then
 		return $exit_code
 	else
 		exit $exit_code
 	fi
 }
 
-
 # ==============================================================================
 # 2. COMMAND & ALIAS HANDLING
 # ==============================================================================
 
-###
-# Safely creates an alias, validating the target command.
-# @param string Alias name.
-# @param string Alias value (the command).
-###
-_safe_alias() {
+# Private helper: command name extraction from an alias definition
+z::alias::_extract_name()
+{
 	emulate -L zsh
+	setopt localoptions typeset_silent extendedglob
+
+	local alias_value="${1-}"
+	[[ -z $alias_value ]] \
+	  && return 1
+
+	local -a tokens
+	tokens=(${(z)alias_value})
+	((${#tokens} == 0)) \
+	  && return 1
+
+	local i=1 t seen_cmd=0
+	while ((i <= ${#tokens})); do
+		t=${tokens[i]}
+
+		# Skip leading assignments
+		if ((!seen_cmd)) \
+		  && [[ $t == [[:alpha:]_][[:alnum:]_]*=* ]]; then
+			((i++))
+			continue
+		fi
+
+		case $t in
+			nocorrect | noglob | nohup | time | nice)
+				((i++))
+				while ((i <= ${#tokens})); do
+					t=${tokens[i]}
+					[[ $t == -- ]] \
+					  && {
+						((i++))
+						break
+					}
+					[[ $t == -* ]] \
+					  || break
+					((i++))
+				done
+				continue
+				;;
+			sudo | doas)
+				((i++))
+				while ((i <= ${#tokens})); do
+					t=${tokens[i]}
+					[[ $t == -- ]] \
+					  && {
+						((i++))
+						break
+					}
+					# Long options with required args
+					if [[ $t == --user || $t == --group || $t == --prompt || $t == --close-from || $t == --chdir || $t == --command-timeout ]]; then
+						((i += 2))
+						continue
+					fi
+					if [[ $t == --user=* || $t == --group=* || $t == --prompt=* || $t == --close-from=* || $t == --chdir=* || $t == --command-timeout=* ]]; then
+						((i++))
+						continue
+					fi
+					# Short options; some require an argument
+					case $t in
+						-u | -g | -p | -C | -r | -t | -D)
+							((i += 2))
+							continue
+							;;
+						-*)
+							((i++))
+							continue
+							;;
+					esac
+					break
+				done
+				continue
+				;;
+			env)
+				((i++))
+				while ((i <= ${#tokens})); do
+					t=${tokens[i]}
+					[[ $t == -- ]] \
+					  && {
+						((i++))
+						break
+					}
+					[[ $t == [[:alpha:]_][[:alnum:]_]*=* ]] \
+					  && {
+						((i++))
+						continue
+					}
+					[[ $t == -* ]] \
+					  && {
+						((i++))
+						continue
+					}
+					break
+				done
+				continue
+				;;
+		esac
+
+		# First sensible token becomes the command name
+		if [[ $t == -* || $t == '|' || $t == '||' || $t == '&&' || $t == ';' || $t == '&' ]]; then
+			((i++))
+			continue
+		fi
+
+		print -r -- "$t"
+		return 0
+	done
+
+	return 1
+}
+
+z::alias::define()
+{
+	emulate -L zsh
+	setopt no_unset warn_create_global
 
 	local alias_name="${1-}" alias_value="${2-}"
 	if [[ -z $alias_name || -z $alias_value || $alias_name == *[[:space:]=]* ]]; then
-		_log_error "Invalid alias definition: name='$alias_name' value='$alias_value'"
+		z::log::error "Invalid alias definition: name='$alias_name' value='$alias_value'"
 		return 1
 	fi
 
-	# In performance mode, skip command validation.
-	if [[ ${_zsh_config[performance_mode]:-} != "true" ]]; then
-		# Derive the command name from the alias value, respecting shell word rules
-		local -a tokens premods skip_validation
-		premods=(nocorrect noglob builtin command exec time nice nohup sudo doas env)
-		skip_validation=(j z zi autojump)  # Commands that may be loaded later
-
-		local cmd_name='' t
-		tokens=(${(z)alias_value})
-
-		# Track certain precommands to skip their flags/args
-		local -i seen_env=0 seen_sudo=0 seen_time=0 seen_nice=0 seen_nohup=0
-
-		for t in "${tokens[@]}"; do
-			# Skip precommand modifiers (not real executables). (Ie) returns 0 if not found.
-			if (( ${premods[(Ie)$t]} )); then
-				case $t in
-					env)        seen_env=1 ;;
-					sudo|doas)  seen_sudo=1 ;;
-					time)       seen_time=1 ;;
-					nice)       seen_nice=1 ;;
-					nohup)      seen_nohup=1 ;;
-				esac
-				continue
-			fi
-
-			# Skip NAME=VALUE assignments anywhere
-			if [[ $t == [[:alpha:]_][[:alnum:]_]*=* ]]; then
-				continue
-			fi
-
-			# Skip options that belong to certain precommands
-			if (( seen_env || seen_sudo || seen_time || seen_nice || seen_nohup )); then
-				if [[ $t == -- || $t == -* ]]; then
-					continue
-				fi
-			fi
-
-			cmd_name=$t
-			break
-		done
-
-		# Validate command unless explicitly skipped
-		if [[ -n $cmd_name ]] && (( ${skip_validation[(Ie)$cmd_name]} == 0 )); then
-			if ! command -v -- "$cmd_name" >/dev/null 2>&1; then
-				_log_debug "Command '$cmd_name' not yet available for alias '$alias_name'"
-			fi
-		fi
-	fi
-
-	if ! builtin alias "${alias_name}=${alias_value}" 2>/dev/null; then
-		_log_error "Failed to create alias: $alias_name='$alias_value'"
+	if ! builtin alias "${alias_name}=${alias_value}" 2> /dev/null; then
+		z::log::error "Failed to create alias: $alias_name='$alias_value'"
 		return 1
 	fi
-	_log_debug "Created alias: $alias_name='$alias_value'"
+	z::log::debug "Created alias: $alias_name='$alias_value'"
 	return 0
 }
 
-###
-# Adds a directory to the PATH environment variable if it exists and is not already present.
-# @param string Directory to add.
-# @param string Position to add the directory ("append" or "prepend"). Defaults to "append".
-###
-_add_to_path() {
-    local dir="$1"
-    local position="${2:-append}"
+z::path::add()
+{
+	emulate -L zsh
+	local dir="$1"
+	local position="${2:-append}"
 
-    if [[ -z "$dir" ]]; then
-        _log_error "Empty directory provided to _add_to_path"
-        return 1
-    fi
+	if [[ -z "$dir" ]]; then
+		z::log::error "Empty directory provided to z::path::add"
+		return 1
+	fi
 
-    local original_dir="$dir"
-    if ! dir=$(_resolve_path "$dir"); then
-        _log_debug "Failed to resolve directory path for PATH: $original_dir"
-        return 1
-    fi
+	local original_dir="$dir"
+	if ! dir=$(z::path::resolve "$dir"); then
+		z::log::debug "Failed to resolve directory path for PATH: $original_dir"
+		return 1
+	fi
 
-    if [[ ! -d "$dir" ]]; then
-        _log_debug "Directory does not exist, not adding to PATH: $dir"
-        return 1
-    fi
+	if [[ ! -d "$dir" ]]; then
+		z::log::debug "Directory does not exist, not adding to PATH: $dir"
+		return 0
+	fi
 
-    if [[ ":${PATH}:" == *":${dir}:"* ]]; then
-        _log_debug "Directory already in PATH: $dir"
-        return 0
-    fi
+	if [[ ":${PATH}:" == *":${dir}:"* ]]; then
+		z::log::debug "Directory already in PATH: $dir"
+		return 0
+	fi
 
-    case "$position" in
-        prepend)
-            export PATH="$dir:$PATH"
-            ;;
-        append)
-            export PATH="$PATH:$dir"
-            ;;
-        *)
-            _log_error "Invalid position for _add_to_path: $position (use prepend or append)"
-            return 1
-            ;;
-    esac
+	case "$position" in
+		prepend) export PATH="$dir:$PATH" ;;
+		append) export PATH="$PATH:$dir" ;;
+		*)
+			z::log::error "Invalid position for z::path::add: $position (use prepend or append)"
+			return 1
+			;;
+	esac
 
-    _log_debug "Added to PATH ($position): $dir"
-    return 0
+	z::log::debug "Added to PATH ($position): $dir"
+	return 0
 }
-
 
 # ==============================================================================
 # 3. DYNAMIC & SAFE EXECUTION
 # ==============================================================================
 
-###
-# Safely evaluates a string of shell code with security checks.
-# @param string Code to evaluate.
-# @param integer Timeout in seconds (optional).
-# @param boolean Force execution in the current shell (optional).
-###
-_safe_eval() {
-    local input="$1"
-    local -i timeout=${2:-${_zsh_config[timeout_default]}}
-    local force_current_shell="${3:-false}"
-    if [[ -z "$input" ]]; then
-        _log_error "Empty input for _safe_eval"
-        return 1
-    fi
+# Private helper: shell init detection
+#z::exec::_is_init_cmd() {
+#	emulate -L zsh
+#	local input="$1"
+#	# Direct form: ... (starship|...) init ...
+#	if [[ "$input" =~ '(^|[[:space:]])(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
+#		return 0
+#	fi
+#	# Wrapped in command substitution, e.g., eval "$(starship init zsh)"
+#	if [[ "$input" =~ '\\$\\([^)]*(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init[^)]*\\)' ]]; then
+#		return 0
+#	fi
+#	# env wrapper heuristic: env VAR=... <tool> init ...
+#	if [[ "$input" =~ '(^|[[:space:]])env([[:space:]]+[-[:alnum:]_]+=.*)*[[:space:]]+(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
+#		return 0
+#	fi
+#	return 1
+#}
+z::exec::_is_init_cmd()
+{
+	emulate -L zsh
+	local input="$1"
+	# Relaxed heuristic: detect any occurrence of a known tool name followed by `init`
+	# Works for: direct use, env-wrapped, eval "$( ... )", and similar forms.
+	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
+		return 0
+	fi
+	# Also accept cases where init is the last token with no trailing space
+	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init$' ]]; then
+		return 0
+	fi
+	return 1
+}
+# Private helper: dangerous pattern detection
 
-    local eval_code=""
-    local is_shell_init=false
-    if [[ "$input" =~ ^(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh).*init ]]; then
-        is_shell_init=true
-    fi
+z::exec::_check_segment()
+{
+	emulate -L zsh
+	local cmd="$1"
+	shift
+	local -a args=("$@")
 
-    # --- Execution Method ---
-    local -i exit_code=0
-    if [[ "${_zsh_config[performance_mode]}" == "true" ]] && [[ "$is_shell_init" == "true" ]]; then
-        # FAST MODE: Direct, less safe execution for init scripts.
-        _log_debug "Running init in performance mode: $input"
-        eval "$($input)" || exit_code=$?
+	if [[ $cmd == rm ]]; then
+		local have_r=0 have_f=0 a
+		for a in "${args[@]}"; do
+			if [[ $a == --* ]]; then
+				continue
+			elif [[ $a == -* ]]; then
+				[[ $a == *r* ]] \
+				  && have_r=1
+				[[ $a == *f* ]] \
+				  && have_f=1
+				continue
+			fi
+		done
+		if ((have_r && have_f)); then
+			for a in "${args[@]}"; do
+				case "$a" in
+					/ | /* | ~ | ~/* | \$HOME | \$HOME/*)
+						z::log::error "Dangerous rm target: $a"
+						return 1
+						;;
+				esac
+			done
+		fi
+	fi
 
-    elif [[ "$is_shell_init" == "true" ]]; then
-        # SAFE MODE: Isolate init scripts in a subshell.
-        _log_debug "Detected shell init command: $input"
-        local temp_stderr
-        temp_stderr=$(mktemp 2>/dev/null || print -r -- "${TMPDIR:-/tmp}/zsh_eval_$$")
+	if [[ $cmd == dd ]]; then
+		local kv dev base
+		for kv in "${args[@]}"; do
+			if [[ $kv == of=/dev/* ]]; then
+				dev="${kv#of=}"
+				base="${dev#/dev/}"
+				case "$base" in
+					sd* | hd* | nvme* | disk* | rdisk*)
+						z::log::error "Dangerous dd of= raw device: $dev"
+						return 1
+						;;
+				esac
+			fi
+		done
+	fi
 
-        eval_code=$(zsh -c "$input" 2>"$temp_stderr") || exit_code=$?
+	if [[ $cmd == mkfs.* ]]; then
+		local a
+		for a in "${args[@]}"; do
+			if [[ $a == /dev/* ]]; then
+				z::log::error "Dangerous mkfs target: $a"
+				return 1
+			fi
+		done
+	fi
 
-        local stderr_output
-        stderr_output=$(<"$temp_stderr" 2>/dev/null)
-        rm -f "$temp_stderr" 2>/dev/null
+	if [[ $cmd == chmod ]]; then
+		local mode="" a
+		local -i nmode=-1 saw_root=0
+		for a in "${args[@]}"; do
+			if [[ -z $mode && $a == <-> ]]; then
+				mode="$a"
+				continue
+			fi
+			if [[ $a == / || $a == /* ]]; then
+				saw_root=1
+				continue
+			fi
+		done
+		if [[ -n $mode ]]; then
+			local -i tmp
+			tmp=$((10#${mode}))
+			nmode=$tmp
+		fi
+		if ((saw_root && nmode == 777)); then
+			z::log::error "Dangerous chmod 777 on /"
+			return 1
+		fi
+	fi
 
-        if (( exit_code != 0 )); then
-            _log_error  "Init command failed: $input (code: $exit_code)"
-            [[ -n "$stderr_output" ]] && _log_debug "Stderr: $stderr_output"
-            return $exit_code
-        fi
-        if [[ -z "$eval_code" ]]; then
-            _log_warn "Init command gave empty output: $input"
-            return 1
-        fi
-        # Fall through to execute the generated code.
-        input="$eval_code"
-    fi
+	if [[ $cmd == killall || $cmd == pkill ]]; then
+		local a
+		for a in "${args[@]}"; do
+			case "$a" in
+				-9 | -KILL | -SIGKILL)
+					z::log::error "Dangerous kill signal -9 detected"
+					return 1
+					;;
+			esac
+		done
+	fi
 
-    # --- Security Scan (for non-init or generated code) ---
-    if [[ "${_zsh_config[performance_mode]}" != "true" ]]; then
-        local -ra dangerous_patterns=(
-            'rm[[:space:]]\+-[^[:space:]]*[rf]' 'sudo[[:space:]]\+rm' 'dd[[:space:]]\+'
-            '>[[:space:]]*/dev/(sd|hd|nvme)' 'mkfs\.' 'chmod[[:space:]]\+777' ':[[:space:]]*\(\)[[:space:]]*\{'
-            'curl[^|]*\|[^|]*sh' 'wget[^|]*\|[^|]*sh' 'base64[[:space:]]\+-d' 'find[[:space:]]\+.*-delete'
-        )
-        local pattern
-        for pattern in "${dangerous_patterns[@]}"; do
-            if [[ "$input" =~ $pattern ]]; then
-                _log_error "Potentially dangerous eval detected (pattern: $pattern)"
-                return 1
-            fi
-        done
-    fi
+	if [[ $cmd == userdel ]]; then
+		local a
+		for a in "${args[@]}"; do
+			[[ $a == -r ]] \
+			  && {
+				z::log::error "Dangerous userdel -r"
+				return 1
+			}
+		done
+	fi
+	if [[ $cmd == groupdel ]]; then
+		z::log::error "Dangerous groupdel detected"
+		return 1
+	fi
 
-    _check_interrupted || return $?
+	return 0
+}
+z::exec::_has_dangerous_metachars()
+{
+	emulate -L zsh
+	local input="$1"
+	[[ -z "$input" ]] \
+	  && return 1
+	[[ "$input" =~ [\;\&\(\)] ]]
+}
+z::exec::_scan_patterns()
+{
+	emulate -L zsh
+	setopt localoptions typeset_silent
+	local input="${1-}"
+	[[ -z $input ]] \
+	  && return 0
 
-    # --- Final Execution ---
-    local run_in_current_shell=false
-    if [[ "$force_current_shell" == "true" ]] || [[ "$is_shell_init" == "true" ]]; then
-        run_in_current_shell=true
-    fi
+	if z::exec::_is_init_cmd "$input"; then
+		return 0
+	fi
 
-    if [[ "$run_in_current_shell" == "true" ]]; then
-        eval "$input" || exit_code=$?
-    elif (( $+commands[timeout] )); then
-        timeout "$timeout" zsh -c "$input" || exit_code=$?
-        if (( exit_code == 124 )); then
-            _log_warn "Eval timed out after ${timeout}s"
-        fi
-    else
-        _log_warn "Timeout command not found, skipping non-init eval for safety."
-        return 1
-    fi
+	# Tokenize using zsh's lexer
+	local -a words
+	words=(${(z)input})
+	((${#words} == 0)) \
+	  && return 0
 
-    if (( exit_code != 0 && exit_code != 124 )); then
-        _log_warn "Eval failed with exit code $exit_code"
-    fi
-    return $exit_code
+	# Guard: pipe to a shell
+	local i next
+	for (( i = 1; i <= ${#words}; i++ )); do
+		if [[ ${words[i]} == '|' ]]; then
+			next="${words[i+1]-}"
+			case "$next" in
+				sh | bash | zsh | ksh | dash)
+					z::log::error "Dangerous pattern: pipe to shell"
+					return 1
+					;;
+			esac
+		fi
+	done
+
+	# Guard: common fork bomb
+	if [[ $input =~ ':\(\)\{[[:space:]]*:[[:space:]]*\|[[:space:]]*&[[:space:]]*;[[:space:]]*:[[:space:]]*\}' ]]; then
+		z::log::error "Dangerous pattern: fork bomb"
+		return 1
+	fi
+
+	# Build and check segments split across |, ||, &&, ;, &
+	local -a seg=()
+	local w
+	for w in "${words[@]}"; do
+		case "$w" in
+			'|' | '||' | '&&' | ';' | '&')
+				if ((${#seg})); then
+					local cmd="${seg[1]}"
+					local -a args=("${(@)seg[2,-1]}")
+					z::exec::_check_segment "$cmd" "${args[@]}" \
+					  || return 1
+					seg=()
+				else
+					return 1
+				fi
+				;;
+			nocorrect | noglob | builtin | exec | time | nice | nohup | sudo | doas | env)
+			# Skip precommands only at segment start
+				if ((${#seg} == 0)); then
+					continue
+				else
+					seg+=("$w")
+				fi
+				;;
+			[[:alpha:]_][[:alnum:]_]*=*)
+			# Skip leading assignments in a segment
+				if ((${#seg} == 0)); then
+					continue
+				else
+					seg+=("$w")
+				fi
+				;;
+			*)
+				seg+=("$w")
+				;;
+		esac
+	done
+
+	if ((${#seg})); then
+		local cmd="${seg[1]}"
+		local -a args=("${(@)seg[2,-1]}")
+		z::exec::_check_segment "$cmd" "${args[@]}" \
+		  || return 1
+	else
+		return 1
+	fi
+
+	return 0
+}
+# Safe command execution (without eval, with pipefail)
+z::exec::run()
+{
+	emulate -L zsh
+	local input="$1"
+	local -i timeout=${2:-${_zcore_config[timeout_default]}}
+
+	if [[ -z "$input" ]]; then
+		z::log::error "Empty input for z::exec::run"
+		return 1
+	fi
+
+	# Short-term guard: block ;, &, ( ) unless explicitly whitelisted init
+	if ! z::exec::_is_init_cmd "$input"; then
+		if z::exec::_has_dangerous_metachars "$input"; then
+			z::log::error "Rejected dangerous metacharacters in input"
+			return 1
+		fi
+	fi
+
+	# Security scan (now robust across separators)
+	z::exec::_scan_patterns "$input" \
+	  || return 1
+
+	z::runtime::check_interrupted \
+	  || return $?
+
+	local -i exit_code=0
+
+	if [[ -n "${_zcore_timeout_cmd:-}" ]]; then
+		"${_zcore_timeout_cmd}" "$timeout" zsh -o pipefail -c "$input" \
+		  || exit_code=$?
+		if ((exit_code == 124)); then
+			z::log::warn "Command timed out after ${timeout}s"
+		fi
+	else
+		z::log::warn "Timeout command not found, executing directly"
+		zsh -o pipefail -c "$input" \
+		  || exit_code=$?
+	fi
+
+	if ((exit_code != 0 && exit_code != 124)); then
+		z::log::warn "Command failed with exit code $exit_code"
+	fi
+	return $exit_code
 }
 
+z::exec::eval()
+{
+	emulate -L zsh
+	local input="$1"
+	local -i timeout=${2:-${_zcore_config[timeout_default]}}
+	local force_current_shell="${3:-false}"
+
+	if [[ -z "$input" ]]; then
+		z::log::error "Empty input for z::exec::eval"
+		return 1
+	fi
+
+	local is_shell_init=false
+	z::exec::_is_init_cmd "$input" \
+	  && is_shell_init=true
+
+	# Check for package manager installation patterns (common)
+	local is_package_install=false
+	if [[ $input =~ '(^|[[:space:]])(npm|yarn|pip|pip3|cargo|brew|apt|yum|dnf|pacman)[[:space:]]+(add|install)($|[[:space:]])' ]]; then
+		is_package_install=true
+	fi
+
+	local -i exit_code=0
+
+	# Handle shell init commands safely
+	if [[ "$is_shell_init" == "true" ]]; then
+		if [[ "${_zcore_config[performance_mode]}" == "true" ]]; then
+			z::log::debug "Running init in performance mode: $input"
+			z::exec::run "$input" "$timeout" \
+			  || exit_code=$?
+		else
+			z::log::debug "Detected shell init command: $input"
+			z::exec::run "$input" "$timeout" \
+			  || exit_code=$?
+		fi
+		return $exit_code
+	fi
+
+	# Security scan (skip only for known package managers and performance mode)
+	if [[ "${_zcore_config[performance_mode]}" != "true" ]] \
+	  && \
+	  [[ "$is_package_install" != "true" ]] \
+	  && \
+	  [[ "$force_current_shell" != "true" ]]; then
+		z::exec::_scan_patterns "$input" \
+		  || return 1
+	fi
+
+	z::runtime::check_interrupted \
+	  || return $?
+
+	# Execute the command safely
+	if [[ "$force_current_shell" == "true" ]]; then
+		# Only for trusted internal operations
+		eval "$input" \
+		  || exit_code=$?
+	else
+		# Use safe execution for external commands
+		z::exec::run "$input" "$timeout" \
+		  || exit_code=$?
+	fi
+
+	if ((exit_code != 0 && exit_code != 124)); then
+		z::log::warn "Eval failed with exit code $exit_code"
+	fi
+	return $exit_code
+}
 
 # ==============================================================================
 # 4. FILESYSTEM & SOURCING
 # ==============================================================================
 
-###
-# Resolves a path, handling tilde expansion and symlinks.
-# @param string Path to resolve.
-# @return Prints the resolved path to stdout.
-###
-_resolve_path() {
-    local path="$1"
-    if [[ -z "$path" || "$path" =~ ^[[:space:]]*$ ]]; then
-        _log_error "Empty or whitespace path provided to _resolve_path"
-        return 1
-    fi
+z::path::resolve()
+{
+	emulate -L zsh
+	local path="$1"
+	if [[ -z "$path" || "$path" =~ ^[[:space:]]*$ ]]; then
+		z::log::error "Empty or whitespace path provided to z::path::resolve"
+		return 1
+	fi
 
-    # Handle tilde expansion manually for robustness.
-    case "$path" in
-        '~'*) path="${HOME}${path#\~}" ;;
-    esac
+	# Tilde expansion (handle ~, ~/..., ~+, ~-, without glob side-effects)
+	if [[ $path == '~' || $path == '~/'* ]]; then
+		path="${HOME}${path#\~}"
+	elif [[ $path == '~+' || $path == '~+/'* ]]; then
+		path="${PWD}${path#\~+}"
+	elif [[ $path == '~-' || $path == '~-/'* ]]; then
+		path="${OLDPWD:-$PWD}${path#\~-}"
+	fi
 
-    # Resolve directory and symlinks.
-    if [[ -d "${path%/*}" ]]; then
-        local resolved_dir
-        if resolved_dir="$(cd "${path%/*}" 2>/dev/null && pwd -P)"; then
-            path="${resolved_dir}/${path##*/}"
-        fi
-    fi
-    if [[ -L "$path" ]]; then
-        local resolved_link
-        if resolved_link=$(readlink -f "$path" 2>/dev/null); then
-            path="$resolved_link"
-        fi
-    fi
-    printf '%s' "$path"
+	# Ensure absolute path prior to normalization
+	if [[ "$path" != /* ]]; then
+		path="${PWD%/}/$path"
+	fi
+
+	# Prefer zsh's realpath-like modifier (:A) for portability and speed
+	local normalized
+	normalized="${path:A}"
+	if [[ -n "$normalized" ]]; then
+		printf '%s' "$normalized"
+		return 0
+	fi
+
+	# Fallback: POSIX-friendly manual resolution without readlink -f
+	local current_path="$path"
+	local -i guard=0
+	local -i max_guard=100 # Increased from 40 for complex symlink chains
+
+	if command -v readlink > /dev/null 2>&1; then
+		while [[ -L "$current_path" && guard -lt max_guard ]]; do
+			local target
+			target=$(readlink "$current_path" 2> /dev/null) \
+			  || break
+			[[ -z "$target" ]] \
+			  && break
+			if [[ "$target" == /* ]]; then
+				current_path="$target"
+			else
+				current_path="${current_path:h}/$target"
+			fi
+			((guard++))
+		done
+
+		if ((guard >= max_guard)); then
+			z::log::warn "Symlink resolution exceeded maximum depth ($max_guard)"
+		fi
+	fi
+
+	if [[ -d "${current_path:h}" ]]; then
+		local physical_dir
+		if physical_dir=$(
+			cd -P "${current_path:h}" 2> /dev/null \
+			  && pwd -P
+		); then
+			current_path="${physical_dir}/${current_path:t}"
+		fi
+	fi
+
+	printf '%s' "$current_path"
 }
 
-###
-# Safely sources a file after validation.
-# @param string Path to the file to source.
-# @param ...    Arguments to pass to the sourced file.
-###
-_safe_source() {
-    local file="$1"
-    shift
-    if [[ -z "$file" ]]; then
-        _log_error "Empty file path for source"
-        return 1
-    fi
+z::path::source()
+{
+	emulate -L zsh
+	local file="$1"
+	shift
+	if [[ -z "$file" ]]; then
+		z::log::error "Empty file path for source"
+		return 1
+	fi
 
-    local resolved_file="$file"
-    # Skip expensive path resolution in performance mode.
-    if [[ "${_zsh_config[performance_mode]}" != "true" ]]; then
-        if ! resolved_file=$(_resolve_path "$file"); then
-            _log_error "Failed to resolve path: $file"
-            return 1
-        fi
-    fi
+	local resolved_file="$file"
 
-    if [[ ! -f "$resolved_file" || ! -r "$resolved_file" ]]; then
-        _log_warn "File not found or not readable: $resolved_file"
-        return 1
-    fi
+	# Always do cheap tilde expansion (even in performance mode) to avoid surprises
+	case "$resolved_file" in
+		'~' | '~/'*) resolved_file="${HOME}${resolved_file#~}" ;;
+		'~+' | '~+/'*) resolved_file="${PWD}${resolved_file#~+}" ;;
+		'~-' | '~-/'*) resolved_file="${OLDPWD:-$PWD}${resolved_file#~-}" ;;
+	esac
 
-    _check_interrupted || return $?
+	# Skip expensive path normalization in performance mode
+	if [[ "${_zcore_config[performance_mode]}" != "true" ]]; then
+		if ! resolved_file=$(z::path::resolve "$resolved_file"); then
+			z::log::error "Failed to resolve path: $file"
+			return 1
+		fi
+	fi
 
-    local -i exit_code=0
-    source "$resolved_file" "$@" || exit_code=$?
+	if [[ ! -f "$resolved_file" || ! -r "$resolved_file" ]]; then
+		z::log::warn "File not found or not readable: $resolved_file"
+		return 1
+	fi
 
-    if (( exit_code != 0 )); then
-        _log_warn "Failed to source $resolved_file (code: $exit_code)"
-    fi
-    return $exit_code
+	z::runtime::check_interrupted \
+	  || return $?
+
+	local -i exit_code=0
+	source "$resolved_file" "$@" \
+	  || exit_code=$?
+
+	if ((exit_code != 0)); then
+		z::log::warn "Failed to source $resolved_file (code: $exit_code)"
+	fi
+	return $exit_code
 }
-
 
 # ==============================================================================
 # 5. FUNCTION INTROSPECTION & CACHING
 # ==============================================================================
 
-###
-# Checks if a function exists, using a cache with LRU eviction.
-# @param string Function name.
-###
-_function_exists() {
-    local func="$1"
-    if [[ -z "$func" ]]; then
-        return 1
-    fi
+z::cache::func::_purge()
+{
+	emulate -L zsh
+	# Remove oldest entries when cache is full
+	if ((_func_cache_size > _zcore_config[cache_max_size])); then
+		local -i to_remove=$((_zcore_config[cache_max_size] / 2))
+		((to_remove < 1)) \
+		  && to_remove=1
+		local -i removed=0
+		local key
 
-    (( _in_function_check++ ))
-    if (( _in_function_check > 1 )); then
-        (( _in_function_check-- ))
-        return 1 # Recursion guard
-    fi
+		while ((removed < to_remove && ${#_func_cache_order[@]} > 0)); do
+			key="${_func_cache_order[1]}"
+			# Drop the first (oldest) entry from the order array
+			shift _func_cache_order
 
-    local cache_key="func_exists_${func//[^a-zA-Z0-9_]/_}"
-    if [[ -n "${_function_cache[$cache_key]:-}" ]]; then
-        (( _in_function_check-- ))
-        return ${_function_cache[$cache_key]}
-    fi
+			# Remove from the assoc cache if present
+			if ((${+_func_cache[$key]})); then
+				unset "_func_cache[$key]"
+			fi
 
-    typeset -f "$func" >/dev/null 2>&1
-    local result=$?
+			((removed++))
+		done
 
-    _function_cache[$cache_key]=$result
-    _cache_order+=($cache_key)
-    (( _cache_size++ ))
-
-    # Skip expensive LRU cache eviction in performance mode.
-    if [[ "${_zsh_config[performance_mode]}" != "true" ]]; then
-        while (( _cache_size > _zsh_config[cache_max_size] )); do
-            if (( ${#_cache_order[@]} > 0 )); then
-                local oldest=${_cache_order[1]}
-                if [[ -n "$oldest" && -n "${_function_cache[$oldest]:-}" ]]; then
-                    unset "_function_cache[$oldest]"
-                    (( _cache_size-- ))
-                fi
-                _cache_order=("${_cache_order[@]:1}")
-            else
-                _cache_size=0
-                break
-            fi
-        done
-    fi
-
-    (( _in_function_check-- ))
-    return $result
+		# Recalculate size from assoc length
+		_func_cache_size=${#_func_cache[@]}
+		z::log::debug "Cleaned function cache: removed $removed entries, new size: $_func_cache_size"
+	fi
 }
 
-###
-# Safely calls a function if it exists.
-# @param string Function name to call.
-# @param ...    Arguments to pass to the function.
-###
-_safe_call() {
-    local func="$1"
-    if [[ -z "$func" ]]; then
-        _log_error "Empty function name for _safe_call"
-        return 1
-    fi
-    shift
+z::cache::cmd::_purge()
+{
+	emulate -L zsh
+	if ((_cmd_cache_size > _zcore_config[cache_max_size])); then
+		local -i to_remove=$((_zcore_config[cache_max_size] / 2))
+		((to_remove < 1)) \
+		  && to_remove=1
+		local -i removed=0
+		local key
 
-    if ! _function_exists "$func"; then
-        case "$func" in
-            _git_prompt_info|__zconvey_on_period_passed*|_*prompt*|_*git*)
-                return 1 # Silently skip known dynamic functions
-                ;;
-            *)
-                _log_warn "Function '$func' not found"
-                return 1
-                ;;
-        esac
-    fi
+		while ((removed < to_remove && ${#_cmd_cache_order[@]} > 0)); do
+			key="${_cmd_cache_order[1]}"
+			# Drop the first (oldest) entry from the order array
+			shift _cmd_cache_order
 
-    _check_interrupted || return $?
+			if ((${+_cmd_cache[$key]})); then
+				unset "_cmd_cache[$key]"
+			fi
 
-    local -i exit_code=0
-    "$func" "$@" || exit_code=$?
+			((removed++))
+		done
 
-    if (( exit_code != 0 )); then
-        _log_warn "Function '$func' failed with code $exit_code"
-    fi
-    return $exit_code
+		_cmd_cache_size=${#_cmd_cache[@]}
+		z::log::debug "Cleaned command cache: removed $removed entries, new size: $_cmd_cache_size"
+	fi
 }
 
+# Command existence check with caching
+z::cmd::exists() {
+	emulate -L zsh
+	local cmd="$1"
+	[[ -z "$cmd" ]] && return 1
+
+	local cache_key="cmd_${cmd//[^a-zA-Z0-9_]/_}"
+	if (( ${+_cmd_cache[$cache_key]} )); then
+		return ${_cmd_cache[$cache_key]}
+	fi
+
+	local -i result=1
+	(( $+commands[$cmd] )) && result=0
+
+	_cmd_cache[$cache_key]=$result
+	_cmd_cache_order+=("$cache_key")
+	(( ++_cmd_cache_size > _zcore_config[cache_max_size] )) && z::cache::cmd::_purge
+
+	return $result
+}
+
+z::func::exists()
+{
+	emulate -L zsh
+	local func="$1"
+	if [[ -z "$func" ]]; then
+		return 1
+	fi
+
+	local cache_key="func_exists_${func//[^a-zA-Z0-9_]/_}"
+	if ((${+_func_cache[$cache_key]})); then
+		return ${_func_cache[$cache_key]}
+	fi
+
+	local result=1
+	if (($+functions[$func])); then
+		result=0
+	fi
+
+	_func_cache[$cache_key]=$result
+	_func_cache_order+=("$cache_key")
+	((_func_cache_size++))
+
+	# Always purge; internal threshold check handles cost
+	z::cache::func::_purge
+
+	return $result
+}
+
+z::func::call()
+{
+	emulate -L zsh
+	local func="$1"
+	if [[ -z "$func" ]]; then
+		z::log::error "Empty function name for z::func::call"
+		return 1
+	fi
+	shift
+
+	if ! z::func::exists "$func"; then
+		case "$func" in
+			_git_prompt_info | __zconvey_on_period_passed* | _*prompt* | _*git*)
+				return 1 # Silently skip known dynamic functions
+				;;
+			*)
+				z::log::warn "Function '$func' not found"
+				return 1
+				;;
+		esac
+	fi
+
+	z::runtime::check_interrupted \
+	  || return $?
+
+	local -i exit_code=0
+	"$func" "$@" \
+	  || exit_code=$?
+
+	if ((exit_code != 0)); then
+		z::log::warn "Function '$func' failed with code $exit_code"
+	fi
+	return $exit_code
+}
 
 # ==============================================================================
 # 6. STATE MANAGEMENT
 # ==============================================================================
 
-###
-# Safely unsets a variable or function.
-# @param string Target name to unset.
-# @param string Type to unset (auto, var, func). Defaults to auto.
-###
-
-_safe_unset() {
+# Private helper: core unset implementation shared by public APIs
+z::state::_unset_impl()
+{
 	emulate -L zsh
-	setopt typeset_silent
+	setopt typeset_silent no_unset
 
 	local target="${1-}"
 	local unset_type="${2:-auto}"
 
 	if [[ -z $target ]]; then
-		_log_error "Empty target for unset"
+		z::log::error "Empty target for unset"
 		return 1
 	fi
 
 	case $unset_type in
-		var|func|auto) ;;
+		var | func | auto) ;;
 		*)
-			_log_error "Invalid unset type: $unset_type"
+			z::log::error "Invalid unset type: $unset_type"
 			return 1
 			;;
 	esac
@@ -598,145 +1130,248 @@ _safe_unset() {
 
 	# Handle variable unsetting
 	if [[ $unset_type == var || $unset_type == auto ]]; then
-		if (( ${+parameters[$target]} )); then
+		if ((${+parameters[$target]})); then
 			found=1
-			# Detect readonly via type string of the parameter named by $target
+			# Check if readonly
 			if [[ ${(tP)target} == *readonly* ]]; then
-				_log_debug "Cannot unset readonly var: $target"
+				z::log::debug "Cannot unset readonly var: $target"
 				rc_var=1
 			else
-				unset -v -- "$target" 2>/dev/null || rc_var=$?
-				(( rc_var == 0 )) && success=1
+				unset -v -- "$target" 2> /dev/null \
+				  || rc_var=$?
+				((rc_var == 0)) \
+				  && success=1
 			fi
 		fi
 	fi
 
 	# Handle function unsetting
 	if [[ $unset_type == func || $unset_type == auto ]]; then
-		if (( ${+functions[$target]} )); then
+		if ((${+functions[$target]})); then
 			found=1
-			unset -f -- "$target" 2>/dev/null || rc_func=$?
-			if (( rc_func == 0 )); then
+			unset -f -- "$target" 2> /dev/null \
+			  || rc_func=$?
+			if ((rc_func == 0)); then
 				success=1
-				# Update function-existence cache if present
+				# Update function-existence cache
 				local cache_key="func_exists_${target//[^A-Za-z0-9_]/_}"
-				if (( ${+_function_cache} )) && (( ${+_function_cache[$cache_key]} )); then
-					unset "_function_cache[$cache_key]"
-					if (( ${+_cache_order} )) && [[ ${(t)_cache_order} == *array* ]]; then
-						_cache_order=("${(@)_cache_order:#$cache_key}")
-					fi
-					if (( ${+_cache_size} )); then
-						_cache_size=${#_function_cache[@]}
-					fi
+				if ((${+_func_cache[$cache_key]})); then
+					unset "_func_cache[$cache_key]"
+					_func_cache_order=("${(@)_func_cache_order:#$cache_key}")
+					_func_cache_size=${#_func_cache[@]}
 				fi
 			fi
 		fi
 	fi
 
-	if (( ! found )); then
-		_log_debug "Target not found for unset: $target"
+	if ((!found)); then
+		z::log::debug "Target not found for unset: $target"
 		return 1
 	fi
 
-	if (( success )); then
-		_log_debug "Unset: $target"
+	if ((success)); then
+		z::log::debug "Unset: $target"
 		return 0
 	fi
 
-	_log_warn "Failed to unset $target"
-	return $(( rc_func != 0 ? rc_func : rc_var ))
+	z::log::warn "Failed to unset $target"
+	return $((rc_func != 0 ? rc_func : rc_var))
+}
+
+# Public: unset a variable only
+# Usage: z::var::unset VAR_NAME
+z::var::unset()
+{
+	emulate -L zsh
+	setopt typeset_silent no_unset
+	local target="${1-}"
+	if [[ -z $target ]]; then
+		z::log::error "Empty target for var unset"
+		return 1
+	fi
+	z::state::_unset_impl "$target" var
+}
+
+# Public: unset a function only
+# Usage: z::func::unset FUNC_NAME
+z::func::unset()
+{
+	emulate -L zsh
+	setopt typeset_silent no_unset
+	local target="${1-}"
+	if [[ -z $target ]]; then
+		z::log::error "Empty target for func unset"
+		return 1
+	fi
+	z::state::_unset_impl "$target" func
+}
+
+# Backward-compatible combined API (auto/var/func)
+# Usage: z::state::unset TARGET [auto|var|func]
+z::state::unset()
+{
+	emulate -L zsh
+	setopt typeset_silent no_unset
+	local target="${1-}"
+	local unset_type="${2:-auto}"
+	z::state::_unset_impl "$target" "$unset_type"
 }
 
 # ==============================================================================
 # 7. USER INTERFACE (UI)
 # ==============================================================================
+z::ui::term::width()
+{
+	emulate -L zsh
+	local width tput_width
 
-###
-# Detects and caches the terminal width.
-###
-_detect_terminal_width() {
-    local width
-    if [[ -n "${COLUMNS:-}" ]] && [[ "$COLUMNS" =~ ^[0-9]+$ ]] && (( COLUMNS >= 10 && COLUMNS <= 9999 )); then
-        _cached_term_width=$COLUMNS
-    elif command -v tput >/dev/null 2>&1 && width=$(tput cols 2>/dev/null) && [[ "$width" =~ ^[0-9]+$ ]] && (( width >= 10 && width <= 9999 )); then
-        _cached_term_width=$width
-    else
-        _cached_term_width=80
-    fi
-    return 0
+	# Use cached width if COLUMNS hasn't changed and cache is valid
+	if ((_cached_term_width > 0 && _zcore_prev_columns == ${COLUMNS:-0})); then
+		print -r -- "$_cached_term_width"
+		return 0
+	fi
+
+	if [[ -n "${COLUMNS:-}" ]] \
+	  && [[ "$COLUMNS" =~ ^[0-9]+$ ]] \
+	  && ((COLUMNS >= 10)); then
+		width=$COLUMNS
+	elif (($+commands[tput])) \
+	  && tput_width=$(tput cols 2> /dev/null) \
+	  && [[ "$tput_width" =~ ^[0-9]+$ ]] \
+	  && ((tput_width >= 10)); then
+		width=$tput_width
+	else
+		width=80
+	fi
+
+	_cached_term_width=$width
+	_zcore_prev_columns=${COLUMNS:-0}
+	print -r -- "$width"
 }
 
-###
-# Determines if a progress update should be displayed.
-# @param integer Current item number.
-# @param integer Total number of items.
-###
-_should_show_progress() {
-    local -i current=$1 total=$2 interval=${_zsh_config[progress_update_interval]}
-    if (( current == 1 || current == total || current % interval == 0 || (total > interval && total - current < interval) )); then
-        return 0
-    else
-        return 1
-    fi
+z::ui::progress::_should_show()
+{
+	emulate -L zsh
+	local -i current=$1 total=$2 interval=${_zcore_config[progress_update_interval]:-20}
+
+	if ((current == 1 || current == total)); then
+		return 0
+	fi
+
+	if ((total <= 10)); then
+		return 1
+	fi
+
+	if ((total <= 50)); then
+		((current % 5 == 0)) \
+		  && return 0
+		return 1
+	fi
+
+	if ((current % interval == 0)) \
+	  || ((total - current < interval)); then
+		return 0
+	fi
+
+	return 1
 }
 
-###
-# Displays a progress bar.
-# @param integer Current item number.
-# @param integer Total number of items.
-# @param string  Label for items (optional).
-###
-_show_progress() {
-    local -i current total
-    if ! current="$1" 2>/dev/null || ! total="$2" 2>/dev/null; then
-        _log_debug "Invalid progress params"
-        return 1
-    fi
-
-    local label="${3:-items}"
-    if (( total <= 0 || current < 0 || current > total )); then
-        _log_debug "Invalid progress range"
-        return 1
-    fi
-
-    # Only display at info level. At debug level, the logs provide the progress.
-    # Also, do not display if not in an interactive terminal.
-    if (( _zsh_config_verbose != _zsh_config[log_info] )) || [[ ! -t 2 ]]; then
-        return 0
-    fi
-
-    if ! _should_show_progress "$current" "$total"; then
-        return 0
-    fi
-
-    _detect_terminal_width
-
-    local -i percent=$(( total > 0 ? (current * 100) / total : 0 ))
-    (( percent > 100 )) && percent=100
-
-    local current_fmt total_fmt
-    printf -v current_fmt "%'d" "$current" 2>/dev/null || current_fmt="$current"
-    printf -v total_fmt "%'d" "$total" 2>/dev/null || total_fmt="$total"
-
-    if (( _cached_term_width > 50 )); then
-        printf '\r[%3d%%] processing %s %s of %s...' "$percent" "$label" "$current_fmt" "$total_fmt" >&2
-    else
-        printf '\r[%3d%%] %s %s/%s' "$percent" "$label" "$current_fmt" "$total_fmt" >&2
-    fi
-
-    if (( current == total )); then
-        printf '\r\e[K\n' >&2
-    fi
+z::util::comma()
+{
+	emulate -L zsh
+	setopt localoptions typeset_silent
+	local n="${1:-0}"
+	# Normalize sign and digits
+	local sign=''
+	if [[ $n == -* ]]; then
+		sign='-'
+		n="${n#-}"
+	fi
+	# Non-digit input: return as-is
+	if [[ $n != <-> ]]; then
+		print -r -- "${sign}${n}"
+		return 0
+	fi
+	local -a groups=()
+	local s="$n"
+	while ((${#s} > 3)); do
+		groups=("${s[-3,-1]}" "${(@)groups}")
+		s="${s[1,-4]}"
+	done
+	local out="$s"
+	if ((${#groups})); then
+		out+=",${(j:,:)groups}"
+	fi
+	print -r -- "${sign}${out}"
 }
 
+z::ui::progress::show()
+{
+	emulate -L zsh
+	setopt typeset_silent
+
+	if [[ ${1-} != <-> || ${2-} != <-> ]]; then
+		z::log::debug "Invalid progress params: must be integers."
+		return 1
+	fi
+	local -i current=$1 total=$2
+
+	local label="${3:-items}"
+	if ((total <= 0 || current < 0 || current > total)); then
+		z::log::debug "Invalid progress range: $current/$total."
+		return 1
+	fi
+
+	if ((_zcore_verbose_level != _zcore_config[log_info])) \
+	  || \
+	  [[ ! -t 2 ]] \
+	  || [[ "${_zcore_config[show_progress]:-true}" == "false" ]]; then
+		return 0
+	fi
+
+	z::ui::progress::_should_show "$current" "$total" \
+	  || return 0
+
+	local -i term_width
+	term_width=$(z::ui::term::width)
+
+	local -i percent=$((total > 0 ? (current * 100) / total : 0))
+
+	local -i bar_width=$((term_width > 40 ? 20 : 10))
+	local -i filled=$(((percent * bar_width) / 100))
+	((filled < 0)) \
+	  && filled=0
+	((filled > bar_width)) \
+	  && filled=$bar_width
+	local -i empty_len=$((bar_width - filled))
+
+	local bar_fill bar_empty
+	printf -v bar_fill "%${filled}s" ""
+	printf -v bar_empty "%${empty_len}s" ""
+	bar_fill=${bar_fill// /█}
+	bar_empty=${bar_empty// /░}
+	local progress_bar="${bar_fill}${bar_empty}"
+
+	local current_fmt total_fmt
+	current_fmt=$(z::util::comma "$current")
+	total_fmt=$(z::util::comma "$total")
+
+	if ((term_width > 70)); then
+		printf '\r[%s] %3d%% | %s: %s / %s ' "$progress_bar" "$percent" "$label" "$current_fmt" "$total_fmt" >&2
+	else
+		printf '\r[%s] %3d%% (%s/%s)' "$progress_bar" "$percent" "$current_fmt" "$total_fmt" >&2
+	fi
+
+	((current == total)) \
+	  && printf '\n' >&2
+}
 
 # ==============================================================================
 # 8. INITIALIZATION
 # ==============================================================================
 
-# Install the interrupt handler.
-trap '_handle_interrupt' INT TERM
+# Install interrupt handlers
+trap 'z::runtime::handle_interrupt' INT TERM
 
-# Log the initialization of the library itself.
-_log_debug "Zsh utility library initialized."
-
+# Initialize library
+z::log::debug "Zsh utility library initialized (performance_mode=${_zcore_config[performance_mode]})"
