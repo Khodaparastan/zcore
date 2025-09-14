@@ -1,195 +1,175 @@
-# --- Platform-Specific Aliases ---
-setup_platform_aliases() {
-  z::runtime::check_interrupted || return $?
+#!/usr/bin/env zsh
+#
+# Custom Integrations Module
+# Handles user-specific aliases, tool integrations, and compatibility stubs.
+#
 
-  # --- General Aliases ---
-  z::alias::define y 'yazi'
-  z::alias::define dev 'cd ~/dev'
-  z::alias::define zss 'cd ~/.ssh'
-  z::alias::define zdd 'cd ${XDG_CONFIG_HOME:-$HOME/.config}'
-#  z::alias::define z 'j'
-  z::alias::define skr 'ssh-keygen -R'
-  z::alias::define sci 'ssh-copy-id -i'
-  z::alias::define ssi 'ssh -i'
+# ==============================================================================
+# PRIVATE HELPERS
+# ==============================================================================
 
-  if ((IS_MACOS)); then
-    z::alias::define o 'open'
-    z::alias::define clip 'pbcopy'
-    if command -v yabai >/dev/null 2>&1; then
-      z::alias::define ybr 'yabai --restart-service'
-    fi
-    local surge_cli='/Applications/Surge.app/Contents/Resources/surge-cli'
-    if [[ -x "$surge_cli" ]]; then
-      z::alias::define surge "$surge_cli"
-    fi
+###
+# Sets up general and platform-specific aliases.
+###
+z::custom::_setup_aliases() {
+	emulate -L zsh
+	z::runtime::check_interrupted || return $?
 
-  elif ((IS_LINUX)); then
-    z::alias::define o 'xdg-open'
-    if command -v xclip >/dev/null 2>&1; then
-      z::alias::define clip 'xclip -selection clipboard'
-    elif command -v xsel >/dev/null 2>&1; then
-      z::alias::define clip 'xsel --clipboard --input'
-    else
-      z::log::warn "No clipboard tool found (xclip or xsel) for Linux"
-    fi
+	# --- General Aliases ---
+	z::alias::define y 'yazi'
+	z::alias::define dev 'cd ~/dev'
+	z::alias::define zss 'cd ~/.ssh'
+	z::alias::define zdd 'cd "${XDG_CONFIG_HOME:-$HOME/.config}"'
+	# The alias 'z' is commented out as it conflicts with zoxide's main function.
+	# z::alias::define z 'j'
+	z::alias::define skr 'ssh-keygen -R'
+	z::alias::define sci 'ssh-copy-id -i'
+	z::alias::define ssi 'ssh -i'
 
-  elif ((IS_BSD)); then
-    z::alias::define o 'xdg-open'
-    if command -v xclip >/dev/null 2>&1; then
-      z::alias::define clip 'xclip -selection clipboard'
-    else
-      z::log::warn "No clipboard tool found (xclip) for BSD"
-    fi
+	# --- Platform-Specific Aliases ---
+	local platform_name="unknown"
+	if (( IS_MACOS )); then
+		platform_name="macOS"
+		z::alias::define o 'open'
+		z::alias::define clip 'pbcopy'
+		if z::cmd::exists "yabai"; then
+			z::alias::define ybr 'yabai --restart-service'
+		fi
+		local surge_cli='/Applications/Surge.app/Contents/Resources/surge-cli'
+		if [[ -x "$surge_cli" ]]; then
+			z::alias::define surge "$surge_cli"
+		fi
+	elif (( IS_LINUX )); then
+		platform_name="Linux"
+		z::alias::define o 'xdg-open'
+		if z::cmd::exists "xclip"; then
+			z::alias::define clip 'xclip -selection clipboard'
+		elif z::cmd::exists "xsel"; then
+			z::alias::define clip 'xsel --clipboard --input'
+		fi
+	elif (( IS_BSD )); then
+		platform_name="BSD"
+		z::alias::define o 'xdg-open'
+		z::cmd::exists "xclip" && z::alias::define clip 'xclip -selection clipboard'
+	elif (( IS_CYGWIN )); then
+		platform_name="Cygwin"
+		z::alias::define o 'cygstart'
+		z::alias::define clip 'cat > /dev/clipboard'
+	fi
 
-  elif ((IS_CYGWIN)); then
-    z::alias::define o 'cygstart'
-    z::alias::define clip 'cat > /dev/clipboard'
-  fi
-
-  z::log::debug "Platform-specific aliases configured for: $PLATFORM"
-  return 0
+	z::log::debug "Platform-specific aliases configured for: $platform_name"
+	return 0
 }
 
 ###
-# Detects the Google Cloud SDK installation, sets the Python interpreter,
-# and sources the necessary shell integration files.
+# Detects and configures the Google Cloud SDK.
 ###
-_setup_gcloud_sdk() {
-  z::runtime::check_interrupted || return $?
+z::custom::_setup_gcloud() {
+	emulate -L zsh
+	z::runtime::check_interrupted || return $?
 
-  # --- Find GCloud SDK Base Path ---
-  local gcloud_base="${GCLOUD_SDK_PATH:-}" # 1. Check environment variable first.
-  if [[ -z "$gcloud_base" ]]; then
-    # 2. Check common installation locations.
-    local -a possible_bases=("$HOME/.local/google-cloud-sdk" "$HOME/google-cloud-sdk" "/usr/lib/google-cloud-sdk")
-    for base in "${possible_bases[@]}"; do
-      if [[ -d "$base/bin" ]]; then
-        gcloud_base="$base"
-        break
-      fi
-    done
-  fi
-  if [[ -z "$gcloud_base" ]] && command -v gcloud >/dev/null 2>&1; then
-    # 3. As a last resort, derive from the command path.
-    gcloud_base="$(dirname "$(dirname "$(command -v gcloud)")")"
-  fi
+	local gcloud_base
+	local -a possible_bases=("$HOME/google-cloud-sdk" "/usr/lib/google-cloud-sdk")
+	for base in "${possible_bases[@]}"; do
+		[[ -d "$base/bin" ]] && gcloud_base="$base" && break
+	done
 
-  if [[ -z "$gcloud_base" || ! -d "$gcloud_base" ]]; then
-    z::log::debug "Google Cloud SDK not found."
-    return 1
-  fi
+	if [[ -z "$gcloud_base" ]] && z::cmd::exists "gcloud"; then
+		gcloud_base="$(dirname "$(dirname "$(command -v gcloud)")")"
+	fi
 
-  local -a gcloud_files=(
-    "$gcloud_base/path.zsh.inc"
-    "$gcloud_base/completion.zsh.inc"
-  )
-  local -i success_count=0
-  for file in "${gcloud_files[@]}"; do
-    if z::path::source "$file"; then
-      ((success_count++))
-    else
-      z::log::debug "Failed to source gcloud file: $file"
-    fi
-  done
+	if [[ -z "$gcloud_base" || ! -d "$gcloud_base" ]]; then
+		z::log::debug "Google Cloud SDK not found."
+		return 1
+	fi
 
-  # --- Set Python Interpreter ---
-  local gcloud_python="${GCLOUD_PYTHON_PATH:-}"
-  if [[ -z "$gcloud_python" ]]; then
-    # Prefer the SDK's bundled Python if it exists.
-    if [[ -x "$gcloud_base/gcp-venv/bin/python" ]]; then
-      gcloud_python="$gcloud_base/gcp-venv/bin/python"
-    else
-      # Fallback to system python3.
-      gcloud_python="$(command -v python3 2>/dev/null)"
-    fi
-  fi
+	z::path::source "$gcloud_base/path.zsh.inc"
+	z::path::source "$gcloud_base/completion.zsh.inc"
 
-  if [[ -n "$gcloud_python" && -x "$gcloud_python" ]]; then
-    export CLOUDSDK_PYTHON="$gcloud_python"
-    z::log::debug "Set CLOUDSDK_PYTHON to: $gcloud_python"
-  fi
+	if [[ -x "$gcloud_base/gcp-venv/bin/python" ]]; then
+		export CLOUDSDK_PYTHON="$gcloud_base/gcp-venv/bin/python"
+	elif z::cmd::exists "python3"; then
+		export CLOUDSDK_PYTHON="$(command -v python3)"
+	fi
+	[[ -n "$CLOUDSDK_PYTHON" ]] && z::log::debug "Set CLOUDSDK_PYTHON to: $CLOUDSDK_PYTHON"
 
-  if ((success_count > 0)); then
-    z::log::debug "Google Cloud SDK initialized ($success_count files loaded)"
-    return 0
-  fi
-  return 1
+	z::log::debug "Google Cloud SDK initialized from: $gcloud_base"
+	return 0
 }
 
 ###
-# Sets up external shell tools if available.
+# Sets up core external shell tools like mise and direnv.
 ###
-_setup_external_tools() {
-  z::runtime::check_interrupted || return $?
+z::custom::_setup_tools() {
+	emulate -L zsh
+	z::runtime::check_interrupted || return $?
 
-  if z::cmd::exists mise; then
-    if z::exec::eval "$(mise activate zsh)" 10 true; then
-      z::log::debug "mise activated successfully"
-    else
-      z::log::warn "Failed to activate mise"
-    fi
-  fi
+	if z::cmd::exists "mise"; then
+		z::exec::eval "$(mise activate zsh)" 10 true || z::log::warn "Failed to activate mise"
+	fi
 
-  if z::cmd::exists direnv; then
-    if z::exec::eval "$(direnv hook zsh)" 10 true; then
-      z::log::debug "direnv hook installed successfully"
-    else
-      z::log::warn "Failed to install direnv hook"
-    fi
-  fi
+	if z::cmd::exists "direnv"; then
+		z::exec::eval "$(direnv hook zsh)" 10 true || z::log::warn "Failed to install direnv hook"
+	fi
 
-#  if ((IS_MACOS)); then
-#    local -a autojump_scripts=(
-#      '/opt/homebrew/etc/profile.d/autojump.sh'
-#      '/usr/local/etc/profile.d/autojump.sh'
-#    )
-#    for script in "${autojump_scripts[@]}"; do
-#      if z::path::source "$script"; then
-#        z::log::debug "autojump loaded from: $script"
-#        break
-#      fi
-#    done
-#  fi
-
-  z::log::debug "External tools setup completed"
+	z::log::debug "Core external tools setup completed"
+	return 0
 }
 
 ###
-# Creates stub functions for optional plugins to prevent errors if they are not loaded.
+# Creates empty stub functions for optional plugins to prevent errors.
 ###
-_create_stub_functions() {
-  # Stub for a common Git prompt function.
-  if ! z::func::exists _git_prompt_info; then
-    _git_prompt_info() { return 0; }
-    z::log::debug "Created stub for _git_prompt_info"
-  fi
+z::custom::_create_stubs() {
+	emulate -L zsh
+	z::runtime::check_interrupted || return $?
 
-  # Stubs for Zconvey, a testing tool that might not be present.
-  local -a zconvey_functions=(
-    __zconvey_on_period_passed26
-    __zconvey_on_period_passed30
-    __zconvey_on_period_passed
-  )
-  for func in "${zconvey_functions[@]}"; do
-    if ! z::func::exists "$func"; then
-      eval "$func() { return 0; }"
-      z::log::debug "Created stub for $func"
-    fi
-  done
+	# Stub for a common Git prompt function
+	if ! z::func::exists "_git_prompt_info"; then
+		_git_prompt_info() { return 0; }
+		z::log::debug "Created stub for _git_prompt_info"
+	fi
 
-  z::log::debug "Stub functions created successfully"
+	# Stubs for zconvey scheduler hooks
+	local -a zconvey_stubs=("__zconvey_on_period_passed" "__zconvey_on_period_passed"*)
+	for func_pattern in "${zconvey_stubs[@]}"; do
+		# Check for functions matching the pattern
+		if ! z::func::exists "$func_pattern"; then
+			# Define a no-op function using a safe, direct method
+			"$func_pattern"() { return 0; }
+			z::log::debug "Created stub for pattern: $func_pattern"
+		fi
+	done
+
+	z::log::debug "Stub functions created successfully"
+	return 0
 }
 
-# Main setup function - call all setup functions
-_setup_extra_module() {
-  z::runtime::check_interrupted || return $?
+# ==============================================================================
+# MAIN INITIALIZATION ORCHESTRATOR
+# ==============================================================================
 
-#  _setup_gcloud_sdk
-#  _setup_external_tools
-  _create_stub_functions
+###
+# Public entry point to configure all custom integrations.
+###
+z::custom::init() {
+	emulate -L zsh
+	z::runtime::check_interrupted || return $?
+	z::log::info "Initializing custom integrations module..."
 
-  z::log::debug "Extra module setup completed successfully"
+	z::custom::_setup_aliases
+	z::custom::_setup_gcloud
+	z::custom::_setup_tools
+	# z::custom::_create_stubs
+
+	z::log::info "Custom integrations module initialized successfully."
+	return 0
 }
 
-# Execute setup when module is sourced
-_setup_extra_module
+# ==============================================================================
+# MODULE EXECUTION
+# ==============================================================================
+
+# Auto-initialize the module when it is sourced.
+if z::func::exists "z::custom::init"; then
+	z::custom::init
+fi
