@@ -2,245 +2,134 @@
 #
 # External Tools Configuration Module
 # Handles initialization of external tools and development utilities
+# Fully integrated with the zcore library.
 #
 
 # ==============================================================================
-# EXTERNAL TOOLS SETUP
+# PRIVATE HELPERS
 # ==============================================================================
 
-# Internal helper: command existence (prefers zcore cache if available)
-_ext::_cmd_exists() {
-	emulate -L zsh -o no_aliases
-	if typeset -f z::cmd::exists >/dev/null 2>&1; then
-		z::cmd::exists "$1"
-		return $?
-	fi
-	command -v "$1" >/dev/null 2>&1
-}
-
 ###
-# Sets up various external development tools and their integrations
+# Generic helper to initialize a tool by evaluating its shell hook output.
+#
+# @param 1: string - The name of the command-line tool (e.g., "direnv").
+# @param 2: string - The subcommand to generate the hook (default: "init").
+# @param 3: string - The shell argument for the hook (default: "zsh").
 ###
-_setup_external_tools() {
+z::ext::_init_tool_from_hook() {
 	emulate -L zsh -o no_aliases
+	local tool_name="$1"
+	local subcommand="${2:-init}"
+	local shell_arg="${3:-zsh}"
 
 	z::runtime::check_interrupted || return $?
-	z::log::debug "Setting up external tools..."
 
-	# Tool initialization functions
-	local -a tools=(
-		"_setup_direnv"
-		"_setup_mise"
-		"_setup_zoxide"
-		"_setup_atuin"
-		"_setup_mcfly"
-		"_setup_fzf"
-	)
-
-	local tool
-	for tool in "${tools[@]}"; do
-		z::runtime::check_interrupted || return $?
-		if typeset -f "$tool" >/dev/null 2>&1; then
-			z::func::call "$tool"
-		else
-			z::log::debug "Tool setup function '$tool' not defined, skipping"
-		fi
-	done
-
-	z::log::debug "External tools setup completed"
-	return 0
-}
-
-###
-# Initialize direnv for automatic environment loading
-###
-_setup_direnv() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
-
-	if ! _ext::_cmd_exists direnv; then
-		z::log::debug "direnv not found, skipping"
+	if ! z::cmd::exists "$tool_name"; then
+		z::log::debug "$tool_name not found, skipping"
 		return 0
 	fi
 
-	local direnv_init_code
-	if direnv_init_code="$(direnv hook zsh 2>/dev/null)" && [[ -n "$direnv_init_code" ]]; then
-		if z::exec::eval "$direnv_init_code" 30 true; then
-			z::log::debug "direnv initialized successfully"
+	local init_code
+	if init_code="$("$tool_name" "$subcommand" "$shell_arg" 2>/dev/null)" && [[ -n "$init_code" ]]; then
+		# The 'true' flag forces eval in the current shell context
+		if z::exec::eval "$init_code" 30 true; then
+			z::log::debug "$tool_name initialized successfully"
+			return 0
 		else
-			z::log::warn "Failed to initialize direnv"
+			z::log::warn "Failed to initialize $tool_name"
 			return 1
 		fi
 	else
-		z::log::warn "Failed to get direnv hook"
+		z::log::warn "Failed to get $tool_name hook/init code"
 		return 1
 	fi
+}
 
-	return 0
+# ==============================================================================
+# INDIVIDUAL TOOL SETUP FUNCTIONS
+# ==============================================================================
+
+###
+# Initialize direnv using the generic hook helper.
+###
+z::ext::_setup_direnv() {
+	z::ext::_init_tool_from_hook "direnv" "hook" "zsh"
 }
 
 ###
-# Initialize mise (formerly rtx) for runtime version management
+# Initialize mise using the generic hook helper.
 ###
-_setup_mise() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
-
-	if ! _ext::_cmd_exists mise; then
-		z::log::debug "mise not found, skipping"
-		return 0
-	fi
-
-	local mise_init_code
-	if mise_init_code="$(mise activate zsh 2>/dev/null)" && [[ -n "$mise_init_code" ]]; then
-		if z::exec::eval "$mise_init_code" 30 true; then
-			z::log::debug "mise initialized successfully"
-		else
-			z::log::warn "Failed to initialize mise"
-			return 1
-		fi
-	else
-		z::log::warn "Failed to get mise activation code"
-		return 1
-	fi
-
-	return 0
+z::ext::_setup_mise() {
+	z::ext::_init_tool_from_hook "mise" "activate" "zsh"
 }
 
 ###
-# Initialize zoxide for smart directory jumping
+# Initialize zoxide using the generic hook helper.
 ###
-_setup_zoxide() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
-
-	if ! _ext::_cmd_exists zoxide; then
-		z::log::debug "zoxide not found, skipping"
-		return 0
-	fi
-
-	local zoxide_init_code
-	if zoxide_init_code="$(zoxide init zsh 2>/dev/null)" && [[ -n "$zoxide_init_code" ]]; then
-		if z::exec::eval "$zoxide_init_code" 30 true; then
-			z::log::debug "zoxide initialized successfully"
-		else
-			z::log::warn "Failed to initialize zoxide"
-			return 1
-		fi
-	else
-		z::log::warn "Failed to get zoxide init code"
-		return 1
-	fi
-
-	return 0
+z::ext::_setup_zoxide() {
+	z::ext::_init_tool_from_hook "zoxide" "init" "zsh"
 }
 
 ###
-# Initialize atuin for shell history sync and search
+# Initialize atuin using the generic hook helper.
 ###
-_setup_atuin() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
-
-	if ! _ext::_cmd_exists atuin; then
-		z::log::debug "atuin not found, skipping"
-		return 0
-	fi
-
-	local atuin_init_code
-	if atuin_init_code="$(atuin init zsh 2>/dev/null)" && [[ -n "$atuin_init_code" ]]; then
-		if z::exec::eval "$atuin_init_code" 30 true; then
-			z::log::debug "atuin initialized successfully"
-		else
-			z::log::warn "Failed to initialize atuin"
-			return 1
-		fi
-	else
-		z::log::warn "Failed to get atuin init code"
-		return 1
-	fi
-
-	return 0
+z::ext::_setup_atuin() {
+	z::ext::_init_tool_from_hook "atuin" "init" "zsh"
 }
 
 ###
-# Initialize mcfly for shell history search
+# Initialize mcfly using the generic hook helper.
 ###
-_setup_mcfly() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
-
-	if ! _ext::_cmd_exists mcfly; then
-		z::log::debug "mcfly not found, skipping"
-		return 0
-	fi
-
-	local mcfly_init_code
-	if mcfly_init_code="$(mcfly init zsh 2>/dev/null)" && [[ -n "$mcfly_init_code" ]]; then
-		if z::exec::eval "$mcfly_init_code" 30 true; then
-			z::log::debug "mcfly initialized successfully"
-		else
-			z::log::warn "Failed to initialize mcfly"
-			return 1
-		fi
-	else
-		z::log::warn "Failed to get mcfly init code"
-		return 1
-	fi
-
-	return 0
+z::ext::_setup_mcfly() {
+	z::ext::_init_tool_from_hook "mcfly" "init" "zsh"
 }
 
 ###
-# Initialize fzf for fuzzy finding
+# Initialize fzf (fuzzy finder) by sourcing its integration files.
 ###
-_setup_fzf() {
+z::ext::_setup_fzf() {
 	emulate -L zsh -o no_aliases
 	z::runtime::check_interrupted || return $?
 
-	if ! _ext::_cmd_exists fzf; then
+	if ! z::cmd::exists "fzf"; then
 		z::log::debug "fzf not found, skipping"
 		return 0
 	fi
 
-	# Candidate paths for fzf zsh integration files (key-bindings and completion)
-	local -a fzf_key_paths=(
-		"/usr/share/fzf/key-bindings.zsh"
-		"/opt/homebrew/share/fzf/shell/key-bindings.zsh"
-		"/usr/local/opt/fzf/shell/key-bindings.zsh"
-		"${HOME}/.fzf/shell/key-bindings.zsh"
-	)
-	local -a fzf_comp_paths=(
-		"/usr/share/fzf/completion.zsh"
-		"/opt/homebrew/share/fzf/shell/completion.zsh"
-		"/usr/local/opt/fzf/shell/completion.zsh"
-		"${HOME}/.fzf/shell/completion.zsh"
-	)
+	local -a key_paths=()
+	local -a comp_paths=()
+	local brew_prefix
+	if z::cmd::exists "brew"; then
+		brew_prefix="$(brew --prefix 2>/dev/null)"
+		if [[ -n "$brew_prefix" ]]; then
+			key_paths+=("${brew_prefix}/opt/fzf/shell/key-bindings.zsh")
+			comp_paths+=("${brew_prefix}/opt/fzf/shell/completion.zsh")
+		fi
+	fi
+	key_paths+=("/usr/share/fzf/key-bindings.zsh" "${HOME}/.fzf/shell/key-bindings.zsh")
+	comp_paths+=("/usr/share/fzf/completion.zsh" "${HOME}/.fzf/shell/completion.zsh")
 
-	# Source at most one key-bindings file and one completion file
-	local fzf_file
-	for fzf_file in "${fzf_key_paths[@]}"; do
+	local fzf_file found_keys=0 found_comp=0
+	for fzf_file in "${key_paths[@]}"; do
 		[[ -f "$fzf_file" ]] || continue
 		if z::path::source "$fzf_file"; then
 			z::log::debug "Loaded fzf key-bindings: $fzf_file"
+			found_keys=1
 			break
-		else
-			z::log::warn "Failed to load fzf key-bindings: $fzf_file"
 		fi
 	done
-	for fzf_file in "${fzf_comp_paths[@]}"; do
+	((!found_keys)) && z::log::debug "fzf key-bindings script not found or failed to load."
+
+	for fzf_file in "${comp_paths[@]}"; do
 		[[ -f "$fzf_file" ]] || continue
 		if z::path::source "$fzf_file"; then
 			z::log::debug "Loaded fzf completion: $fzf_file"
+			found_comp=1
 			break
-		else
-			z::log::warn "Failed to load fzf completion: $fzf_file"
 		fi
 	done
+	((!found_comp)) && z::log::debug "fzf completion script not found or failed to load."
 
-	# Set up common fzf environment variables:
-	# - Modernize --inline-info -> --info=inline
-	# - Append to existing FZF_DEFAULT_OPTS instead of overwriting
 	local base_opts="--height 40% --layout=reverse --border --info=inline"
 	if [[ -n ${FZF_DEFAULT_OPTS:-} ]]; then
 		export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${base_opts}"
@@ -248,15 +137,13 @@ _setup_fzf() {
 		export FZF_DEFAULT_OPTS="${base_opts}"
 	fi
 
-	# Use fd or ripgrep if available; respect existing user settings
 	if [[ -z ${FZF_DEFAULT_COMMAND:-} ]]; then
-		if _ext::_cmd_exists fd; then
+		if z::cmd::exists "fd"; then
 			export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
-			export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
-		elif _ext::_cmd_exists rg; then
+		elif z::cmd::exists "rg"; then
 			export FZF_DEFAULT_COMMAND='rg --files --hidden --follow --glob "!.git/*"'
-			export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 		fi
+		[[ -n "$FZF_DEFAULT_COMMAND" ]] && export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 	fi
 
 	z::log::debug "fzf setup completed"
@@ -264,106 +151,97 @@ _setup_fzf() {
 }
 
 ###
-# Initialize Google Cloud SDK if installed
+# Initialize Google Cloud SDK if found in common locations.
 ###
-_setup_gcloud_sdk() {
+z::ext::_setup_gcloud_sdk() {
 	emulate -L zsh -o no_aliases
 	z::runtime::check_interrupted || return $?
 
-	z::log::debug "Setting up Google Cloud SDK..."
-
-	# Common gcloud installation paths
-	local -a gcloud_paths=(
+	local -a sdk_paths=(
 		"${HOME}/google-cloud-sdk"
 		"/opt/google-cloud-sdk"
 		"/usr/lib/google-cloud-sdk"
-		"/usr/local/share/google-cloud-sdk"
-		"/opt/homebrew/share/google-cloud-sdk"
 	)
+	local brew_prefix
+	if z::cmd::exists "brew"; then
+		brew_prefix="$(brew --prefix 2>/dev/null)"
+		[[ -n "$brew_prefix" ]] && sdk_paths+=("${brew_prefix}/share/google-cloud-sdk")
+	fi
 
-	local gcloud_path gcloud_completion gcloud_path_script
-	for gcloud_path in "${gcloud_paths[@]}"; do
-		[[ -d "$gcloud_path" ]] || continue
-		z::log::debug "Found Google Cloud SDK at: $gcloud_path"
+	local sdk_path
+	for sdk_path in "${sdk_paths[@]}"; do
+		[[ -d "$sdk_path" ]] || continue
 
-		# Source the path script
-		gcloud_path_script="${gcloud_path}/path.zsh.inc"
-		if [[ -f "$gcloud_path_script" ]]; then
-			if z::path::source "$gcloud_path_script"; then
-				z::log::debug "Loaded gcloud path script"
-			else
-				z::log::warn "Failed to load gcloud path script"
-			fi
-		fi
+		z::log::debug "Found Google Cloud SDK at: $sdk_path"
+		local path_script="${sdk_path}/path.zsh.inc"
+		local comp_script="${sdk_path}/completion.zsh.inc"
 
-		# Source the completion script
-		gcloud_completion="${gcloud_path}/completion.zsh.inc"
-		if [[ -f "$gcloud_completion" ]]; then
-			if z::path::source "$gcloud_completion"; then
-				z::log::debug "Loaded gcloud completion"
-			else
-				z::log::warn "Failed to load gcloud completion"
-			fi
-		fi
+		[[ -f "$path_script" ]] && z::path::source "$path_script"
+		[[ -f "$comp_script" ]] && z::path::source "$comp_script"
 
-		z::log::info "Google Cloud SDK initialized from: $gcloud_path"
+		z::log::info "Google Cloud SDK initialized from: $sdk_path"
 		return 0
 	done
 
-	# Check if gcloud is available in PATH but we couldn't find the SDK directory
-	if _ext::_cmd_exists gcloud; then
-		z::log::info "gcloud command found in PATH but SDK directory not located"
-		return 0
+	if z::cmd::exists "gcloud"; then
+		z::log::info "gcloud command found in PATH but SDK directory not located in standard paths."
+	else
+		z::log::debug "Google Cloud SDK not found."
 	fi
 
-	z::log::debug "Google Cloud SDK not found"
 	return 0
 }
 
+# ==============================================================================
+# MAIN INITIALIZATION ORCHESTRATOR
+# ==============================================================================
+
 ###
-# Setup Docker completion if available
+# Public entry point to set up all external tools.
 ###
-_setup_docker() {
+z::ext::init() {
 	emulate -L zsh -o no_aliases
 	z::runtime::check_interrupted || return $?
+	z::log::debug "Initializing external tools module..."
 
-	if ! _ext::_cmd_exists docker; then
-		z::log::debug "docker not found, skipping"
-		return 0
-	fi
+	local -a setup_functions=(
+		"z::ext::_setup_direnv"
+		"z::ext::_setup_mise"
+		"z::ext::_setup_zoxide"
+		"z::ext::_setup_atuin"
+		"z::ext::_setup_mcfly"
+		"z::ext::_setup_fzf"
+		"z::ext::_setup_gcloud_sdk"
+	)
+	local -a simple_check_tools=(
+		"docker"
+		"kubectl"
+	)
 
-	# Docker completion is usually handled by the system package manager
-	# or completions module, but we can add any Docker-specific setup here
-	z::log::debug "docker found and available"
+	local setup_func
+	for setup_func in "${setup_functions[@]}"; do
+		z::runtime::check_interrupted || break
+		z::func::call "$setup_func"
+	done
+
+	local tool
+	for tool in "${simple_check_tools[@]}"; do
+		z::runtime::check_interrupted || break
+		if z::cmd::exists "$tool"; then
+			z::log::debug "$tool is available in PATH."
+		fi
+	done
+
+	z::log::debug "External tools module initialization complete."
 	return 0
 }
 
-###
-# Setup kubectl completion
-###
-_setup_kubectl() {
-	emulate -L zsh -o no_aliases
-	z::runtime::check_interrupted || return $?
+# ==============================================================================
+# MODULE EXECUTION
+# ==============================================================================
 
-	if ! _ext::_cmd_exists kubectl; then
-		z::log::debug "kubectl not found, skipping"
-		return 0
-	fi
+# Auto-initialize all tools when this module is sourced.
+if z::func::exists "z::ext::init"; then
+	z::ext::init
+fi
 
-	# kubectl completion is typically handled in completions module
-	# but we can add kubectl-specific aliases or setup here
-	z::log::debug "kubectl found and available"
-	return 0
-}
-
-# Export functions that should be available after module load
-typeset -f _setup_external_tools _setup_gcloud_sdk >/dev/null 2>&1 || {
-	z::log::error "Failed to define external tools functions"
-	return 1
-}
-
-# Auto-initialize external tools when module is loaded
-_setup_external_tools
-_setup_gcloud_sdk
-
-z::log::debug "External tools module loaded"
