@@ -1,48 +1,52 @@
 # --- Platform-Specific Aliases ---
 setup_platform_aliases() {
-  _detect_platform
+  z::runtime::check_interrupted || return $?
+
   # --- General Aliases ---
-  _safe_alias y 'yazi'
-  _safe_alias dev 'cd ~/dev'
-  _safe_alias zss 'cd ~/.ssh'
-  _safe_alias zdd 'cd ${XDG_CONFIG_HOME:-$HOME/.config}'
-  _safe_alias z 'j'
-  _safe_alias skr 'ssh-keygen -R'
-  _safe_alias sci 'ssh-copy-id -i'
-  _safe_alias ssi 'ssh -i'
+  z::alias::define y 'yazi'
+  z::alias::define dev 'cd ~/dev'
+  z::alias::define zss 'cd ~/.ssh'
+  z::alias::define zdd 'cd ${XDG_CONFIG_HOME:-$HOME/.config}'
+#  z::alias::define z 'j'
+  z::alias::define skr 'ssh-keygen -R'
+  z::alias::define sci 'ssh-copy-id -i'
+  z::alias::define ssi 'ssh -i'
 
   if ((IS_MACOS)); then
-    _safe_alias o 'open'
-    _safe_alias clip 'pbcopy'
+    z::alias::define o 'open'
+    z::alias::define clip 'pbcopy'
     if command -v yabai >/dev/null 2>&1; then
-      _safe_alias ybr 'yabai --restart-service'
+      z::alias::define ybr 'yabai --restart-service'
     fi
     local surge_cli='/Applications/Surge.app/Contents/Resources/surge-cli'
-    [[ -x "$surge_cli" ]] && _safe_alias surge "$surge_cli"
+    if [[ -x "$surge_cli" ]]; then
+      z::alias::define surge "$surge_cli"
+    fi
 
   elif ((IS_LINUX)); then
-    _safe_alias o 'xdg-open'
+    z::alias::define o 'xdg-open'
     if command -v xclip >/dev/null 2>&1; then
-      _safe_alias clip 'xclip -selection clipboard'
+      z::alias::define clip 'xclip -selection clipboard'
     elif command -v xsel >/dev/null 2>&1; then
-      _safe_alias clip 'xsel --clipboard --input'
+      z::alias::define clip 'xsel --clipboard --input'
     else
-      _log_warn "No clipboard tool found (xclip or xsel) for Linux"
+      z::log::warn "No clipboard tool found (xclip or xsel) for Linux"
     fi
 
   elif ((IS_BSD)); then
-    _safe_alias o 'xdg-open'
+    z::alias::define o 'xdg-open'
     if command -v xclip >/dev/null 2>&1; then
-      _safe_alias clip 'xclip -selection clipboard'
+      z::alias::define clip 'xclip -selection clipboard'
     else
-      _log_warn "No clipboard tool found (xclip) for BSD"
+      z::log::warn "No clipboard tool found (xclip) for BSD"
     fi
 
   elif ((IS_CYGWIN)); then
-    _safe_alias o 'cygstart'
-    _safe_alias clip 'cat > /dev/clipboard'
+    z::alias::define o 'cygstart'
+    z::alias::define clip 'cat > /dev/clipboard'
   fi
 
+  z::log::debug "Platform-specific aliases configured for: $PLATFORM"
   return 0
 }
 
