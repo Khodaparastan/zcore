@@ -224,7 +224,7 @@ _configure_completion_styles() {
   zstyle ':completion:*:corrections'  format '%F{magenta}%d (errors: %e)%f'
 
   # Colors
-  if [[ -n $LS_COLORS ]]; then
+    if [[ -n ${LS_COLORS:-} ]]; then
     zstyle ':completion:*:default' list-colors "${(s.:.)LS_COLORS}"
   else
     local default_colors=(
@@ -283,11 +283,14 @@ _configure_completion_styles() {
       zstyle ':completion:*:hosts' hosts "${ssh_hosts_array[@]}"
     fi
   fi
+    return 0
 }
 
 _git_prompt_info() {
-  emulate -L zsh
-  setopt LOCAL_OPTIONS NO_NOMATCH
+    emulate -L zsh -o no_aliases
+    setopt local_options no_nomatch
+
+  z::runtime::check_interrupted || return $?
 
   command git rev-parse --git-dir &>/dev/null || return
 
@@ -300,7 +303,7 @@ _git_prompt_info() {
       || branch_name='detached'
   fi
 
-  local has_changes=0 has_untracked=0
+    local -i has_changes=0 has_untracked=0
   local status_output
   status_output=$(command git status --porcelain=v1 2>/dev/null)
   if [[ -n $status_output ]]; then
@@ -320,22 +323,25 @@ _git_prompt_info() {
   command git rev-parse --verify --quiet refs/stash &>/dev/null && git_status+='$'
 
   printf '%%F{%s} (%s%s)%%f' "$git_color" "$branch_name" "$git_status"
+    return 0
 }
 
 _setup_prompt() {
-  # eval $(starship init zsh)
-  setopt PROMPT_SUBST
+    emulate -L zsh -o no_aliases
+    setopt local_options prompt_subst
+
+  z::runtime::check_interrupted || return $?
 
   # Cache git availability
-  if [[ -z $_zsh_git_available ]]; then
-    (( ${+commands[git]} )) && typeset -g _zsh_git_available=1 || typeset -g _zsh_git_available=0
+    if [[ -z ${_zcore_git_available:-} ]]; then
+    (( ${+commands[git]} )) && typeset -g _zcore_git_available=1 || typeset -g _zcore_git_available=0
   fi
 
-  local use_color=1
-  [[ -n $NO_COLOR || $TERM == dumb ]] && use_color=0
+    local -i use_color=1
+    [[ -n ${NO_COLOR:-} || ${TERM:-} == dumb ]] && use_color=0
 
   if (( use_color )); then
-    if (( _zsh_git_available )); then
+    if (( _zcore_git_available )); then
       PS1='%F{cyan}%n@%m%f:%F{blue}%~%f$(_git_prompt_info)%F{green}❯%f '
     else
       PS1='%F{cyan}%n@%m%f:%F{blue}%~%f%F{green}❯%f '
