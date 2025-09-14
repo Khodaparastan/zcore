@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `core.zsh` library is a production-ready, enterprise-grade utility framework for Zsh environments. It provides a comprehensive foundation for safe command execution, robust logging, intelligent caching, and sophisticated user interface management in complex shell environments.
+The `core.zsh` library is a utility framework for Zsh environments. It provides a comprehensive foundation for safe command execution, robust logging, intelligent caching, and sophisticated user interface management in complex shell environments.
 
 ## System Architecture
 
@@ -845,5 +845,3 @@ for ((i=1; i<=total; i++)); do
     # ... operation ...
 done
 ```
-
-This architecture documentation provides a comprehensive overview of the sophisticated engineering that makes this Zsh utility library enterprise-ready and production-safe.
