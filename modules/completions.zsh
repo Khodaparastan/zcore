@@ -355,10 +355,13 @@ _setup_prompt() {
   fi
 
 #Terminal title without overwriting other precmd handlers
-  _zsh_precmd_set_title() { print -Pn '\e]0;%n@%m:%~\a' }
-  typeset -ga precmd_functions
-  if (( ${precmd_functions[(I)_zsh_precmd_set_title]} == 0 )); then
-    precmd_functions+=_zsh_precmd_set_title
-  fi
+	autoload -Uz add-zsh-hook 2>/dev/null || true
+	_zcore_precmd_set_title() { print -Pn '\e]0;%n@%m:%~\a' }
+	add-zsh-hook precmd _zcore_precmd_set_title 2>/dev/null || {
+		# Fallback if add-zsh-hook is unavailable
+		if [[ -z ${(M)precmd_functions:#_zcore_precmd_set_title} ]]; then
+			precmd_functions+=_zcore_precmd_set_title
+		fi
+	}
+    return 0
 }
-
