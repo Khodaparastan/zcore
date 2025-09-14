@@ -1,5 +1,8 @@
+#!/usr/bin/env zsh
 _build_path() {
   emulate -L zsh
+
+  z::runtime::check_interrupted || return $?
 
   # Keep arrays unique but explicitly de-duplicate to preserve first-seen order
   typeset -gU path fpath
@@ -56,4 +59,7 @@ _build_path() {
     seen_fpath[$dir]=1
   done
   fpath=("${new_fpath[@]}")
+  
+  z::log::debug "PATH built successfully: ${#path[@]} entries"
+  z::log::debug "FPATH built successfully: ${#fpath[@]} entries"
 }
