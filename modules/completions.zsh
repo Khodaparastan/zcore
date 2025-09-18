@@ -260,14 +260,11 @@ z::mod::completions::_get_ssh_hosts() {
     return 0
 }
 
-###
-# Internal: Configures all `zstyle` settings for the completion system.
-###
+# Internal: Configures all zstyle settings for the completion system.
 z::mod::completions::_configure_styles() {
     emulate -L zsh
-    z::runtime::check_interrupted || return $?
+    setopt local_options typeset_silent
 
-    # Core completion styles
     zstyle ':completion:*' menu select=2
     zstyle ':completion:*' use-cache on
     zstyle ':completion:*' cache-path "${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compcache"
@@ -287,11 +284,9 @@ z::mod::completions::_configure_styles() {
 
     # Formatting and colors
     zstyle ':completion:*:descriptions' format '%F{yellow}-- %d --%f'
-    zstyle ':completion:*:messages' format '%F{blue}%d%f'
-    zstyle ':completion:*:warnings' format '%F{red}No matches found: %d%f'
-    zstyle ':completion:*:errors' format '%F{red}%d%f'
-    zstyle ':completion:*:corrections' format '%F{magenta}%d (errors: %e)%f'
-
+    zstyle ':completion:*:messages'     format '%F{blue}%d%f'
+    zstyle ':completion:*:warnings'     format '%F{red}No matches found: %d%f'
+    zstyle ':completion:*:errors'       format '%F{red}%d%f'
     if [[ -n "${LS_COLORS:-}" ]]; then
         zstyle ':completion:*:default' list-colors "${(s.:.)LS_COLORS}"
     else
@@ -301,10 +296,10 @@ z::mod::completions::_configure_styles() {
     fi
 
     # Specific command behaviors
-    zstyle ':completion:*:*:cd:*' tag-order local-directories directory-stack path-directories
-    zstyle ':completion:*:-tilde-:*' group-order 'named-directories' 'path-directories' 'expand'
-    zstyle ':completion:*:manuals' separate-sections true
-    zstyle ':completion:*:man:*' menu yes select
+    zstyle ':completion:*:*:cd:*'       tag-order local-directories directory-stack path-directories
+    zstyle ':completion:*:-tilde-:*'    group-order 'named-directories' 'path-directories' 'expand'
+    zstyle ':completion:*:manuals'      separate-sections true
+    zstyle ':completion:*:man:*'        menu select
 
     # Ignored patterns
     zstyle ':completion:*' ignored-patterns \
@@ -313,12 +308,16 @@ z::mod::completions::_configure_styles() {
         'node_modules' '__pycache__' '.pytest_cache' \
         '(*/)#lost+found' '(*/)#.cache' '*.log' '*.pid'
 
-    # Process completion using platform detection from zcore
+    # Process completion using platform detection
+    local uname_s; uname_s="$(uname -s 2>/dev/null)"
+    local use_bsd_ps=0
+    [[ "$uname_s" == "Darwin" || "$uname_s" == (FreeBSD|OpenBSD|NetBSD) ]] && use_bsd_ps=1
+
     local ps_cmd ps_kill_cmd
-    if ((IS_MACOS || IS_BSD)); then
+    if (( use_bsd_ps )); then
         ps_cmd="ps -u ${USER:-$(whoami)} -o pid,ppid,state,start,pcpu,pmem,command"
         ps_kill_cmd="ps -u ${USER:-$(whoami)} -o pid,user,comm"
-    else # Assumes Linux-like ps
+    else
         ps_cmd="ps -u ${USER:-$(whoami)} -o pid,ppid,state,stime,pcpu,pmem,args"
         ps_kill_cmd="ps -u ${USER:-$(whoami)} -o pid,user,comm -w -w"
     fi
@@ -326,33 +325,27 @@ z::mod::completions::_configure_styles() {
     zstyle ':completion:*:*:kill:*:processes' command "$ps_kill_cmd"
 
     # SSH-like commands host completion
-    if z::func::exists z::mod::completions::_get_ssh_hosts; then
-        local -a ssh_hosts_array=()
-        if ((${#_zcore_ssh_hosts_cache})); then
-            ssh_hosts_array=("${_zcore_ssh_hosts_cache[@]}")
-        else
-            ssh_hosts_array=("${(@f)$(z::mod::completions::_get_ssh_hosts 2> /dev/null)}")
-        fi
+    local -a ssh_hosts_array=()
+    if (( ${+_zcore_ssh_hosts_cache} && ${#_zcore_ssh_hosts_cache} )); then
+        ssh_hosts_array=("${_zcore_ssh_hosts_cache[@]}")
+    else
+        # Build (and populate cache) on demand; ignore errors
+        ssh_hosts_array=("${(@f)$(z::mod::completions::_get_ssh_hosts 2>/dev/null)}")
+    fi
 
-        if ((${#ssh_hosts_array})); then
-            zstyle ':completion:*:(ssh|scp|sftp|rsync):*' hosts "${ssh_hosts_array[@]}"
-            zstyle ':completion:*:hosts' hosts "${ssh_hosts_array[@]}"
-        fi
+    if (( ${#ssh_hosts_array} )); then
+        zstyle ':completion:*:(ssh|scp|sftp|rsync):*' hosts "${ssh_hosts_array[@]}"
+        zstyle ':completion:*:hosts'                   hosts "${ssh_hosts_array[@]}"
     fi
 
     z::log::debug "Completion styles configured."
-    return 0
 }
 
-# ==============================================================================
-# MAIN INITIALIZATION
-# ==============================================================================
-
-###
-# Public entry point for the completions module.
-###
+# Public init: prepares cache paths, loads modules, and configures styles
 z::mod::completions::init() {
     emulate -L zsh
+    setopt local_options typeset_silent
+
     z::runtime::check_interrupted || return $?
     z::log::info "Initializing completions module..."
 
