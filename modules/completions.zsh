@@ -5,18 +5,45 @@
 #
 
 # ==============================================================================
+# OPTIONAL COMPAT SHIMS (only if framework is absent)
+# ==============================================================================
+if ! typeset -f z::func::exists >/dev/null 2>&1; then
+    z::func::exists() { whence -w -- "$1" >/dev/null 2>&1; }
+fi
+if ! typeset -f z::log::debug >/dev/null 2>&1; then
+    z::log::debug() { :; }
+    z::log::info()  { :; }
+    z::log::warn()  { :; }
+    z::log::error() { :; }
+fi
+if ! typeset -f z::runtime::check_interrupted >/dev/null 2>&1; then
+    z::runtime::check_interrupted() { return 0; }
+fi
+if ! typeset -f z::config::get >/dev/null 2>&1; then
+    # z::config::get key nameref default
+    z::config::get() {
+        emulate -L zsh
+        setopt typeset_silent
+        local key="$1" dest_name="$2" default="$3"
+        typeset -n _dst="$dest_name"
+        if [[ -n "${(P)key:-}" ]]; then
+            _dst="${(P)key}"
+        else
+            _dst="$default"
+        fi
+    }
+fi
+
+# ==============================================================================
 # PRIVATE HELPERS
 # ==============================================================================
 
-###
 # Internal: Recursively parses an ssh_config file for host definitions.
-# Supports `Include` directives and negative patterns.
-#
-# @param 1: string - Path to the ssh_config file.
-# @param 2: integer - Current recursion depth to prevent infinite loops.
-# @param 3: string - Nameref to the array storing discovered hosts.
-# @param 4: string - Nameref to the array storing negative patterns.
-###
+# Supports Include directives and negative patterns.
+#   $1: string  - Path to the ssh_config file.
+#   $2: integer - Current recursion depth to prevent infinite loops.
+#   $3: string  - Nameref to the array storing discovered hosts.
+#   $4: string  - Nameref to the array storing negative patterns.
 z::mod::completions::_process_ssh_config() {
     emulate -L zsh
     setopt typeset_silent local_options extended_glob
@@ -26,11 +53,10 @@ z::mod::completions::_process_ssh_config() {
     local hosts_ref_name="$3"
     local neg_ref_name="$4"
 
-    # Use namerefs to modify the caller's arrays directly
     typeset -n _hosts_ref="$hosts_ref_name"
     typeset -n _negs_ref="$neg_ref_name"
 
-    if ((depth > 10)); then
+    if (( depth > 10 )); then
         z::log::warn "SSH config include depth limit reached for: $config_file"
         return 0
     fi
@@ -39,84 +65,107 @@ z::mod::completions::_process_ssh_config() {
     z::runtime::check_interrupted || return $?
 
     local base_dir="${config_file:h}"
-    local line trimmed
-
+    local line trimmed key rest
     while IFS= read -r line || [[ -n "$line" ]]; do
         z::runtime::check_interrupted || return $?
 
+        # Trim leading spaces
         trimmed="${line##[[:space:]]#}"
+        # Skip blanks and comments
         [[ -z "$trimmed" || "${trimmed[1]}" == '#' ]] && continue
 
-        # Handle 'Include' directives (case-insensitive)
-        if [[ "$trimmed" == (#mi)[[:space:]]#include[[:space:]]#(*) ]]; then
-            local include_pattern="${match[1]//\"/}"
-            [[ "$include_pattern" != /* ]] && include_pattern="$base_dir/$include_pattern"
+        # Split into key and the rest (preserve quoting in rest)
+        key="${trimmed%%[[:space:]]*}"
+        rest="${trimmed#$key}"
+        rest="${rest##[[:space:]]#}"
+        key="${key:l}"  # lowercase
 
-            local inc
-            for inc in ${~include_pattern}(N); do
-                if [[ -r "$inc" ]]; then
+        # Handle Include directives
+        if [[ "$key" == "include" && -n "$rest" ]]; then
+            # Split like shell words, respecting quotes
+            local -a patterns
+            patterns=("${(z)rest}")
+            local include_pattern inc
+            for include_pattern in "${patterns[@]}"; do
+                # Dequote simple double-quotes
+                include_pattern="${include_pattern//\"/}"
+                [[ "$include_pattern" != /* ]] && include_pattern="$base_dir/$include_pattern"
+                # Expand glob(s)
+                for inc in ${~include_pattern}(N); do
+                    [[ -r "$inc" ]] || continue
                     z::log::debug "Processing included SSH config: $inc"
-                    z::mod::completions::_process_ssh_config "$inc" $((depth + 1)) "$hosts_ref_name" "$neg_ref_name"
-                fi
+                    z::mod::completions::_process_ssh_config "$inc" $(( depth + 1 )) "$hosts_ref_name" "$neg_ref_name"
+                done
             done
             continue
         fi
 
-        # Handle 'Host' definitions (case-insensitive)
-        if [[ "$trimmed" == (#mi)[[:space:]]#host[[:space:]]#(*) ]]; then
-            local hosts_part="${match[1]//\"/}"
-            local -a host_list=("${(@s: :)hosts_part}")
+        # Handle Host definitions
+        if [[ "$key" == "host" && -n "$rest" ]]; then
+            local -a host_list
+            host_list=("${(z)rest}")
             local w
             for w in "${host_list[@]}"; do
+                # Negative patterns
                 if [[ "$w" == '!'* ]]; then
                     _negs_ref+=("${w#!}")
                     continue
                 fi
                 # Skip wildcards, localhost, IPs, IPv6, and .local mDNS
                 [[ "$w" == (*[\*\?\[\]]*|localhost|127.*|::1|*:*|*.local) ]] && continue
-
-                # Validate hostname format
-                if [[ "$w" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; then
+                # Validate hostname format (ERE)
+                if [[ "$w" =~ '^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$' ]]; then
                     _hosts_ref+=("$w")
                 fi
             done
+            continue
         fi
     done < "$config_file"
+
     return 0
 }
 
-###
 # Internal: Generates a list of SSH hosts from config and known_hosts files.
 # The result is cached for performance.
-#
-# @output A list of hostnames, one per line.
-###
+# Output: A list of hostnames, one per line.
 z::mod::completions::_get_ssh_hosts() {
     emulate -L zsh
     setopt local_options null_glob typeset_silent
 
     z::runtime::check_interrupted || return $?
-    zmodload -F zsh/stat b:zstat 2> /dev/null # Prefer zstat for speed
+
+    # Prefer builtin zstat for speed if available
+    zmodload -F zsh/stat b:zstat 2>/dev/null
 
     local cache_file="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/ssh_hosts_cache"
     local -i cache_age
-    z::config::get 'ssh_hosts_cache_age' cache_age 3600 # Use zcore config if available, fallback to 1hr
-    local -i current_time="${EPOCHSECONDS:-$(command date +%s)}"
+    z::config::get 'ssh_hosts_cache_age' cache_age 3600
+    local -i current_time=${EPOCHSECONDS:-$(command date +%s)}
+
+    # Decide how to stat mtime
+    local -i have_zstat=0
+    if whence -w zstat >/dev/null 2>&1; then
+        have_zstat=1
+    fi
+    local uname_s; uname_s="$(uname -s 2>/dev/null)"
+    local is_bsd_ps=0
+    [[ "$uname_s" == "Darwin" || "$uname_s" == (FreeBSD|OpenBSD|NetBSD) ]] && is_bsd_ps=1
 
     # Serve from cache if it's fresh
     if [[ -r "$cache_file" ]]; then
         local cache_mtime
-        if z::func::exists zstat; then
-            cache_mtime=$(zstat +mtime -- "$cache_file" 2> /dev/null)
-        elif ((IS_MACOS)); then
-            cache_mtime=$(command stat -f %m "$cache_file" 2> /dev/null)
+        if (( have_zstat )); then
+            cache_mtime=$(zstat +mtime -- "$cache_file" 2>/dev/null)
+        elif (( is_bsd_ps )); then
+            cache_mtime=$(command stat -f %m "$cache_file" 2>/dev/null)
         else
-            cache_mtime=$(command stat -c %Y "$cache_file" 2> /dev/null)
+            cache_mtime=$(command stat -c %Y "$cache_file" 2>/dev/null)
         fi
 
-        if [[ -n "$cache_mtime" ]] && ((current_time - cache_mtime < cache_age)); then
-            local -a cached_hosts=("${(@f)$(<"$cache_file")}")
-            if ((${#cached_hosts})); then
+        if [[ -n "$cache_mtime" ]] && (( current_time - cache_mtime < cache_age )); then
+            local -a cached_hosts=("${(@f)$(< "$cache_file")}")
+            if (( ${#cached_hosts} )); then
+                typeset -g _zcore_ssh_hosts_cache
                 _zcore_ssh_hosts_cache=("${cached_hosts[@]}")
                 print -l -- "${cached_hosts[@]}"
                 z::log::debug "Served SSH hosts from fresh cache."
