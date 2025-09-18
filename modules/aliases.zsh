@@ -22,10 +22,14 @@ z::mod::aliases::init() {
   z::alias::define up2 'cd ../../'
   z::alias::define cd- 'cd -'
   z::alias::define home 'cd ~'
+  z::alias::define dev 'cd ~/dev'
+  z::alias::define zss 'cd ~/.ssh'
+  z::alias::define zdd 'cd "${XDG_CONFIG_HOME:-$HOME/.config}"'
 
   # --- System & File Operations ---
   z::alias::define df 'df -h'
-  z::cmd::exists "free" && z::alias::define free 'free -h'
+  z::cmd::exists "free" &&
+    z::alias::define free 'free -h'
   z::alias::define mkdir 'mkdir -pv'
   z::alias::define ping 'ping -c 5'
   if ((IS_MACOS)); then
