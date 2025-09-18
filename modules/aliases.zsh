@@ -43,12 +43,20 @@ z::mod::aliases::init() {
   fi
 
   # --- Enhanced Tool Replacements ---
-  z::cmd::exists "bat" && z::alias::define cat 'bat --style=plain --paging=never'
-  z::cmd::exists "rg" && z::alias::define grep 'rg --color=always --smart-case'
-  z::cmd::exists "fd" && z::alias::define find 'fd --hidden --follow --exclude .git'
-  z::cmd::exists "btop" && z::alias::define top 'btop' ||
-    z::cmd::exists "htop" && z::alias::define top 'htop'
-  z::cmd::exists "delta" && z::alias::define diff 'delta'
+  z::cmd::exists "yazi" && z::alias::define y 'yazi'
+  z::cmd::exists "nvim" && z::alias::define v 'nvim' && z::alias::define vim 'nvim'
+  z::cmd::exists "bat" &&
+    z::alias::define cat 'bat --style=plain --paging=never'
+  z::cmd::exists "rg" &&
+    z::alias::define grep 'rg --color=always --smart-case'
+  z::cmd::exists "fd" &&
+    z::alias::define find 'fd --hidden --follow --exclude .git'
+  z::cmd::exists "btop" &&
+    z::alias::define top 'btop' ||
+    z::cmd::exists "htop" &&
+    z::alias::define top 'htop'
+  z::cmd::exists "delta" &&
+    z::alias::define diff 'delta'
 
   # --- Git ---
   if z::cmd::exists "git"; then
