@@ -175,16 +175,16 @@ z::mod::completions::_get_ssh_hosts() {
     fi
 
     z::log::debug "SSH host cache is stale or missing; rebuilding."
-    typeset -gU _zcore_ssh_hosts_cache
-    typeset -aU discovered_hosts=()
+    typeset -g _zcore_ssh_hosts_cache
+    typeset -a discovered_hosts=()
     typeset -a negative_patterns=()
 
     # SSH config sources
     local -a conf_files=()
     [[ -r "$HOME/.ssh/config" ]] && conf_files+=("$HOME/.ssh/config")
-    [[ -d "$HOME/.ssh/config.d" ]] && conf_files+=($HOME/.ssh/config.d/*.conf(N))
+    [[ -d "$HOME/.ssh/config.d" ]] && conf_files+=("$HOME/.ssh/config.d"/*.conf(N))
     [[ -r "/etc/ssh/ssh_config" ]] && conf_files+=("/etc/ssh/ssh_config")
-    [[ -d "/etc/ssh/ssh_config.d" ]] && conf_files+=(/etc/ssh/ssh_config.d/*.conf(N))
+    [[ -d "/etc/ssh/ssh_config.d" ]] && conf_files+=("/etc/ssh/ssh_config.d"/*.conf(N))
 
     local f
     for f in "${conf_files[@]}"; do
@@ -202,16 +202,21 @@ z::mod::completions::_get_ssh_hosts() {
         z::runtime::check_interrupted || return $?
         while IFS=' ' read -r host_entry _; do
             z::runtime::check_interrupted || return $?
+            # Skip comments and hashed entries
             [[ -z "$host_entry" || "$host_entry" == [\#\|]* ]] && continue
 
-            local -a hosts_in_entry=("${(@s:,:)host_entry}")
+            # Split host list (comma-separated)
+            local -a hosts_in_entry
+            hosts_in_entry=("${(@s:,:)host_entry}")
             local h
             for h in "${hosts_in_entry[@]}"; do
+                # Strip [host]:port and raw :port
                 h="${h#\[}"
                 h="${h%%\]:*}"
                 h="${h%%:*}"
+                # Filter localhost, IPs, IPv6, mDNS
                 [[ -z "$h" || "$h" == (127.*|::1|*.local|*:*|localhost) ]] && continue
-                if [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; then
+                if [[ "$h" =~ '^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$' ]]; then
                     discovered_hosts+=("$h")
                 fi
             done
@@ -219,7 +224,7 @@ z::mod::completions::_get_ssh_hosts() {
     done
 
     # Apply negative patterns
-    if ((${#negative_patterns})); then
+    if (( ${#negative_patterns} )); then
         local -a filtered_hosts=()
         local host pat
         for host in "${discovered_hosts[@]}"; do
@@ -231,16 +236,18 @@ z::mod::completions::_get_ssh_hosts() {
                     break
                 fi
             done
-            ((!skip)) && filtered_hosts+=("$host")
+            (( ! skip )) && filtered_hosts+=("$host")
         done
         discovered_hosts=("${filtered_hosts[@]}")
     fi
 
-    # Update global cache and write to file
+    # Unique + sort once
     _zcore_ssh_hosts_cache=("${(@ou)discovered_hosts}")
-    if ((${#_zcore_ssh_hosts_cache})); then
+
+    # Write cache file
+    if (( ${#_zcore_ssh_hosts_cache} )); then
         local cache_dir="${cache_file:h}"
-        if [[ -d "$cache_dir" ]] || command mkdir -p "$cache_dir" 2> /dev/null; then
+        if [[ -d "$cache_dir" ]] || command mkdir -p "$cache_dir" 2>/dev/null; then
             if ! print -l -- "${_zcore_ssh_hosts_cache[@]}" >| "$cache_file"; then
                 z::log::warn "Failed to write SSH hosts cache to $cache_file"
             else
