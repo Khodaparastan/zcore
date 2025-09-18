@@ -24,16 +24,15 @@ _zcore_config[show_progress]=${ZCORE_CONFIG_SHOW_PROGRESS:-true}
 
 # Global verbosity level
 # 0 = error only, 1 = warn, 2 = info (default), 3 = debug
-typeset -gi _zcore_verbose_level
-if [[ -n ${zcore_config_verbose:-} && ${zcore_config_verbose} == <-> ]]; then
-	if ((zcore_config_verbose > _zcore_config[log_info])) \
-	  && [[ "${_zcore_config[performance_mode]:-}" != "true" ]]; then
-		_zcore_verbose_level=${zcore_config_verbose}
-	else
-		_zcore_verbose_level=${_zcore_config[log_info]}
+typeset -gi _zcore_verbose_level=${_zcore_config[log_info]}
+if [[ "${zcore_config_verbose:-}" == <-> ]]; then
+	# Allow higher verbosity only if not in performance mode
+    if ((zcore_config_verbose > _zcore_config[log_info])) && \
+		[[ "${_zcore_config[performance_mode]}" != "true" ]]; then
+		_zcore_verbose_level=$zcore_config_verbose
+	elif ((zcore_config_verbose <= _zcore_config[log_info])); then
+		_zcore_verbose_level=$zcore_config_verbose
 	fi
-else
-	_zcore_verbose_level=${_zcore_config[log_info]}
 fi
 
 # Function to enable debug mode
@@ -116,7 +115,7 @@ elif (($+commands[gtimeout])); then
 fi
 
 typeset -gA _zcore_colors
-if [[ -t 2 && -z ${NO_COLOR:-} ]] \
+if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-} != "dumb" ]] \
   && (($+commands[tput])) \
   && tput setaf 1 > /dev/null 2>&1; then
 	_zcore_colors=(
@@ -136,19 +135,14 @@ typeset -gi _timestamp_epoch=0
 
 # --- Logging ---
 
-z::log::_update_ts()
-{
+z::log::_update_ts() {
 	emulate -L zsh
-	local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2> /dev/null)}
+	local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2>/dev/null)}
 	if ((current_epoch != _timestamp_epoch)); then
 		_timestamp_epoch=$current_epoch
-		if print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2> /dev/null; then
-			:
-		else
-			_cached_timestamp=$(
-				date '+%Y-%m-%d %H:%M:%S' 2> /dev/null \
-				  || date
-			)
+		# Use zsh/datetime for performance; fallback to `date`
+		if ! print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2>/dev/null; then
+			_cached_timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
 		fi
 	fi
 }
@@ -188,10 +182,10 @@ z::log::_engine()
 	local prefix=""
 	case $level in
 		(${_zcore_config[log_error]}) prefix="${_zcore_colors[red]}[error]${_zcore_colors[reset]}" ;;
-		(${_zcore_config[log_warn]}) prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
-		(${_zcore_config[log_info]}) prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
+        (${_zcore_config[log_warn]})  prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
+        (${_zcore_config[log_info]})  prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
 		(${_zcore_config[log_debug]}) prefix="${_zcore_colors[green]}[debug]${_zcore_colors[reset]}" ;;
-		(*) prefix="[unknown]" ;;
+        (*)                            prefix="[unknown]" ;;
 	esac
 
 	local msg="${(j: :)@}"
@@ -305,119 +299,6 @@ z::runtime::die()
 # 2. COMMAND & ALIAS HANDLING
 # ==============================================================================
 
-# Private helper: command name extraction from an alias definition
-z::alias::_extract_name()
-{
-	emulate -L zsh
-	setopt localoptions typeset_silent extendedglob
-
-	local alias_value="${1-}"
-	[[ -z $alias_value ]] \
-	  && return 1
-
-	local -a tokens
-	tokens=(${(z)alias_value})
-	((${#tokens} == 0)) \
-	  && return 1
-
-	local i=1 t seen_cmd=0
-	while ((i <= ${#tokens})); do
-		t=${tokens[i]}
-
-		# Skip leading assignments
-		if ((!seen_cmd)) \
-		  && [[ $t == [[:alpha:]_][[:alnum:]_]*=* ]]; then
-			((i++))
-			continue
-		fi
-
-		case $t in
-			nocorrect | noglob | nohup | time | nice)
-				((i++))
-				while ((i <= ${#tokens})); do
-					t=${tokens[i]}
-					[[ $t == -- ]] \
-					  && {
-						((i++))
-						break
-					}
-					[[ $t == -* ]] \
-					  || break
-					((i++))
-				done
-				continue
-				;;
-			sudo | doas)
-				((i++))
-				while ((i <= ${#tokens})); do
-					t=${tokens[i]}
-					[[ $t == -- ]] \
-					  && {
-						((i++))
-						break
-					}
-					# Long options with required args
-					if [[ $t == --user || $t == --group || $t == --prompt || $t == --close-from || $t == --chdir || $t == --command-timeout ]]; then
-						((i += 2))
-						continue
-					fi
-					if [[ $t == --user=* || $t == --group=* || $t == --prompt=* || $t == --close-from=* || $t == --chdir=* || $t == --command-timeout=* ]]; then
-						((i++))
-						continue
-					fi
-					# Short options; some require an argument
-					case $t in
-						-u | -g | -p | -C | -r | -t | -D)
-							((i += 2))
-							continue
-							;;
-						-*)
-							((i++))
-							continue
-							;;
-					esac
-					break
-				done
-				continue
-				;;
-			env)
-				((i++))
-				while ((i <= ${#tokens})); do
-					t=${tokens[i]}
-					[[ $t == -- ]] \
-					  && {
-						((i++))
-						break
-					}
-					[[ $t == [[:alpha:]_][[:alnum:]_]*=* ]] \
-					  && {
-						((i++))
-						continue
-					}
-					[[ $t == -* ]] \
-					  && {
-						((i++))
-						continue
-					}
-					break
-				done
-				continue
-				;;
-		esac
-
-		# First sensible token becomes the command name
-		if [[ $t == -* || $t == '|' || $t == '||' || $t == '&&' || $t == ';' || $t == '&' ]]; then
-			((i++))
-			continue
-		fi
-
-		print -r -- "$t"
-		return 0
-	done
-
-	return 1
-}
-
 z::alias::define()
 {
 	emulate -L zsh
@@ -466,7 +347,7 @@ z::path::add()
 
 	case "$position" in
 		prepend) export PATH="$dir:$PATH" ;;
-		append) export PATH="$PATH:$dir" ;;
+    append)  export PATH="$PATH:$dir" ;;
 		*)
 			z::log::error "Invalid position for z::path::add: $position (use prepend or append)"
 			return 1
@@ -482,23 +363,6 @@ z::path::add()
 # ==============================================================================
 
 # Private helper: shell init detection
-#z::exec::_is_init_cmd() {
-#	emulate -L zsh
-#	local input="$1"
-#	# Direct form: ... (starship|...) init ...
-#	if [[ "$input" =~ '(^|[[:space:]])(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-#		return 0
-#	fi
-#	# Wrapped in command substitution, e.g., eval "$(starship init zsh)"
-#	if [[ "$input" =~ '\\$\\([^)]*(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init[^)]*\\)' ]]; then
-#		return 0
-#	fi
-#	# env wrapper heuristic: env VAR=... <tool> init ...
-#	if [[ "$input" =~ '(^|[[:space:]])env([[:space:]]+[-[:alnum:]_]+=.*)*[[:space:]]+(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-#		return 0
-#	fi
-#	return 1
-#}
 z::exec::_is_init_cmd()
 {
 	emulate -L zsh
@@ -506,10 +370,6 @@ z::exec::_is_init_cmd()
 	# Relaxed heuristic: detect any occurrence of a known tool name followed by `init`
 	# Works for: direct use, env-wrapped, eval "$( ... )", and similar forms.
 	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-		return 0
-	fi
-	# Also accept cases where init is the last token with no trailing space
-	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init$' ]]; then
 		return 0
 	fi
 	return 1
@@ -582,7 +442,7 @@ z::exec::_check_segment()
 				mode="$a"
 				continue
 			fi
-			if [[ $a == / || $a == /* ]]; then
+            if [[ $a == / ]]; then
 				saw_root=1
 				continue
 			fi
@@ -654,17 +514,38 @@ z::exec::_scan_patterns()
 	  && return 0
 
 	# Guard: pipe to a shell
-	local i next
+    local i j next_cmd base
 	for (( i = 1; i <= ${#words}; i++ )); do
 		if [[ ${words[i]} == '|' ]]; then
-			next="${words[i+1]-}"
-			case "$next" in
+            j=$(( i + 1 ))
+            # Find the first real command in the next segment
+            while (( j <= ${#words} )); do
+                case "${words[j]}" in
+                    '|'|'||'|'&&'|';'|'&')
+                        break
+                        ;;
+                    nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
+                        ((j++))
+                        continue
+                        ;;
+                    [[:alpha:]_][[:alnum:]_]*=*)
+                        ((j++))
+                        continue
+                        ;;
+                esac
+                next_cmd="${words[j]}"
+                break
+            done
+            if [[ -n ${next_cmd:-} ]]; then
+                base="${next_cmd:t}"
+                case "$base" in
 				sh | bash | zsh | ksh | dash)
 					z::log::error "Dangerous pattern: pipe to shell"
 					return 1
 					;;
 			esac
 		fi
+        fi
 	done
 
 	# Guard: common fork bomb
@@ -689,7 +570,7 @@ z::exec::_scan_patterns()
 					return 1
 				fi
 				;;
-			nocorrect | noglob | builtin | exec | time | nice | nohup | sudo | doas | env)
+      nocorrect | noglob | builtin | command | exec | time | nice | nohup | sudo | doas | env)
 			# Skip precommands only at segment start
 				if ((${#seg} == 0)); then
 					continue
@@ -716,8 +597,6 @@ z::exec::_scan_patterns()
 		local -a args=("${(@)seg[2,-1]}")
 		z::exec::_check_segment "$cmd" "${args[@]}" \
 		  || return 1
-	else
-		return 1
 	fi
 
 	return 0
@@ -742,7 +621,7 @@ z::exec::run()
 		fi
 	fi
 
-	# Security scan (now robust across separators)
+  # Security scan
 	z::exec::_scan_patterns "$input" \
 	  || return 1
 
@@ -781,38 +660,34 @@ z::exec::eval()
 		return 1
 	fi
 
+    if [[ "$force_current_shell" == "true" ]]; then
+        z::log::debug "Forcing eval in current shell for init script"
+        z::runtime::check_interrupted \
+            || return $?
+        local -i exit_code=0
+        eval "$input" \
+            || exit_code=$?
+        if ((exit_code != 0)); then
+            z::log::warn "Forced eval failed with exit code $exit_code"
+        fi
+        return $exit_code
+    fi
+
 	local is_shell_init=false
 	z::exec::_is_init_cmd "$input" \
 	  && is_shell_init=true
 
-	# Check for package manager installation patterns (common)
 	local is_package_install=false
 	if [[ $input =~ '(^|[[:space:]])(npm|yarn|pip|pip3|cargo|brew|apt|yum|dnf|pacman)[[:space:]]+(add|install)($|[[:space:]])' ]]; then
 		is_package_install=true
 	fi
 
-	local -i exit_code=0
-
-	# Handle shell init commands safely
-	if [[ "$is_shell_init" == "true" ]]; then
-		if [[ "${_zcore_config[performance_mode]}" == "true" ]]; then
-			z::log::debug "Running init in performance mode: $input"
-			z::exec::run "$input" "$timeout" \
-			  || exit_code=$?
-		else
-			z::log::debug "Detected shell init command: $input"
-			z::exec::run "$input" "$timeout" \
-			  || exit_code=$?
-		fi
-		return $exit_code
-	fi
-
-	# Security scan (skip only for known package managers and performance mode)
+    # Security scan (skipped for known safe patterns)
 	if [[ "${_zcore_config[performance_mode]}" != "true" ]] \
 	  && \
-	  [[ "$is_package_install" != "true" ]] \
+        [[ "$is_shell_init" != "true" ]] \
 	  && \
-	  [[ "$force_current_shell" != "true" ]]; then
+        [[ "$is_package_install" != "true" ]]; then
 		z::exec::_scan_patterns "$input" \
 		  || return 1
 	fi
@@ -820,23 +695,52 @@ z::exec::eval()
 	z::runtime::check_interrupted \
 	  || return $?
 
-	# Execute the command safely
-	if [[ "$force_current_shell" == "true" ]]; then
-		# Only for trusted internal operations
-		eval "$input" \
-		  || exit_code=$?
-	else
-		# Use safe execution for external commands
-		z::exec::run "$input" "$timeout" \
-		  || exit_code=$?
-	fi
+    if [[ "$is_shell_init" == "true" ]]; then
+        z::log::debug "Detected shell init command (running in subshell): ${input}"
+    fi
 
-	if ((exit_code != 0 && exit_code != 124)); then
-		z::log::warn "Eval failed with exit code $exit_code"
-	fi
-	return $exit_code
+    z::exec::run "$input" "$timeout"
 }
 
+###
+# Initializes a tool by safely evaluating its shell hook output.
+#
+# @param 1: string - The name of the command-line tool (e.g., "direnv").
+# @param 2: string - The subcommand to generate the hook (default: "init").
+# @param 3: string - The shell argument for the hook (default: "zsh").
+# @return 0 on success, 1 on failure.
+###
+z::exec::from_hook()
+{
+    emulate -L zsh
+    local tool_name="$1"
+    local subcommand="${2:-init}"
+    local shell_arg="${3:-zsh}"
+
+    z::runtime::check_interrupted \
+        || return $?
+
+    if ! z::cmd::exists "$tool_name"; then
+        z::log::debug "$tool_name not found, skipping"
+        return 0 # Return 0 because not finding the tool isn't a failure
+    fi
+
+    local init_code
+    if init_code="$("$tool_name" "$subcommand" "$shell_arg" 2> /dev/null)" \
+        && [[ -n "$init_code" ]]; then
+        # Use the 'true' flag to force eval in the current shell context
+        if z::exec::eval "$init_code" 30 true; then
+            z::log::debug "$tool_name initialized successfully via hook"
+            return 0
+        else
+            z::log::warn "Failed to initialize $tool_name from its hook"
+            return 1
+        fi
+	else
+        z::log::warn "Failed to get hook/init code from $tool_name"
+        return 1
+	fi
+}
 # ==============================================================================
 # 4. FILESYSTEM & SOURCING
 # ==============================================================================
@@ -924,7 +828,7 @@ z::path::source()
 
 	# Always do cheap tilde expansion (even in performance mode) to avoid surprises
 	case "$resolved_file" in
-		'~' | '~/'*) resolved_file="${HOME}${resolved_file#~}" ;;
+    '~' | '~/'*)   resolved_file="${HOME}${resolved_file#~}" ;;
 		'~+' | '~+/'*) resolved_file="${PWD}${resolved_file#~+}" ;;
 		'~-' | '~-/'*) resolved_file="${OLDPWD:-$PWD}${resolved_file#~-}" ;;
 	esac
@@ -1017,22 +921,26 @@ z::cache::cmd::_purge()
 }
 
 # Command existence check with caching
-z::cmd::exists() {
+z::cmd::exists()
+{
 	emulate -L zsh
 	local cmd="$1"
-	[[ -z "$cmd" ]] && return 1
+    [[ -z "$cmd" ]] \
+        && return 1
 
 	local cache_key="cmd_${cmd//[^a-zA-Z0-9_]/_}"
-	if (( ${+_cmd_cache[$cache_key]} )); then
+    if ((${+_cmd_cache[$cache_key]})); then
 		return ${_cmd_cache[$cache_key]}
 	fi
 
 	local -i result=1
-	(( $+commands[$cmd] )) && result=0
+    (($+commands[$cmd])) \
+        && result=0
 
 	_cmd_cache[$cache_key]=$result
 	_cmd_cache_order+=("$cache_key")
-	(( ++_cmd_cache_size > _zcore_config[cache_max_size] )) && z::cache::cmd::_purge
+    ((++_cmd_cache_size > _zcore_config[cache_max_size])) \
+        && z::cache::cmd::_purge
 
 	return $result
 }
@@ -1346,10 +1254,18 @@ z::ui::progress::show()
 	local -i empty_len=$((bar_width - filled))
 
 	local bar_fill bar_empty
-	printf -v bar_fill "%${filled}s" ""
-	printf -v bar_empty "%${empty_len}s" ""
+    if ((filled > 0)); then
+        print -v bar_fill -f "%${filled}s" ""
 	bar_fill=${bar_fill// /█}
+    else
+        bar_fill=""
+    fi
+    if ((empty_len > 0)); then
+        print -v bar_empty -f "%${empty_len}s" ""
 	bar_empty=${bar_empty// /░}
+    else
+        bar_empty=""
+    fi
 	local progress_bar="${bar_fill}${bar_empty}"
 
 	local current_fmt total_fmt
