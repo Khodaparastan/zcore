@@ -24,16 +24,15 @@ _zcore_config[show_progress]=${ZCORE_CONFIG_SHOW_PROGRESS:-true}
 
 # Global verbosity level
 # 0 = error only, 1 = warn, 2 = info (default), 3 = debug
-typeset -gi _zcore_verbose_level
-if [[ -n ${zcore_config_verbose:-} && ${zcore_config_verbose} == <-> ]]; then
-	if ((zcore_config_verbose > _zcore_config[log_info])) \
-	  && [[ "${_zcore_config[performance_mode]:-}" != "true" ]]; then
-		_zcore_verbose_level=${zcore_config_verbose}
-	else
-		_zcore_verbose_level=${_zcore_config[log_info]}
+typeset -gi _zcore_verbose_level=${_zcore_config[log_info]}
+if [[ "${zcore_config_verbose:-}" == <-> ]]; then
+	# Allow higher verbosity only if not in performance mode
+    if ((zcore_config_verbose > _zcore_config[log_info])) && \
+		[[ "${_zcore_config[performance_mode]}" != "true" ]]; then
+		_zcore_verbose_level=$zcore_config_verbose
+	elif ((zcore_config_verbose <= _zcore_config[log_info])); then
+		_zcore_verbose_level=$zcore_config_verbose
 	fi
-else
-	_zcore_verbose_level=${_zcore_config[log_info]}
 fi
 
 # Function to enable debug mode
@@ -136,19 +135,14 @@ typeset -gi _timestamp_epoch=0
 
 # --- Logging ---
 
-z::log::_update_ts()
-{
+z::log::_update_ts() {
 	emulate -L zsh
-	local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2> /dev/null)}
+	local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2>/dev/null)}
 	if ((current_epoch != _timestamp_epoch)); then
 		_timestamp_epoch=$current_epoch
-		if print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2> /dev/null; then
-			:
-		else
-			_cached_timestamp=$(
-				date '+%Y-%m-%d %H:%M:%S' 2> /dev/null \
-				  || date
-			)
+		# Use zsh/datetime for performance; fallback to `date`
+		if ! print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2>/dev/null; then
+			_cached_timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
 		fi
 	fi
 }
@@ -1017,22 +1011,26 @@ z::cache::cmd::_purge()
 }
 
 # Command existence check with caching
-z::cmd::exists() {
+z::cmd::exists()
+{
 	emulate -L zsh
 	local cmd="$1"
-	[[ -z "$cmd" ]] && return 1
+    [[ -z "$cmd" ]] \
+        && return 1
 
 	local cache_key="cmd_${cmd//[^a-zA-Z0-9_]/_}"
-	if (( ${+_cmd_cache[$cache_key]} )); then
+    if ((${+_cmd_cache[$cache_key]})); then
 		return ${_cmd_cache[$cache_key]}
 	fi
 
 	local -i result=1
-	(( $+commands[$cmd] )) && result=0
+    (($+commands[$cmd])) \
+        && result=0
 
 	_cmd_cache[$cache_key]=$result
 	_cmd_cache_order+=("$cache_key")
-	(( ++_cmd_cache_size > _zcore_config[cache_max_size] )) && z::cache::cmd::_purge
+    ((++_cmd_cache_size > _zcore_config[cache_max_size])) \
+        && z::cache::cmd::_purge
 
 	return $result
 }
