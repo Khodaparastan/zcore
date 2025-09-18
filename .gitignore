@@ -1,4 +1,7 @@
 tmp
+.DS_Store
 aliases
 .idea
 zsh-runtime-detect
+.zc*
+.zsh_*
