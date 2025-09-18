@@ -78,6 +78,11 @@ z::mod::aliases::init() {
     z::alias::define gds 'git diff --staged'
   fi
 
+  # --- SSH ---
+  z::alias::define skr 'ssh-keygen -R'
+  z::alias::define sci 'ssh-copy-id -i'
+  z::alias::define ssi 'ssh -i'
+
   # --- Platform Specific ---
   if ((IS_MACOS)); then
     z::alias::define o 'open'
