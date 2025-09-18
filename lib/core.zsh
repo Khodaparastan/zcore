@@ -1254,10 +1254,18 @@ z::ui::progress::show()
 	local -i empty_len=$((bar_width - filled))
 
 	local bar_fill bar_empty
-	printf -v bar_fill "%${filled}s" ""
-	printf -v bar_empty "%${empty_len}s" ""
+    if ((filled > 0)); then
+        print -v bar_fill -f "%${filled}s" ""
 	bar_fill=${bar_fill// /█}
+    else
+        bar_fill=""
+    fi
+    if ((empty_len > 0)); then
+        print -v bar_empty -f "%${empty_len}s" ""
 	bar_empty=${bar_empty// /░}
+    else
+        bar_empty=""
+    fi
 	local progress_bar="${bar_fill}${bar_empty}"
 
 	local current_fmt total_fmt
