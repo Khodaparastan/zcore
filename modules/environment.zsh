@@ -2,7 +2,7 @@
 
 # Package managers and environment initialization helpers
 
-_setup_package_managers() {
+z::mod::env::_setup_package_managers() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -38,14 +38,14 @@ _setup_package_managers() {
 
 # ----- XDG helper functions (moved out of _create_xdg_dirs) -----
 
-_xdg_can_modify_dir() {
+z::mod::env::_xdg_can_modify_dir() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local dir="$1"
 	[[ -O "$dir" ]] 2>/dev/null
 }
 
-_xdg_is_system_managed() {
+z::mod::env::_xdg_is_system_managed() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local dir="$1"
@@ -55,7 +55,7 @@ _xdg_is_system_managed() {
 	[[ "$owner_uid" == "0" || "$owner_uid" == "unknown" ]]
 }
 
-_xdg_has_immutable_attrs() {
+z::mod::env::_xdg_has_immutable_attrs() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local dir="$1"
@@ -70,14 +70,14 @@ _xdg_has_immutable_attrs() {
 	fi
 }
 
-_xdg_is_symlink() {
+z::mod::env::_xdg_is_symlink() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local path="$1"
 	[[ -L "$path" ]]
 }
 
-_xdg_is_readonly_fs() {
+z::mod::env::_xdg_is_readonly_fs() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local path="$1"
@@ -91,7 +91,7 @@ _xdg_is_readonly_fs() {
 
 # ----- Create XDG directories with permissions -----
 
-_create_xdg_dirs() {
+z::mod::env::_create_xdg_dirs() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -99,7 +99,7 @@ _create_xdg_dirs() {
 
 	# Ensure XDG variables are set
 	if [[ -z $XDG_CONFIG_HOME || -z $XDG_DATA_HOME || -z $XDG_CACHE_HOME || -z $XDG_STATE_HOME ]]; then
-		_setup_xdg || return 1
+		z::mod::env::_setup_xdg || return 1
 	fi
 
 	# Skip permissions modifications as root
@@ -145,11 +145,11 @@ _create_xdg_dirs() {
 			current_perm=$(stat -f "%Lp" "$dir" 2>/dev/null || stat -c "%a" "$dir" 2>/dev/null || print -r -- "unknown")
 
 			if [[ "$current_perm" != "unknown" ]] \
-			  && _xdg_can_modify_dir "$dir" \
-			  && ! _xdg_is_system_managed "$dir" \
-			  && ! _xdg_has_immutable_attrs "$dir" \
-			  && ! _xdg_is_symlink "$dir" \
-			  && ! _xdg_is_readonly_fs "$dir"
+			  && z::mod::env::_xdg_can_modify_dir "$dir" \
+			  && ! z::mod::env::_xdg_is_system_managed "$dir" \
+			  && ! z::mod::env::_xdg_has_immutable_attrs "$dir" \
+			  && ! z::mod::env::_xdg_is_symlink "$dir" \
+			  && ! z::mod::env::_xdg_is_readonly_fs "$dir"
 			then
 				local current_owner_perm="${current_perm:0:1}"
 				local target_owner_perm="${perm:0:1}"
@@ -162,13 +162,13 @@ _create_xdg_dirs() {
 				else
 					z::log::debug "Permissions already appropriate ($current_perm) on: $dir"
 				fi
-			elif _xdg_is_system_managed "$dir"; then
+			elif z::mod::env::_xdg_is_system_managed "$dir"; then
 				z::log::debug "Using existing permissions $current_perm on: $dir (system-managed)"
-			elif _xdg_has_immutable_attrs "$dir"; then
+			elif z::mod::env::_xdg_has_immutable_attrs "$dir"; then
 				z::log::debug "Using existing permissions $current_perm on: $dir (immutable attributes)"
-			elif _xdg_is_symlink "$dir"; then
+			elif z::mod::env::_xdg_is_symlink "$dir"; then
 				z::log::debug "Using existing permissions $current_perm on: $dir (symlink)"
-			elif _xdg_is_readonly_fs "$dir"; then
+			elif z::mod::env::_xdg_is_readonly_fs "$dir"; then
 				z::log::debug "Using existing permissions $current_perm on: $dir (read-only filesystem)"
 			elif [[ "$current_perm" != "unknown" ]]; then
 				z::log::debug "Using existing permissions $current_perm on: $dir (not owned by current user)"
@@ -190,7 +190,7 @@ _create_xdg_dirs() {
 	return 0
 }
 
-_setup_xdg() {
+z::mod::env::_setup_xdg() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -214,15 +214,15 @@ _setup_xdg() {
 	return 0
 }
 
-_initialize_environment() {
+z::mod::env::_initialize_environment() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
 	z::runtime::check_interrupted || return $?
 
-	_setup_xdg || return 1
-	# _create_xdg_dirs
-	_setup_package_managers || return 1
+	z::mod::env::_setup_xdg || return 1
+	z::mod::env::_create_xdg_dirs || return 1
+	z::mod::env::_setup_package_managers || return 1
 
 	if [[ ${ZCORE_DEBUG:-0} == 1 ]]; then
 		z::log::info "Core environment initialized:"
@@ -237,7 +237,7 @@ _initialize_environment() {
 	return 0
 }
 
-zcore_safe_exec() {
+z::mod::env::zcore_safe_exec() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 
@@ -254,7 +254,7 @@ zcore_safe_exec() {
 	return 127
 }
 
-_check_network() {
+z::mod::env::_check_network() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -289,7 +289,7 @@ _check_network() {
 
 # ----- Environment setup helpers (moved out of _setup_environment) -----
 
-_setup_editor_environment() {
+z::mod::env::_setup_editor() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -325,8 +325,8 @@ _setup_editor_environment() {
 	return 0
 }
 
-
-_setup_development_environment() {
+# ----- Development environment setup helpers -----
+z::mod::env::_setup_development() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -434,7 +434,8 @@ _setup_development_environment() {
 
 	return 0
 }
-_setup_xdg_compliance() {
+# ----- XDG compliance setup helpers -----
+z::mod::env::_setup_xdg_compliance() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -511,7 +512,8 @@ _setup_xdg_compliance() {
 	return 0
 }
 
-_setup_security_environment() {
+# ----- Security environment setup helpers -----
+z::mod::env::_setup_security() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -540,7 +542,8 @@ _setup_security_environment() {
 	return 0
 }
 
-_setup_performance_environment() {
+# ----- Performance environment setup helpers -----
+z::mod::env::_setup_performance() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -559,7 +562,8 @@ _setup_performance_environment() {
 	return 0
 }
 
-_setup_terminal_environment() {
+# ----- Terminal environment setup helpers -----
+z::mod::env::_setup_terminal() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -596,7 +600,8 @@ _setup_terminal_environment() {
 	return 0
 }
 
-_setup_cloud_environment() {
+# ----- Cloud environment setup helpers -----
+z::mod::env::_setup_cloud() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
@@ -627,20 +632,26 @@ _setup_cloud_environment() {
 	return 0
 }
 
-_setup_environment() {
+# ----- Environment setup helpers -----
+z::mod::env::init() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent no_unset
 
 	z::runtime::check_interrupted || return $?
-
-	_setup_editor_environment        || return $?
-	_setup_development_environment   || return $?
-	_setup_xdg_compliance            || return $?
-	_setup_security_environment      || return $?
-	_setup_performance_environment   || return $?
-	_setup_terminal_environment      || return $?
-	_setup_cloud_environment         || return $?
-
-	z::log::debug "Environment setup completed successfully"
+        z::log::info "Initializing core environment..."
+	z::mod::env::_setup_editor        || return $?
+	# z::mod::env::_initialize_environment || return $?
+	z::mod::env::_setup_development   || return $?
+	z::mod::env::_setup_xdg_compliance            || return $?
+	z::mod::env::_setup_security      || return $?
+	z::mod::env::_setup_performance   || return $?
+	z::mod::env::_setup_terminal      || return $?
+	z::mod::env::_setup_cloud         || return $?
+        z::log::info "Core environment initialized successfully."
 	return 0
 }
+
+
+if z::func::exists "z::mod::env::init"; then
+  z::mod::env::init
+fi
