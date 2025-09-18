@@ -115,7 +115,7 @@ elif (($+commands[gtimeout])); then
 fi
 
 typeset -gA _zcore_colors
-if [[ -t 2 && -z ${NO_COLOR:-} ]] \
+if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-} != "dumb" ]] \
   && (($+commands[tput])) \
   && tput setaf 1 > /dev/null 2>&1; then
 	_zcore_colors=(
@@ -182,10 +182,10 @@ z::log::_engine()
 	local prefix=""
 	case $level in
 		(${_zcore_config[log_error]}) prefix="${_zcore_colors[red]}[error]${_zcore_colors[reset]}" ;;
-		(${_zcore_config[log_warn]}) prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
-		(${_zcore_config[log_info]}) prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
+        (${_zcore_config[log_warn]})  prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
+        (${_zcore_config[log_info]})  prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
 		(${_zcore_config[log_debug]}) prefix="${_zcore_colors[green]}[debug]${_zcore_colors[reset]}" ;;
-		(*) prefix="[unknown]" ;;
+        (*)                            prefix="[unknown]" ;;
 	esac
 
 	local msg="${(j: :)@}"
@@ -460,7 +460,7 @@ z::path::add()
 
 	case "$position" in
 		prepend) export PATH="$dir:$PATH" ;;
-		append) export PATH="$PATH:$dir" ;;
+    append)  export PATH="$PATH:$dir" ;;
 		*)
 			z::log::error "Invalid position for z::path::add: $position (use prepend or append)"
 			return 1
@@ -918,7 +918,7 @@ z::path::source()
 
 	# Always do cheap tilde expansion (even in performance mode) to avoid surprises
 	case "$resolved_file" in
-		'~' | '~/'*) resolved_file="${HOME}${resolved_file#~}" ;;
+    '~' | '~/'*)   resolved_file="${HOME}${resolved_file#~}" ;;
 		'~+' | '~+/'*) resolved_file="${PWD}${resolved_file#~+}" ;;
 		'~-' | '~-/'*) resolved_file="${OLDPWD:-$PWD}${resolved_file#~-}" ;;
 	esac
