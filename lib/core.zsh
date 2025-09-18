@@ -514,17 +514,38 @@ z::exec::_scan_patterns()
 	  && return 0
 
 	# Guard: pipe to a shell
-	local i next
+    local i j next_cmd base
 	for (( i = 1; i <= ${#words}; i++ )); do
 		if [[ ${words[i]} == '|' ]]; then
-			next="${words[i+1]-}"
-			case "$next" in
+            j=$(( i + 1 ))
+            # Find the first real command in the next segment
+            while (( j <= ${#words} )); do
+                case "${words[j]}" in
+                    '|'|'||'|'&&'|';'|'&')
+                        break
+                        ;;
+                    nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
+                        ((j++))
+                        continue
+                        ;;
+                    [[:alpha:]_][[:alnum:]_]*=*)
+                        ((j++))
+                        continue
+                        ;;
+                esac
+                next_cmd="${words[j]}"
+                break
+            done
+            if [[ -n ${next_cmd:-} ]]; then
+                base="${next_cmd:t}"
+                case "$base" in
 				sh | bash | zsh | ksh | dash)
 					z::log::error "Dangerous pattern: pipe to shell"
 					return 1
 					;;
 			esac
 		fi
+        fi
 	done
 
 	# Guard: common fork bomb
