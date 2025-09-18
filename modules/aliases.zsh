@@ -9,7 +9,8 @@
 # ==============================================================================
 z::mod::aliases::init() {
   emulate -L zsh
-  z::runtime::check_interrupted || return $?
+  z::runtime::check_interrupted ||
+    return $?
   z::log::info "Defining aliases..."
 
   # --- Editor ---
