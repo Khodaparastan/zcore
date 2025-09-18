@@ -363,23 +363,6 @@ z::path::add()
 # ==============================================================================
 
 # Private helper: shell init detection
-#z::exec::_is_init_cmd() {
-#	emulate -L zsh
-#	local input="$1"
-#	# Direct form: ... (starship|...) init ...
-#	if [[ "$input" =~ '(^|[[:space:]])(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-#		return 0
-#	fi
-#	# Wrapped in command substitution, e.g., eval "$(starship init zsh)"
-#	if [[ "$input" =~ '\\$\\([^)]*(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init[^)]*\\)' ]]; then
-#		return 0
-#	fi
-#	# env wrapper heuristic: env VAR=... <tool> init ...
-#	if [[ "$input" =~ '(^|[[:space:]])env([[:space:]]+[-[:alnum:]_]+=.*)*[[:space:]]+(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-#		return 0
-#	fi
-#	return 1
-#}
 z::exec::_is_init_cmd()
 {
 	emulate -L zsh
@@ -387,10 +370,6 @@ z::exec::_is_init_cmd()
 	# Relaxed heuristic: detect any occurrence of a known tool name followed by `init`
 	# Works for: direct use, env-wrapped, eval "$( ... )", and similar forms.
 	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
-		return 0
-	fi
-	# Also accept cases where init is the last token with no trailing space
-	if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init$' ]]; then
 		return 0
 	fi
 	return 1
@@ -463,7 +442,7 @@ z::exec::_check_segment()
 				mode="$a"
 				continue
 			fi
-			if [[ $a == / || $a == /* ]]; then
+            if [[ $a == / ]]; then
 				saw_root=1
 				continue
 			fi
@@ -570,7 +549,7 @@ z::exec::_scan_patterns()
 					return 1
 				fi
 				;;
-			nocorrect | noglob | builtin | exec | time | nice | nohup | sudo | doas | env)
+      nocorrect | noglob | builtin | command | exec | time | nice | nohup | sudo | doas | env)
 			# Skip precommands only at segment start
 				if ((${#seg} == 0)); then
 					continue
@@ -597,8 +576,6 @@ z::exec::_scan_patterns()
 		local -a args=("${(@)seg[2,-1]}")
 		z::exec::_check_segment "$cmd" "${args[@]}" \
 		  || return 1
-	else
-		return 1
 	fi
 
 	return 0
