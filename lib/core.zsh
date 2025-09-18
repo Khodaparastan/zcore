@@ -621,7 +621,7 @@ z::exec::run()
 		fi
 	fi
 
-	# Security scan (now robust across separators)
+  # Security scan
 	z::exec::_scan_patterns "$input" \
 	  || return 1
 
@@ -660,38 +660,34 @@ z::exec::eval()
 		return 1
 	fi
 
+    if [[ "$force_current_shell" == "true" ]]; then
+        z::log::debug "Forcing eval in current shell for init script"
+        z::runtime::check_interrupted \
+            || return $?
+        local -i exit_code=0
+        eval "$input" \
+            || exit_code=$?
+        if ((exit_code != 0)); then
+            z::log::warn "Forced eval failed with exit code $exit_code"
+        fi
+        return $exit_code
+    fi
+
 	local is_shell_init=false
 	z::exec::_is_init_cmd "$input" \
 	  && is_shell_init=true
 
-	# Check for package manager installation patterns (common)
 	local is_package_install=false
 	if [[ $input =~ '(^|[[:space:]])(npm|yarn|pip|pip3|cargo|brew|apt|yum|dnf|pacman)[[:space:]]+(add|install)($|[[:space:]])' ]]; then
 		is_package_install=true
 	fi
 
-	local -i exit_code=0
-
-	# Handle shell init commands safely
-	if [[ "$is_shell_init" == "true" ]]; then
-		if [[ "${_zcore_config[performance_mode]}" == "true" ]]; then
-			z::log::debug "Running init in performance mode: $input"
-			z::exec::run "$input" "$timeout" \
-			  || exit_code=$?
-		else
-			z::log::debug "Detected shell init command: $input"
-			z::exec::run "$input" "$timeout" \
-			  || exit_code=$?
-		fi
-		return $exit_code
-	fi
-
-	# Security scan (skip only for known package managers and performance mode)
+    # Security scan (skipped for known safe patterns)
 	if [[ "${_zcore_config[performance_mode]}" != "true" ]] \
 	  && \
-	  [[ "$is_package_install" != "true" ]] \
+        [[ "$is_shell_init" != "true" ]] \
 	  && \
-	  [[ "$force_current_shell" != "true" ]]; then
+        [[ "$is_package_install" != "true" ]]; then
 		z::exec::_scan_patterns "$input" \
 		  || return 1
 	fi
@@ -699,23 +695,52 @@ z::exec::eval()
 	z::runtime::check_interrupted \
 	  || return $?
 
-	# Execute the command safely
-	if [[ "$force_current_shell" == "true" ]]; then
-		# Only for trusted internal operations
-		eval "$input" \
-		  || exit_code=$?
-	else
-		# Use safe execution for external commands
-		z::exec::run "$input" "$timeout" \
-		  || exit_code=$?
-	fi
+    if [[ "$is_shell_init" == "true" ]]; then
+        z::log::debug "Detected shell init command (running in subshell): ${input}"
+    fi
 
-	if ((exit_code != 0 && exit_code != 124)); then
-		z::log::warn "Eval failed with exit code $exit_code"
-	fi
-	return $exit_code
+    z::exec::run "$input" "$timeout"
 }
 
+###
+# Initializes a tool by safely evaluating its shell hook output.
+#
+# @param 1: string - The name of the command-line tool (e.g., "direnv").
+# @param 2: string - The subcommand to generate the hook (default: "init").
+# @param 3: string - The shell argument for the hook (default: "zsh").
+# @return 0 on success, 1 on failure.
+###
+z::exec::from_hook()
+{
+    emulate -L zsh
+    local tool_name="$1"
+    local subcommand="${2:-init}"
+    local shell_arg="${3:-zsh}"
+
+    z::runtime::check_interrupted \
+        || return $?
+
+    if ! z::cmd::exists "$tool_name"; then
+        z::log::debug "$tool_name not found, skipping"
+        return 0 # Return 0 because not finding the tool isn't a failure
+    fi
+
+    local init_code
+    if init_code="$("$tool_name" "$subcommand" "$shell_arg" 2> /dev/null)" \
+        && [[ -n "$init_code" ]]; then
+        # Use the 'true' flag to force eval in the current shell context
+        if z::exec::eval "$init_code" 30 true; then
+            z::log::debug "$tool_name initialized successfully via hook"
+            return 0
+        else
+            z::log::warn "Failed to initialize $tool_name from its hook"
+            return 1
+        fi
+	else
+        z::log::warn "Failed to get hook/init code from $tool_name"
+        return 1
+	fi
+}
 # ==============================================================================
 # 4. FILESYSTEM & SOURCING
 # ==============================================================================
