@@ -1,79 +1,80 @@
-_setup_keybindings() {
-    emulate -L zsh
+#!/usr/bin/env zsh
+#
+# Keybindings Module
+# Configures Zsh Line Editor (ZLE) keybindings for vi mode.
+#
 
-    z::runtime::check_interrupted || return $?
+# ==============================================================================
+# MAIN INITIALIZATION
+# ==============================================================================
 
-    bindkey -v
-    typeset -gxi KEYTIMEOUT=${KEYTIMEOUT:-1}
+###
+# Public entry point to set up all custom keybindings.
+###
+z::mod::keybindings::init()
+{
+  emulate -L zsh
+  z::runtime::check_interrupted \
+    || return $?
+  z::log::info "Initializing keybindings..."
 
-    # Basic emacs-like helpers even in vi-insert
-    bindkey '^A' beginning-of-line
-    bindkey '^E' end-of-line
-    bindkey '^K' kill-line
-    bindkey '^U' kill-whole-line
-    bindkey '^W' backward-kill-word
-    bindkey '^?' backward-delete-char
-    bindkey '^H' backward-delete-char
-    bindkey '^[^?' backward-kill-word
-    bindkey '^[d' kill-word
+  bindkey -v
+  typeset -gxi KEYTIMEOUT=1
 
-    # Delete key
-    bindkey '^[[3~' delete-char
+  # --- Universal Bindings (emacs-like, available in insert mode) ---
+  bindkey '^A' beginning-of-line
+  bindkey '^E' end-of-line
+  bindkey '^K' kill-line
+  bindkey '^U' kill-whole-line
+  bindkey '^W' backward-kill-word
+  bindkey '^?' backward-delete-char
+  bindkey '^H' backward-delete-char
+  bindkey '^[[3~' delete-char
 
-    # Word navigation
-    bindkey '^[[1;5C' forward-word
-    bindkey '^[[1;5D' backward-word
-    bindkey '^[f' forward-word
-    bindkey '^[b' backward-word
+  # --- Word Navigation ---
+  bindkey '^[[1;5C' forward-word
+  bindkey '^[[1;5D' backward-word
+  bindkey '^[f' forward-word
+  bindkey '^[b' backward-word
 
-    # Completion
-    bindkey '^I' expand-or-complete
-    bindkey '^[[Z' reverse-menu-complete
+  # --- Completion ---
+  bindkey '^I' expand-or-complete
+  bindkey '^[[Z' reverse-menu-complete
 
-    # Vi-mode history navigation
-    bindkey -M vicmd 'k' up-line-or-search
-    bindkey -M vicmd 'j' down-line-or-search
-    bindkey -M vicmd 'gg' beginning-of-buffer-or-history
-    bindkey -M vicmd 'G' end-of-buffer-or-history
-    bindkey -M vicmd '/' history-incremental-search-forward
-    bindkey -M vicmd '?' history-incremental-search-backward
+  # --- Vi Mode History Navigation ---
+  bindkey -M vicmd 'k' up-line-or-search
+  bindkey -M vicmd 'j' down-line-or-search
+  bindkey -M vicmd '/' history-incremental-search-forward
+  bindkey -M viins '^P' up-line-or-search
+  bindkey -M viins '^N' down-line-or-search
 
-    bindkey -M viins '^A' beginning-of-line
-    bindkey -M viins '^E' end-of-line
-    bindkey -M viins '^U' kill-whole-line
-    bindkey -M viins '^W' backward-kill-word
-    bindkey -M viins '^P' up-line-or-search
-    bindkey -M viins '^N' down-line-or-search
+  # --- Conditionally bind zsh-navigation-tools widgets ---
+  autoload -Uz znt-history-widget znt-cd-widget znt-kill-widget 2> /dev/null \
+    || true
 
-    # Conditionally autoload and bind znt widgets (from zsh-navigation-tools)
-    autoload -Uz znt-history-widget znt-cd-widget znt-kill-widget znt-env-widget znt-aliases-widget 2>/dev/null || true
+  # CORRECTED SYNTAX: Associative array keys should not be in brackets.
+  local -A znt_bindings=(
+    znt-history-widget
+    '^R'
+    znt-cd-widget
+    '^G'
+    znt-kill-widget
+    '^Q'
+  )
 
-    if whence -w znt-history-widget >/dev/null 2>&1; then
-        zle -N znt-history-widget
-        bindkey '^R' znt-history-widget
-        z::log::debug "Bound znt-history-widget to ^R"
+  local widget key
+  for widget key in "${(@kv)znt_bindings}"; do
+    if whence -w "$widget" > /dev/null 2>&1; then
+      zle -N "$widget"
+      bindkey "$key" "$widget"
+      z::log::debug "Bound znt widget '$widget' to '$key'"
     fi
-    if whence -w znt-cd-widget >/dev/null 2>&1; then
-        zle -N znt-cd-widget
-        bindkey '^W' znt-cd-widget
-        z::log::debug "Bound znt-cd-widget to ^W"
-    fi
-    if whence -w znt-kill-widget >/dev/null 2>&1; then
-        zle -N znt-kill-widget
-        bindkey '^Q' znt-kill-widget
-        z::log::debug "Bound znt-kill-widget to ^Q"
-    fi
-    if whence -w znt-env-widget >/dev/null 2>&1; then
-        zle -N znt-env-widget
-        # Only set if available to avoid conflicting with end-of-line
-        bindkey '^[e' znt-env-widget # Alt+e to avoid clobbering ^E
-        z::log::debug "Bound znt-env-widget to ^[e"
-    fi
-    if whence -w znt-aliases-widget >/dev/null 2>&1; then
-        zle -N znt-aliases-widget
-        bindkey '^V' znt-aliases-widget
-        z::log::debug "Bound znt-aliases-widget to ^V"
-    fi
+  done
 
-    z::log::debug "Keybindings setup completed successfully"
+  z::log::info "Keybindings initialized successfully."
 }
+
+# Auto-initialize the module when it is sourced.
+if z::func::exists "z::mod::keybindings::init"; then
+  z::mod::keybindings::init
+fi
