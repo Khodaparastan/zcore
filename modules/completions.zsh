@@ -359,13 +359,15 @@ z::mod::completions::init() {
         fi
     fi
 
-    zmodload -i zsh/complist 2> /dev/null
-	z::mod::completions::_configure_styles
+    # Load complist for menu-select UI
+    zmodload -i zsh/complist 2>/dev/null
 
-	z::log::info "Completion system configured successfully."
+    z::mod::completions::_configure_styles
+
+    z::log::info "Completion system configured successfully."
 }
 
-# Auto-initialize the module when it is sourced.
+# Auto-initialize the module when it is sourced (if the init function exists).
 if z::func::exists "z::mod::completions::init"; then
-	z::mod::completions::init
+    z::mod::completions::init
 fi
