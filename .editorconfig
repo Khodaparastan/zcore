@@ -1,23 +1,51 @@
 root = true
 
 [*]
-end_of_line = lf
-tab_width   = 8
-indent_size = 2
-indent_style = space
+    charset = utf-8
+    end_of_line = lf
+    insert_final_newline = true
+    trim_trailing_whitespace = true
+    indent_style = space
+    indent_size = 2
 
-[**/Makefile*]
-indent_style = tab
-indent_size = 8
+[*.zsh]
+    indent_style = space
+    indent_size = 2
 
-[Functions/VCS_Info/**/*]
-indent_size = 4
-indent_style = space
+[*.{sh,bash,ksh}]
+    indent_style = space
+    indent_size = 2
 
-[ChangeLog]
-indent_size = 8
-indent_style = tab
+[.env]
+    indent_style = space
+    indent_size = 2
 
-[*.[ch]]
-indent_size = 4
-indent_style = tab
+[{.zshrc,.zprofile,.zlogin,.zlogout,.zshenv,.bashrc,.bash_profile,.profile,.aliases,.functions}]
+    indent_style = space
+    indent_size = 2
+
+[*.md]
+    trim_trailing_whitespace = false
+    insert_final_newline = true
+
+[*.y{a,}ml]
+    indent_style = space
+    indent_size = 2
+
+[*.json]
+    indent_style = space
+    indent_size = 2
+
+[Makefile]
+    indent_style = tab
+
+[*.gitconfig]
+    indent_style = space
+    indent_size = 2
+
+[*.{patch,diff}]
+    trim_trailing_whitespace = false
+
+[*.editorconfig]
+    indent_style = space
+    indent_size = 2
