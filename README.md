@@ -1,353 +1,125 @@
-# ZCore - Zsh Utility Library
+# Zcore: The Zsh Framework for Robust Scripting
 
-A utility library for Zsh that provides safe command execution, logging, caching, and platform detection. Built for reliability and performance in shell environments.
+[](https://www.google.com/search?q=https://github.com/your-username/zcore/actions)
+[](https://opensource.org/licenses/MIT)
 
-## Overview
+**Zcore** is a modern, safe, and performant framework for advanced Zsh scripting. It provides a comprehensive toolkit to build complex, reliable, and user-friendly command-line applications and automation scripts without reinventing the wheel.
 
-ZCore provides:
+It's designed for script authors who need more than basic shell commands, offering features like a security-conscious command runner, a structured logging system, a high-performance cache, and polished UI components.
 
-- **Safe Command Execution**: Subprocess isolation with timeout protection and security scanning
-- **Logging System**: 4-level verbosity with recursion protection
-- **Caching**: LRU-based function and command existence caching
-- **Cross-Platform Support**: Works on macOS, Linux, BSD, WSL, and Termux
-- **User Interface**: Progress bars and terminal detection
-- **Platform Detection**: OS and environment detection
-- **State Management**: Safe variable and function cleanup
+-----
 
-## 📁 Project Structure
+## Key Features
 
-```text
-zsh_config/
-├── lib/                      # ZCore Library
-│   ├── core.zsh             # Main utility library
-│   ├── platform.zsh         # Platform detection
-│   └── ARCHITECTURE.md      # Detailed architecture docs
-├── modules/                  # Example usage modules
-│   ├── aliases.zsh          # Example alias usage
-│   ├── environment.zsh      # Example environment setup
-│   ├── funcs.zsh            # Example function usage
-│   └── ...                  # Other example modules
-├── tests/                    # Test suite
-└── README.md                # This file
-```
+* 🛡️ **Safe Execution Engine**: A security-focused command runner with a built-in scanner to block dangerous patterns (`rm -rf /`, pipe-to-shell, etc.), subprocess isolation, and timeout protection.
+* ✍️ **Structured Logging**: Leveled logging (`debug`, `info`, `warn`, `error`) with color-coded output, timestamping, and runtime verbosity control.
+* 🚀 **Performance Caching**: Blazing fast, in-memory caches for command and function lookups to minimize shell startup time and latency in your scripts.
+* 📊 **Interactive UI**: A sleek, efficient progress bar that provides clear user feedback for long-running tasks with minimal performance overhead.
+* 💻 **Cross-Platform**: A robust platform detection layer that works seamlessly across **macOS**, **Linux**, **BSD**, and **WSL**.
+* 🛠️ **Fluent Helpers**: A rich library of helper functions for filesystem operations, path resolution, state management, and more.
 
-## 🚀 Quick Start
+-----
 
-### Prerequisites
+## Quick Start
 
-- **Zsh 5.0+**: Required for all features
-- **Standard Unix tools**: `tput`, `date`, `uname` (usually pre-installed)
-
-### Basic Usage
-
-1. **Source the library**:
-
-   ```zsh
-   source /path/to/lib/core.zsh
-   source /path/to/lib/platform.zsh
-   ```
-
-2. **Use ZCore functions**:
-
-   ```zsh
-   # Logging
-   z::log::info "Hello from ZCore"
-   z::log::error "Error message"
-
-   # Safe execution
-   z::exec::run "ls -la" 30
-
-   # Platform detection
-   z::detect::platform
-   if (( IS_MACOS )); then
-       echo "Running on macOS"
-   fi
-   ```
-
-3. **See [EXAMPLES.md](docs/EXAMPLES.md) for comprehensive usage examples**
-
-## Core Features
-
-### Logging System
-
-Logging with 4 levels of verbosity:
-
-```zsh
-# Logging functions
-z::log::error "Error message"
-z::log::warn "Warning message"
-z::log::info "Info message"
-z::log::debug "Debug message"
-
-# Control logging
-z::log::enable_debug
-z::log::get_level
-z::log::toggle_progress
-```
-
-### Safe Execution
-
-Command execution with protection layers:
-
-```zsh
-# Safe command execution
-z::exec::run "command" [timeout]
-
-# Safe evaluation with security scanning
-z::exec::eval "command" [timeout] [force_shell]
-
-# Safe function calling
-z::func::call "function_name" "arg1" "arg2"
-```
-
-### Path Management
-
-Path resolution and management:
-
-```zsh
-# Resolve paths with symlink following
-z::path::resolve "~/Documents"
-
-# Add directories to PATH
-z::path::add "/usr/local/bin" prepend
-
-# Safe file sourcing
-z::path::source "~/.config/script.zsh"
-```
-
-### State Management
-
-Safe variable and function cleanup:
-
-```zsh
-# Check existence (cached)
-z::cmd::exists "git"
-z::func::exists "my_function"
-
-# Safe cleanup
-z::state::unset "variable_name"
-z::var::unset "variable_name"
-z::func::unset "function_name"
-```
-
-### User Interface
-
-Progress tracking and terminal utilities:
-
-```zsh
-# Progress tracking
-z::ui::progress::show 5 10 "processing items"
-
-# Terminal utilities
-z::ui::term::width
-z::ui::progress::clear
-```
-
-### Platform Detection
-
-Operating system and environment detection:
-
-```zsh
-# Detect platform
-z::detect::platform
-
-# Check platform flags
-if (( IS_MACOS )); then
-    echo "macOS detected"
-elif (( IS_LINUX )); then
-    echo "Linux detected"
-fi
-```
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-Control library behavior:
-
-```bash
-# Performance optimization
-export ZCORE_CONFIG_PERFORMANCE_MODE=true
-
-# UI control
-export ZCORE_CONFIG_SHOW_PROGRESS=false
-
-# Verbosity control (0=error, 1=warn, 2=info, 3=debug)
-export zcore_config_verbose=2
-```
-
-### Runtime Configuration
-
-Modify settings during execution:
-
-```zsh
-# Update configuration
-z::config::set "timeout_default" 60
-z::config::set "cache_max_size" 200
-z::config::set "performance_mode" true
-```
-
-## Security Features
-
-- **Input Validation**: Parameter sanitization
-- **Pattern Scanning**: Regex-based threat detection
-- **Subprocess Isolation**: Commands run in separate processes
-- **Timeout Protection**: Prevents resource exhaustion
-- **Dangerous Command Detection**: Blocks harmful operations
-
-### Threat Detection
-
-The library detects and blocks:
-
-- File system destruction (`rm -rf`, `sudo rm`)
-- Device manipulation (`dd`, `mkfs`)
-- Network exploitation (pipe-to-shell patterns)
-- Process manipulation (fork bombs, signal abuse)
-- Permission escalation (dangerous chmod operations)
-
-## Performance
-
-### Caching System
-
-Caching with LRU eviction:
-
-- **Function existence cache**: Avoids repeated `typeset -f` calls
-- **Command existence cache**: Avoids repeated `command -v` calls
-- **LRU eviction**: Automatically manages cache size
-- **Configurable limits**: Adjust cache size as needed
-
-### Performance Modes
-
-Enable performance mode for faster execution:
-
-```bash
-export ZCORE_CONFIG_PERFORMANCE_MODE=true
-```
-
-This mode:
-
-- Reduces security scanning overhead
-- Skips expensive path resolution
-- Minimizes progress display
-- Optimizes for high-throughput scenarios
-
-## Platform Support
-
-### Supported Platforms
-
-- **macOS**: Full support with native optimizations
-- **Linux**: Complete compatibility including WSL
-- **BSD**: FreeBSD, OpenBSD, NetBSD, DragonFly
-- **WSL**: Windows Subsystem for Linux
-- **Termux**: Android terminal environment
-- **Cygwin**: Windows compatibility layer
-
-### Platform Flags
-
-Automatic platform detection sets these flags:
-
-- `IS_MACOS`: macOS/Darwin systems
-- `IS_LINUX`: Linux systems
-- `IS_BSD`: BSD variants
-- `IS_CYGWIN`: Cygwin/MSYS/MinGW
-- `IS_WSL`: Windows Subsystem for Linux
-- `IS_TERMUX`: Termux on Android
-- `IS_UNKNOWN`: Unrecognized platforms
-
-## Testing
-
-Run the test suite:
-
-```bash
-# Run all tests
-zsh ~/path/to/tests/run.zsh
-
-# Run specific test
-zsh ~/path/to/tests/run.zsh test_name
-```
-
-## Documentation
-
-- **[Architecture Documentation](docs/ARCHITECTURE.md)**: Detailed technical documentation
-- **[Usage Examples](docs/EXAMPLES.md)**: Practical examples for various scripting scenarios
-- **[Configuration Guide](docs/CONFIGURATION.md)**: Using ZCore for shell configuration
-- **API Reference**: Complete function reference in the architecture docs
-
-## Integration
-
-### Using ZCore in Your Scripts
+To use Zcore, simply `source` the `zcore.zsh` file at the top of your script.
 
 ```zsh
 #!/usr/bin/env zsh
 
-# Source ZCore
-source /path/to/lib/core.zsh
-source /path/to/lib/platform.zsh
+# It's recommended to use an absolute path in production scripts.
+source "/path/to/zcore.zsh" || exit 1
 
-# Use ZCore functions
-z::log::info "Starting script"
-z::detect::platform
+# Start using the framework immediately.
+z::log::info "Zcore is loaded and ready!"
 
-if z::cmd::exists "git"; then
-    z::exec::run "git status" || z::log::warn "Git command failed"
-fi
-
-z::log::info "Script completed"
+# Safely run a command.
+z::exec::run "ls -l"
 ```
 
-### Using ZCore in Shell Configuration
+-----
+
+## Usage at a Glance
+
+Zcore's API is fully namespaced under `z::` for clarity and to prevent conflicts.
+
+### Logging
 
 ```zsh
-# In your .zshrc
-source /path/to/lib/core.zsh
-source /path/to/lib/platform.zsh
-
-# Use ZCore for safe operations
-z::detect::platform
-z::path::add "/usr/local/bin" prepend
-z::alias::define "ll" "ls -la"
+z::log::info "Starting deployment..."
+z::log::warn "Configuration file is deprecated."
+z::log::debug "Connecting to server 'mars.local'..." # Only shows in debug mode
+z::log::error "Deployment failed: Connection refused."
 ```
 
-### More Examples
+### Safe Execution
 
-- **[EXAMPLES.md](docs/EXAMPLES.md)**: Comprehensive examples for various scripting scenarios
-- **[CONFIGURATION.md](docs/CONFIGURATION.md)**: Detailed guide for shell configuration usage
+```zsh
+# Run a simple command with a 60-second timeout
+if z::exec::run "git clone https://github.com/some/repo.git" 60; then
+  z::log::info "Repository cloned successfully."
+else
+  z::log::error "Failed to clone repository. Exit code: $?"
+fi
+```
+
+### Progress Bar
+
+```zsh
+local -i total_files=300
+z::log::info "Processing ${total_files} files..."
+
+for i in {1..$total_files}; do
+  z::runtime::check_interrupted || break # Allow user to cancel with Ctrl+C
+  sleep 0.05 # Simulate work
+  z::ui::progress::show $i $total_files "files"
+done
+```
+
+-----
+
+## Configuration
+
+Zcore can be configured using environment variables or at runtime.
+
+**Via Environment Variables:**
+
+```bash
+# Run your script with debug logging enabled
+zcore_config_verbose=3 ./my_script.zsh
+
+# Run in performance mode to disable some expensive checks
+ZCORE_CONFIG_PERFORMANCE_MODE=true ./my_script.zsh
+```
+
+**At Runtime:**
+
+```zsh
+# Set a custom timeout for all z::exec calls
+z::config::set "timeout_default" "120" # 2 minutes
+
+# Disable the progress bar for a specific part of the script
+z::config::set "show_progress" "false"
+```
+
+-----
+
+## Documentation
+
+For a deep dive into the framework, see the detailed documentation:
+
+* **[Usage and Examples](https://www.google.com/search?q=./docs/usage_and_examples.md)**: A practical guide with common use cases.
+* **[Full API Reference](https://www.google.com/search?q=./docs/API.md)**: A complete reference for every public and internal function.
+* **[Architecture Deep Dive](https://www.google.com/search?q=./docs/architecture.md)**: An explanation of the internal design and patterns.
+
+-----
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+Contributions are welcome\! Please feel free to submit a pull request or open an issue.
 
-### Development Guidelines
-
-- Follow the existing code style
-- Add appropriate error handling
-- Include logging for debugging
-- Update documentation as needed
-- Maintain backward compatibility
+-----
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Built on the solid foundation of Zsh
-- Inspired by modern shell utility practices
-- Community-driven development and feedback
-
-## Support
-
-- **Issues**: Report bugs and request features on GitHub
-- **Discussions**: Ask questions and share ideas
-- **Documentation**:
-  - [Architecture docs](docs/ARCHITECTURE.md) for technical details
-  - [Examples](docs/EXAMPLES.md) for practical usage
-  - [Configuration guide](docs/CONFIGURATION.md) for shell setup
-
----
-
-**Note**: ZCore includes error handling, security features, and performance optimizations for reliable shell scripting.
+This project is licensed under the MIT License. See the [LICENSE](https://www.google.com/search?q=./LICENSE) file for details.
