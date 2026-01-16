@@ -1,5 +1,12 @@
-tmp
+_tmp
 .DS_Store
 .idea
 .z*
-
+add
+.zsh_*
+v0.2
+tests
+plugins
+examples
+e
+docs
