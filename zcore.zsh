@@ -101,15 +101,173 @@ typeset -gi _zcore_config_locked=0
 
 
 ################################################################################
-# GLOBAL VERBOSITY LEVEL
+# LOGGING SUBSYSTEM
 ################################################################################
 
 ###
-# Current logging verbosity level
-# 0 = error only, 1 = warn, 2 = info (default), 3 = debug
+# Update cached timestamp
+# Internal function to refresh timestamp only when needed
+# Tries multiple methods: printf %()T, date command, fallback
+#
+# @private
+# @return 0 always
 ###
-typeset -gi _zcore_verbose_level=${_zcore_config[log_info]}
+__z::log::update_ts()
+{
+  emulate -L zsh
+  setopt no_unset
+  typeset -i current_epoch
+  (( current_epoch = ${EPOCHSECONDS:-$(date +%s 2>/dev/null || print 0)} ))
 
+  # Only update if epoch second changed
+  if (( current_epoch != _timestamp_epoch )); then
+    (( _timestamp_epoch = current_epoch ))
+    # Try zsh's built-in printf %()T formatting (fastest, zsh 5.0+)
+    if ! _cached_timestamp=$(printf '%(%Y-%m-%d %H:%M:%S)T' "$current_epoch" 2>/dev/null); then
+      # Fallback to date command
+      if ! _cached_timestamp=$(date -r "$current_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) && \
+         ! _cached_timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
+        _cached_timestamp="unknown-time"
+      fi
+    fi
+  fi
+  return 0
+}
+
+###
+# Core logging engine
+# Internal implementation for all log levels
+# Handles recursion prevention, level filtering, formatting
+#
+# @param 1: integer - Log level (0=error, 1=warn, 2=info, 3=debug)
+# @param ...: string - Message components (joined with spaces)
+# @private
+# @return 0 on success, 1 on recursion overflow or invalid level
+###
+__z::log::engine()
+{
+  emulate -L zsh
+  setopt localoptions no_unset warn_create_global typeset_silent
+  # Test mode: suppress all logging
+  if [[ -n ${ZCORE_TEST_MODE-} ]]; then
+    return 0
+  fi
+  # Infinite recursion prevention
+  typeset -i max_depth
+  (( max_depth = _zcore_logging[max_depth] ))
+  (( max_depth <= 0 )) && (( max_depth = 50 ))  # sane fallback
+
+  if (( _zcore_logging[depth] > max_depth )); then
+    print -r -- "FATAL: Recursion in __z::log::engine" >&2
+    return 1
+  fi
+
+  {
+  (( _zcore_logging[depth] += 1 ))
+
+
+  typeset -i level
+  if [[ -z ${1-} || $1 != <-> ]]; then
+    print -r -- "[error] Invalid log level: '${1-}'"
+    return 1
+  fi
+  (( level = 10#${1} ))
+  shift
+
+  if (( level > _zcore_logging[level] )); then
+    return 0
+  fi
+
+  __z::log::update_ts
+
+  local prefix=""
+  case $level in
+    (${_zcore_logging[error]}) prefix="$(__zuic red [error])";;
+    (${_zcore_logging[warn]})  prefix="$(__zuic yellow '[warn]')";;
+    (${_zcore_logging[info]})  prefix="$(__zuic green '[info]')";;
+    (${_zcore_logging[debug]}) prefix="$(__zuic magenta '[debug]')";;
+    (*)                            prefix="[unknown]" ;;
+  esac
+
+  local msg="${(j: :)@}"
+  print -r -- "${_cached_timestamp} ${prefix} ${msg}" >&2
+  } always {
+  (( _zcore_logging[depth] -= 1 ))
+  }
+  return 0
+}
+
+###
+# Log error message
+# Critical errors that indicate failure
+#
+# Usage:
+#   z::log::error "Failed to connect to database"
+#   z::log::error "Invalid input:" "$value"
+#
+# @param ...: string - Message components
+# @return 0 on success
+###
+z::log::error()
+{
+  emulate -L zsh
+  setopt no_unset
+  __z::log::engine ${_zcore_logging[error]} "$@"
+}
+
+###
+# Log warning message
+# Non-critical issues that don't stop execution
+#
+# Usage:
+#   z::log::warn "Deprecated function called"
+#   z::log::warn "Config file not found, using defaults"
+#
+# @param ...: string - Message components
+# @return 0 on success
+###
+z::log::warn()
+{
+  emulate -L zsh
+  setopt no_unset
+  __z::log::engine ${_zcore_logging[warn]} "$@"
+}
+
+###
+# Log informational message
+# Standard operational messages
+#
+# Usage:
+#   z::log::info "Starting backup process"
+#   z::log::info "Processed" $count "files"
+#
+# @param ...: string - Message components
+# @return 0 on success
+###
+z::log::info()
+{
+  emulate -L zsh
+  setopt no_unset
+  __z::log::engine ${_zcore_logging[info]} "$@"
+}
+
+###
+# Log debug message
+# Verbose debugging information
+#
+# Usage:
+#   z::log::debug "Variable value:" "$var"
+#   z::log::debug "Function entered with args:" "$@"
+#
+# @param ...: string - Message components
+# @return 0 on success
+###
+z::log::debug()
+{
+  emulate -L zsh
+  setopt no_unset
+  __z::log::engine ${_zcore_logging[debug]} "$@"
+}
 ###
 # Get human-readable name for log level
 # Internal helper for consistent level naming across functions
@@ -126,10 +284,10 @@ __z::log::level_name() {
   (( level = 10#${1:-9999} ))
 
   case $level in
-    (${_zcore_config[log_error]}) print -r -- "error" ;;
-    (${_zcore_config[log_warn]})  print -r -- "warn" ;;
-    (${_zcore_config[log_info]})  print -r -- "info" ;;
-    (${_zcore_config[log_debug]}) print -r -- "debug" ;;
+    (${_zcore_logging[error]}) print -r -- "error" ;;
+    (${_zcore_logging[warn]})  print -r -- "warn" ;;
+    (${_zcore_logging[info]})  print -r -- "info" ;;
+    (${_zcore_logging[debug]}) print -r -- "debug" ;;
     (*)
       print -r -- "unknown"
       return 1
@@ -159,15 +317,15 @@ __z::log::parse_level() {
     (( level = 10#${input} ))
   else
     case ${input:l} in
-      error) (( level = _zcore_config[log_error] )) ;;
-      warn)  (( level = _zcore_config[log_warn]  )) ;;
-      info)  (( level = _zcore_config[log_info]  )) ;;
-      debug) (( level = _zcore_config[log_debug] )) ;;
+      error) (( level = _zcore_logging[error] )) ;;
+      warn)  (( level = _zcore_logging[warn]  )) ;;
+      info)  (( level = _zcore_logging[info]  )) ;;
+      debug) (( level = _zcore_logging[debug] )) ;;
       *) return 1 ;;
     esac
   fi
 
-  if (( level < _zcore_config[log_error] || level > _zcore_config[log_debug] )); then
+  if (( level < _zcore_logging[error] || level > _zcore_logging[debug] )); then
     return 1
   fi
 
