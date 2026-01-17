@@ -1,89 +1,49 @@
 #!/usr/bin/env zsh
 
 ################################################################################
-# ZCORE FRAMEWORK
+# ZCORE v0.3.0
 ################################################################################
 #
-# A zsh utility library providing:
-#   - Robust logging with configurable verbosity levels
-#   - Safe command execution with security scanning
-#   - Cross-platform compatibility detection
-#   - Function and command caching for performance
-#   - State management and filesystem operations
-#   - User interface components (progress bars)
-#   - Interrupt handling and graceful shutdown
+# Three independent pillars:
+#   🔴 PILLAR 1: LOGGING    - No dependencies
+#   🔵 PILLAR 2: CACHE      - Depends on: Logging
+#   🟠 PILLAR 3: KV STORE   - Depends on: Logging
 #
-# Usage:
-#   source /path/to/zcore.zsh
-#   z::log::info "Application started"
-#   z::detect::platform
-#   z::exec::run "echo 'Hello World'"
+# Integration layer connects pillars AFTER all are loaded
 #
-# Configuration:
-#   export ZCORE_CONFIG_PERFORMANCE_MODE=true  # Disable expensive checks
-#   export ZCORE_CONFIG_SHOW_PROGRESS=false    # Disable progress bars
-#   export zcore_config_verbose=3              # Set debug level
-#
-# Version: 1.0.0
+# Version: v0.3.0
 # License: MIT
-################################################################################
-
-################################################################################
-# MODULE INITIALIZATION
 ################################################################################
 # Double-sourcing Guard
 # Prevents this module from being initialized multiple times in the same session.
 # Returns 0 when already loaded (whether sourced or executed).
 if [[ ${_zcore_loaded:-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
 typeset -g _zcore_loaded=1
+typeset -gr ZCORE_VERSION="0.3.0"
+
 
 # Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
-# Used for efficient timestamp generation in logging
 zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
 
 ################################################################################
 # CONFIGURATION MANAGEMENT
 ################################################################################
-###
-# Global configuration store
-# Centralized configuration for all zcore functionality
-###
-typeset -gA _zcore_config
+typeset -gA _zcore_logging
 
-# Logging level constants (readonly for safety)
+# Logging level constants
 typeset -gri ZCORE_LOG_LEVEL_ERROR=0    # Critical errors only
 typeset -gri ZCORE_LOG_LEVEL_WARN=1     # Warnings and errors
 typeset -gri ZCORE_LOG_LEVEL_INFO=2     # Informational messages (default)
 typeset -gri ZCORE_LOG_LEVEL_DEBUG=3    # Verbose debugging output
-
-# Logging levels (numeric) - reference constants
-_zcore_config[log_error]=$ZCORE_LOG_LEVEL_ERROR
-_zcore_config[log_warn]=$ZCORE_LOG_LEVEL_WARN
-_zcore_config[log_info]=$ZCORE_LOG_LEVEL_INFO
-_zcore_config[log_debug]=$ZCORE_LOG_LEVEL_DEBUG
-
-# Exit codes
-_zcore_config[exit_general_error]=1    # Generic failure
-_zcore_config[exit_interrupted]=130    # SIGINT (Ctrl+C)
 # Standard return codes
 typeset -gri ZCORE_SUCCESS=0
-typeset -gri ZCORE_ERROR_NOT_FOUND=1
-typeset -gri ZCORE_ERROR_INVALID_INPUT=2
-typeset -gri ZCORE_ERROR_PERMISSION=3
+typeset -gri ZCORE_ERROR_GENERAL=1
+typeset -gri ZCORE_ERROR_NOT_FOUND=2
+typeset -gri ZCORE_ERROR_INVALID_INPUT=3
+typeset -gri ZCORE_ERROR_PERMISSION=4
 typeset -gri ZCORE_ERROR_TIMEOUT=124
 typeset -gri ZCORE_ERROR_INTERRUPTED=130
 
-_zcore_config[alias.force_overwrite]=0
-_zcore_config[alias.interactive_mode]=0
-_zcore_config[alias.warn_shadow]=0
-_zcore_config[alias.auto_persist]=0
-# Performance tuning
-_zcore_config[progress_update_interval]=10  # Updates per progress bar cycle
-_zcore_config[timeout_default]=30           # Default command timeout (seconds)
-_zcore_config[log_max_depth]=50             # Max recursion depth for logging
-_zcore_config[cache_max_size]=100           # Max cached function/command entries
-_zcore_config[cache_purge_threshold]=10     # Min excess before purging cache
-_zcore_config[symlink_max_iterations]=40    # Max symlink resolution iterations
 
 _zcore_config[event_max_history]=100
 _zcore_config[event_handler_timeout]=5
@@ -92,6 +52,39 @@ _zcore_config[event_enable_history]=true
 _zcore_config[event_enable_stats]=true
 _zcore_config[event_enable_wildcards]=true
 
+typeset -gA _zcore_colors
+if [[ -t 2 && -z ${NO_COLOR:-} && ( ${TERM:-} != dumb || -n ${COLORTERM:-} ) ]] &&
+   (( $+commands[tput] )) && tput setaf 1 >/dev/null 2>&1; then
+     _zcore_colors=(
+         'black'       "$(tput setaf 0)"
+         'red'         "$(tput setaf 1)"
+         'green'       "$(tput setaf 2)"
+         'yellow'      "$(tput setaf 3)"
+         'blue'        "$(tput setaf 4)"
+         'magenta'     "$(tput setaf 5)"
+         'cyan'        "$(tput setaf 6)"
+         'white'       "$(tput setaf 7)"
+
+         'bright_black'   "$(tput setaf 8)"
+         'bright_red'     "$(tput setaf 9)"
+         'bright_green'   "$(tput setaf 10)"
+         'bright_yellow'  "$(tput setaf 11)"
+         'bright_blue'    "$(tput setaf 12)"
+         'bright_magenta' "$(tput setaf 13)"
+         'bright_cyan'    "$(tput setaf 14)"
+         'bright_white'   "$(tput setaf 15)"
+
+         'reset'       "$(tput sgr0)"
+         'bold'        "$(tput bold)"
+         'dim'         "$(tput dim)"
+         'underline'   "$(tput smul)"
+         'blink'       "$(tput blink)"
+         'reverse'     "$(tput rev)"
+         'hidden'      "$(tput invis)"
+     )
+else
+  _zcore_colors=('red' "" 'green' "" 'blue' "" 'yellow' "" '' "" 'magenta' "" 'reset' "" 'bold' "")
+fi
 
 # Feature flags (can be overridden via environment)
 _zcore_config[performance_mode]=${ZCORE_CONFIG_PERFORMANCE_MODE:-false}
