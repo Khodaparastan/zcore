@@ -1,8 +1,8 @@
 _tmp
 .DS_Store
 .idea
+.zed
 docs
-v0.2
 README.md
 .zsh_history
 .zcompdump
