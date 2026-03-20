@@ -37,14 +37,14 @@ z::interactive::load_mods() {
         "environment"
         "ziplug"
         "completions"
-        "lsenh"
+        "ls-enhancements"
         "python"
-        "clip"
-        "integrations"
+        "clipboard"
+        "external-tool-integrations"
         "prompt"
         "keybindings"
         "aliases"
-        "zox"
+        "zoxide"
     )
 
     local -i loaded_count=0 processed_count=0
