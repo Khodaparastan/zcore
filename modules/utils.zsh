@@ -1,265 +1,1421 @@
 #!/usr/bin/env zsh
-_setup_colors() {
-    emulate -L zsh
-    setopt no_unset warn_create_global
 
-    z::runtime::check_interrupted || return $?
+# ==============================================================================
+# Z FRAMEWORK
+# ==============================================================================
 
-    if (( IS_MACOS )); then
-        typeset -grx LSCOLORS='exfxcxdxbxegedAbAgacad'
-        typeset -grx CLICOLOR=1
-        z::log::debug "Configured macOS colors: LSCOLORS and CLICOLOR"
-    else
-        if [[ -z ${LS_COLORS:-} ]] && command -v dircolors >/dev/null 2>&1; then
-            eval "$(dircolors -b)" 2>/dev/null || {
-                # Fallback if dircolors fails
-                typeset -grx LS_COLORS='rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32'
-                z::log::warn "dircolors failed, using fallback LS_COLORS"
-            }
-        elif [[ -z ${LS_COLORS:-} ]]; then
-            typeset -grx LS_COLORS='rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arj=01;31:*.taz=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.zip=01;31:*.z=01;31:*.Z=01;31:*.dz=01;31:*.gz=01;31:*.lz=01;31:*.xz=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.jpg=01;35:*.jpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.axv=01;35:*.anx=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:'
-            z::log::debug "Using fallback LS_COLORS for non-macOS system"
-        fi
-        z::log::debug "Configured Linux/BSD colors: LS_COLORS"
-    fi
+# Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
+zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
+
+typeset -gA _z_config
+_z_config[log_error]=0
+_z_config[log_warn]=1
+_z_config[log_info]=2
+_z_config[log_debug]=3
+_z_config[exit_general_error]=1
+_z_config[exit_interrupted]=130
+_z_config[progress_update_interval]=10
+_z_config[timeout_default]=30
+_z_config[log_max_depth]=50
+_z_config[cache_max_size]=100
+_z_config[performance_mode]=${Z_CONFIG_PERFORMANCE_MODE:-false}
+_z_config[show_progress]=${Z_CONFIG_SHOW_PROGRESS:-true}
+# Optional: allow to extend/override init whitelist via regex (empty by default)
+_z_config[init_whitelist_regex]=''
+
+# Global verbosity level
+# 0 = error only, 1 = warn, 2 = info (default), 3 = debug
+typeset -gi _z_verbose_level=${_z_config[log_info]}
+if [[ "${z_config_verbose:-}" == <-> ]]; then
+  if (( z_config_verbose > _z_config[log_info] )) &&
+    [[ "${_z_config[performance_mode]}" != "true" ]]; then
+    _z_verbose_level=$z_config_verbose
+  elif (( z_config_verbose <= _z_config[log_info] )); then
+    _z_verbose_level=$z_config_verbose
+  fi
+fi
+
+# Function to enable debug mode
+z::log::enable_debug()
+{
+  emulate -L zsh
+  _z_verbose_level=${_z_config[log_debug]}
+  z::log::info "Debug mode enabled"
 }
 
-_setup_ls() {
-    emulate -L zsh
-    setopt no_unset warn_create_global
+# Function to check current verbosity level
+z::log::get_level()
+{
+  emulate -L zsh
+  local level_name
+  case $_z_verbose_level in
+    (${_z_config[log_error]}) level_name="error" ;;
+    (${_z_config[log_warn]}) level_name="warn" ;;
+    (${_z_config[log_info]}) level_name="info" ;;
+    (${_z_config[log_debug]}) level_name="debug" ;;
+    (*) level_name="unknown" ;;
+  esac
+  print -r -- "Current verbosity level: $_z_verbose_level ($level_name)"
+}
 
-    z::runtime::check_interrupted || return $?
+# Function to toggle progress bars on/off
+z::log::toggle_progress()
+{
+  emulate -L zsh
+  if [[ "${_z_config[show_progress]:-}" == "true" ]]; then
+    _z_config[show_progress]=false
+    z::log::info "Progress bars disabled"
+  else
+    _z_config[show_progress]=true
+    z::log::info "Progress bars enabled"
+  fi
+}
 
-    _setup_colors
+# Function to clear any lingering progress output
+z::ui::progress::clear()
+{
+  emulate -L zsh
+  if [[ -t 2 ]]; then
+    printf '\r\e[K' >&2
+  fi
+}
 
-    local ls_tool="system"
+# Performance mode override
+if [[ -n ${Z_CONFIG_PERFORMANCE_MODE:-} ]]; then
+  _z_config[performance_mode]="${Z_CONFIG_PERFORMANCE_MODE}"
+fi
 
-    if command -v eza >/dev/null 2>&1; then
-        ls_tool="eza"
-        local -a eza_base_opts=(--group-directories-first --color=always --classify)
-        if eza --help 2>&1 | grep -q -- '--icons'; then
-            eza_base_opts+=(--icons)
+# Progress bar override
+if [[ -n ${Z_CONFIG_SHOW_PROGRESS:-} ]]; then
+  _z_config[show_progress]="${Z_CONFIG_SHOW_PROGRESS}"
+fi
+
+# Global state variables
+typeset -gi _z_config_interrupted=0
+typeset -gi _log_depth=0
+typeset -gi _cached_term_width=0
+typeset -gi _z_prev_columns=0
+
+# Function existence cache
+typeset -gA _func_cache
+typeset -ga _func_cache_order
+
+# Command existence cache
+typeset -gA _cmd_cache
+typeset -ga _cmd_cache_order
+
+# Timeout command detection (GNU timeout or coreutils gtimeout on macOS)
+typeset -g _z_timeout_cmd=""
+if (( $+commands[timeout] )); then
+  _z_timeout_cmd="timeout"
+elif (( $+commands[gtimeout] )); then
+  _z_timeout_cmd="gtimeout"
+fi
+
+typeset -gA _z_colors
+if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-} != "dumb" ]] &&
+   (( $+commands[tput] )) &&
+   tput setaf 1 >/dev/null 2>&1; then
+  _z_colors=(
+    [red]="$(tput setaf 1)"
+    [green]="$(tput setaf 2)"
+    [blue]="$(tput setaf 4)"
+    [yellow]="$(tput setaf 3)"
+    [reset]="$(tput sgr0)"
+  )
+else
+  _z_colors=([red]="" [green]="" [blue]="" [yellow]="" [reset]="")
+fi
+
+# Timestamp caching for performance
+typeset -g _cached_timestamp=""
+typeset -gi _timestamp_epoch=0
+
+# --- Logging ---
+
+__z::log::update_ts()
+{
+  emulate -L zsh
+  local -i current_epoch=${EPOCHSECONDS:-$(date +%s 2>/dev/null)}
+  if (( current_epoch != _timestamp_epoch )); then
+    _timestamp_epoch=$current_epoch
+    if ! print -v _cached_timestamp -f "%(%Y-%m-%d %H:%M:%S)T" "$current_epoch" 2>/dev/null; then
+      if ! _cached_timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
+        _cached_timestamp="unknown-time"
+      fi
+    fi
+  fi
+}
+
+__z::log::engine()
+{
+  emulate -L zsh
+  setopt localoptions no_unset warn_create_global
+
+  # Infinite recursion prevention
+  if (( _log_depth > _z_config[log_max_depth] )); then
+    print -r -- "FATAL: Recursion in __z::log::engine" >&2
+    return 1
+  fi
+  (( _log_depth++ ))
+
+  # log level validation
+  local -i level
+  if [[ -z ${1-} || $1 != <-> ]]; then
+    print -r -- "[error] Invalid log level: '${1-}'" >&2
+    (( _log_depth-- ))
+    return 1
+  fi
+  level=$1
+  shift
+
+  # Early return for filtered messages
+  if (( level > _z_verbose_level )); then
+    (( _log_depth-- ))
+    return 0
+  fi
+
+  __z::log::update_ts
+
+  # Mapping level to prefix and color
+  local prefix=""
+  case $level in
+    (${_z_config[log_error]}) prefix="${_z_colors[red]}[error]${_z_colors[reset]}" ;;
+    (${_z_config[log_warn]})  prefix="${_z_colors[yellow]}[warn]${_z_colors[reset]}" ;;
+    (${_z_config[log_info]})  prefix="${_z_colors[blue]}[info]${_z_colors[reset]}" ;;
+    (${_z_config[log_debug]}) prefix="${_z_colors[green]}[debug]${_z_colors[reset]}" ;;
+    (*)                           prefix="[unknown]" ;;
+  esac
+
+  local msg="${(j: :)@}"
+  print -r -- "${_cached_timestamp} ${prefix} ${msg}" >&2
+
+  (( _log_depth-- ))
+  return 0
+}
+
+# Logging interface functions
+z::log::error()
+{
+  emulate -L zsh
+  __z::log::engine ${_z_config[log_error]} "$@"
+}
+z::log::warn()
+{
+  emulate -L zsh
+  __z::log::engine ${_z_config[log_warn]} "$@"
+}
+z::log::info()
+{
+  emulate -L zsh
+  __z::log::engine ${_z_config[log_info]} "$@"
+}
+z::log::debug()
+{
+  emulate -L zsh
+  __z::log::engine ${_z_config[log_debug]} "$@"
+}
+
+# --- Interrupt Handling ---
+
+z::runtime::handle_interrupt()
+{
+  emulate -L zsh
+
+  # Only handle actual interrupts, not normal editing
+  if [[ -n ${ZLE_STATE:-} ]]; then
+    return 0 # Don't handle interrupts during ZLE (line editing)
+  fi
+
+  if (( _z_config_interrupted == 0 )); then
+    _z_config_interrupted=1
+    z::ui::progress::clear
+    z::log::warn "Interrupt received. Gracefully shutting down..."
+  fi
+}
+
+z::sys::interrupted()
+{
+  emulate -L zsh
+  if (( _z_config_interrupted )); then
+    z::log::info "Operation cancelled by user."
+    return ${_z_config[exit_interrupted]}
+  fi
+  return 0
+}
+
+z::config::set()
+{
+  emulate -L zsh
+  local key="${1-}" value="${2-}"
+
+  if [[ -z "$key" ]]; then
+    z::log::error "z::config::set: Configuration key cannot be empty."
+    return 1
+  fi
+
+  if (( !${+_z_config[$key]} )); then
+    z::log::warn "z::config::set: Unknown configuration key: '$key'."
+    return 1
+  fi
+
+  case "$key" in
+    log_* | exit_* | *interval | *timeout | *depth | *size)
+      if [[ "$value" != <-> ]]; then
+        z::log::error "z::config::set: Value for '$key' must be an integer, but got '$value'."
+        return 1
+      fi
+      # Validate cache_max_size bounds
+      if [[ "$key" == "cache_max_size" ]] && (( value < 10 || value > 10000 )); then
+        z::log::error "z::config::set: cache_max_size must be between 10 and 10000"
+        return 1
+      fi
+      ;;
+    *mode | show_progress)
+      if [[ "$value" != "true" && "$value" != "false" ]]; then
+        z::log::error "z::config::set: Value for '$key' must be 'true' or 'false', but got '$value'."
+        return 1
+      fi
+      ;;
+  esac
+
+  _z_config[$key]="$value"
+  z::log::debug "Configuration updated: $key = $value"
+  return 0
+}
+
+# --- Fatal Error Handling ---
+
+z::runtime::die()
+{
+  emulate -L zsh
+  local message="${1-}"
+  local -i exit_code=${2:-${_z_config[exit_general_error]}}
+
+  z::ui::progress::clear
+  z::log::error "FATAL: $message"
+
+  # Return in sourced context, exit otherwise
+  if [[ -n $ZSH_EVAL_CONTEXT && $ZSH_EVAL_CONTEXT == *:file:* ]]; then
+    return $exit_code
+  else
+    exit $exit_code
+  fi
+}
+
+# ==============================================================================
+# 1. PLATFORM DETECTION
+# ==============================================================================
+z::sys::platform()
+{
+  emulate -L zsh
+  setopt no_unset typeset_silent
+
+  
+
+  if [[ -n "${_PLATFORM_DETECTED:-}" ]]; then
+    return 0
+  fi
+
+  # Defensive fallback if OSTYPE is empty
+  local ostype_value="${OSTYPE:-}"
+  if [[ -z "$ostype_value" ]]; then
+    case "$(uname -s 2> /dev/null)" in
+      Darwin)                              ostype_value="darwin" ;;
+      Linux)                               ostype_value="linux" ;;
+      FreeBSD | OpenBSD | NetBSD | DragonFly) ostype_value="bsd" ;;
+      CYGWIN* | MSYS* | MINGW*)            ostype_value="cygwin" ;;
+      *)                                   ostype_value="unknown" ;;
+    esac
+  fi
+
+  # Set platform variables based on $ostype_value
+  case "$ostype_value" in
+    darwin*)
+      typeset -gri IS_MACOS=1 IS_LINUX=0 IS_BSD=0 IS_CYGWIN=0
+      ;;
+    linux* | linux-gnu*)
+      typeset -gri IS_MACOS=0 IS_LINUX=1 IS_BSD=0 IS_CYGWIN=0
+      ;;
+    *bsd* | dragonfly* | netbsd* | openbsd* | freebsd*)
+      typeset -gri IS_MACOS=0 IS_LINUX=0 IS_BSD=1 IS_CYGWIN=0
+      ;;
+    cygwin* | msys* | mingw*)
+      typeset -gri IS_MACOS=0 IS_LINUX=0 IS_BSD=0 IS_CYGWIN=1
+      ;;
+    *)
+      typeset -gri IS_MACOS=0 IS_LINUX=0 IS_BSD=0 IS_CYGWIN=0
+      ;;
+  esac
+
+  # Check for Windows Subsystem for Linux (WSL) - Linux only
+  local -i is_wsl=0
+  if (( IS_LINUX )); then
+    if [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSLENV:-}" || -f "/proc/sys/fs/binfmt_misc/WSLInterop" ]]; then
+      is_wsl=1
+    elif [[ -r "/proc/version" ]]; then
+      local proc_version=""
+      if IFS= read -r proc_version < /proc/version 2> /dev/null; then
+        if [[ "$proc_version" == *[Mm]icrosoft* || "$proc_version" == *[Ww][Ss][Ll]* ]]; then
+          is_wsl=1
         fi
-        local eza_cmd="eza ${(j: :)eza_base_opts[@]}"
-        z::alias::define ls "$eza_cmd" || z::log::warn "Failed to create ls alias for eza"
-        z::alias::define ll "$eza_cmd --long --header --git --time-style=long-iso --total-size" || z::log::warn "Failed to create ll alias for eza"
-        z::alias::define la "$eza_cmd --all" || z::log::warn "Failed to create la alias for eza"
-        z::alias::define l "$eza_cmd --all --long --header --git --time-style=long-iso --total-size" || z::log::warn "Failed to create l alias for eza"
-        z::alias::define lt "$eza_cmd --tree --level=3 --long --git" || z::log::warn "Failed to create lt alias for eza"
-        z::log::info "Configured eza as ls replacement"
-    elif command -v lsd >/dev/null 2>&1; then
-        ls_tool="lsd"
-        z::alias::define ls "lsd --group-directories-first --color=always --icon=auto --classify" || z::log::warn "Failed to create ls alias for lsd"
-        z::alias::define ll "lsd --long --header --date=long-iso --size=short --blocks=permission,user,group,size,date,name,git --total-size" || z::log::warn "Failed to create ll alias for lsd"
-        z::alias::define la "lsd --almost-all" || z::log::warn "Failed to create la alias for lsd"
-        z::alias::define l "lsd --almost-all --long --header --date=long-iso --size=short --blocks=permission,user,group,size,date,name,git --total-size" || z::log::warn "Failed to create l alias for lsd"
-        z::alias::define lt "lsd --tree --depth=3 --long" || z::log::warn "Failed to create lt alias for lsd"
-        z::log::info "Configured lsd as ls replacement"
-    else
-        local ls_cmd_base="ls"
-        if (( IS_MACOS )); then
-            ls_cmd_base="ls -FG"
+      fi
+    fi
+  fi
+  typeset -gri IS_WSL=$is_wsl
+
+  # Check for Termux on Android - Linux only
+  local -i is_termux=0
+  if (( IS_LINUX )) && [[ -d "/data/data/com.termux/files/usr" ]]; then
+    is_termux=1
+  fi
+  typeset -gri IS_TERMUX=$is_termux
+
+  # Unknown flag
+  if (( IS_MACOS || IS_LINUX || IS_BSD || IS_CYGWIN )); then
+    typeset -gri IS_UNKNOWN=0
+  else
+    typeset -gri IS_UNKNOWN=1
+  fi
+
+  # Mark complete
+  typeset -gr _PLATFORM_DETECTED=1
+
+  if (( IS_UNKNOWN )); then
+    z::log::warn "Unknown platform: ${ostype_value}"
+  fi
+
+  z::log::debug "Platform: macOS=$IS_MACOS Linux=$IS_LINUX BSD=$IS_BSD WSL=$IS_WSL Cygwin=$IS_CYGWIN Termux=$IS_TERMUX"
+
+  return 0
+}
+
+
+# ==============================================================================
+# 2. COMMAND & ALIAS HANDLING
+# ==============================================================================
+
+z::env::alias_set()
+{
+  emulate -L zsh
+  setopt no_unset warn_create_global
+
+  local alias_name="${1-}" alias_value="${2-}"
+  if [[ -z $alias_name || -z $alias_value || $alias_name == *[[:space:]=]* ]]; then
+    z::log::error "Invalid alias definition: name='$alias_name' value='$alias_value'"
+    return 1
+  fi
+
+  if ! builtin alias "${alias_name}=${alias_value}" 2> /dev/null; then
+    z::log::error "Failed to create alias: $alias_name='$alias_value'"
+    return 1
+  fi
+  z::log::debug "Created alias: $alias_name='$alias_value'"
+  return 0
+}
+
+z::env::path_add()
+{
+  emulate -L zsh
+  local dir="$1"
+  local position="${2:-append}"
+
+  if [[ -z "$dir" ]]; then
+    z::log::error "Empty directory provided to z::env::path_add"
+    return 1
+  fi
+
+  local original_dir="$dir"
+  if ! dir=$(z::path::resolve "$dir"); then
+    z::log::debug "Failed to resolve directory path for PATH: $original_dir"
+    return 1
+  fi
+
+  if [[ ! -d "$dir" ]]; then
+    z::log::debug "Directory does not exist, not adding to PATH: $dir"
+    return 0
+  fi
+
+  if [[ ":${PATH}:" == *":${dir}:"* ]]; then
+    z::log::debug "Directory already in PATH: $dir"
+    return 0
+  fi
+
+  case "$position" in
+    prepend) export PATH="$dir:$PATH" ;;
+    append)  export PATH="$PATH:$dir" ;;
+    *)
+      z::log::error "Invalid position for z::env::path_add: $position (use prepend or append)"
+      return 1
+      ;;
+  esac
+
+  # Rehash and clear command cache to avoid stale $commands hits
+  builtin hash -r 2> /dev/null || true
+  z::cache::cmd::clear
+
+  z::log::debug "Added to PATH ($position): $dir"
+  return 0
+}
+
+# ==============================================================================
+# 3. DYNAMIC & SAFE EXECUTION
+# ==============================================================================
+
+# Private helper: shell init detection
+__z::exec::is_init_cmd()
+{
+  emulate -L zsh
+  local input="$1"
+
+  # Optional user-provided whitelist regex
+  if [[ -n ${_z_config[init_whitelist_regex]:-} ]]; then
+    if [[ "$input" =~ ${_z_config[init_whitelist_regex]} ]]; then
+      return 0
+    fi
+  fi
+
+  # Works for: direct use, env-wrapped, eval "$( ... )", and similar forms.
+  if [[ "$input" =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Private helper: dangerous pattern detection
+__z::exec::check_segment()
+{
+  emulate -L zsh
+  local cmd="$1"
+  shift
+  local -a args=("$@")
+
+  if [[ $cmd == rm ]]; then
+    local -i have_r=0 have_f=0
+    local a
+    for a in "${args[@]}"; do
+      if [[ $a == --* ]]; then
+        continue
+      elif [[ $a == -* ]]; then
+        [[ $a == *r* ]] && have_r=1
+        [[ $a == *f* ]] && have_f=1
+        continue
+      fi
+    done
+    if (( have_r && have_f )); then
+      for a in "${args[@]}"; do
+        case "$a" in
+          / | /* | ~ | ~/* | '$HOME' | '$HOME'/*)
+            z::log::error "Dangerous rm target: $a"
+            return 1
+            ;;
+        esac
+      done
+    fi
+  fi
+
+  if [[ $cmd == dd ]]; then
+    local kv dev base
+    for kv in "${args[@]}"; do
+      if [[ $kv == of=/dev/* ]]; then
+        dev="${kv#of=}"
+        base="${dev#/dev/}"
+        case "$base" in
+          sd* | hd* | nvme* | disk* | rdisk*)
+            z::log::error "Dangerous dd of= raw device: $dev"
+            return 1
+            ;;
+        esac
+      fi
+    done
+  fi
+
+  if [[ $cmd == mkfs.* ]]; then
+    local a
+    for a in "${args[@]}"; do
+      if [[ $a == /dev/* ]]; then
+        z::log::error "Dangerous mkfs target: $a"
+        return 1
+      fi
+    done
+  fi
+
+  if [[ $cmd == chmod ]]; then
+    local mode="" a
+    local -i nmode=-1 saw_root=0 recursive=0 symb_wide=0
+    for a in "${args[@]}"; do
+      # options
+      if [[ $a == -* ]]; then
+        [[ $a == *R* ]] && recursive=1
+        continue
+      fi
+      # numeric mode
+      if [[ -z $mode && $a == <-> ]]; then
+        mode="$a"
+        continue
+      fi
+      # symbolic mode - very limited risky patterns
+      if [[ -z $mode && ( $a == *a+w* || $a == *a+rwx* || $a == *o+w* || $a == *u=rwx* ) ]]; then
+        symb_wide=1
+        continue
+      fi
+      # target path
+      if [[ $a == / ]]; then
+        saw_root=1
+        continue
+      fi
+    done
+    if [[ -n $mode ]]; then
+      local -i tmp
+      (( tmp = 10#${mode} ))
+      nmode=$tmp
+    fi
+    if (( recursive && saw_root && (nmode == 777 || symb_wide == 1) )); then
+      z::log::error "Dangerous chmod recursive wide-open on /"
+      return 1
+    fi
+    if (( saw_root && nmode == 777 )); then
+      z::log::error "Dangerous chmod 777 on /"
+      return 1
+    fi
+  fi
+
+  if [[ $cmd == killall || $cmd == pkill ]]; then
+    local a
+    for a in "${args[@]}"; do
+      case "$a" in
+        -9 | -KILL | -SIGKILL)
+          z::log::error "Dangerous kill signal -9 detected"
+          return 1
+          ;;
+      esac
+    done
+  fi
+
+  if [[ $cmd == userdel ]]; then
+    local a
+    for a in "${args[@]}"; do
+      [[ $a == -r ]] && {
+        z::log::error "Dangerous userdel -r"
+        return 1
+      }
+    done
+  fi
+
+  if [[ $cmd == groupdel ]]; then
+    z::log::error "Dangerous groupdel detected"
+    return 1
+  fi
+
+  return 0
+}
+
+__z::exec::has_dangerous_metachars()
+{
+  emulate -L zsh
+  local input="$1"
+  [[ -z "$input" ]] && return 1
+  [[ "$input" =~ '[;&()]' ]] || [[ "$input" == *'`'* ]]
+}
+
+__z::exec::scan_patterns()
+{
+  emulate -L zsh
+  setopt localoptions typeset_silent
+  local input="${1-}"
+  [[ -z $input ]] && return 0
+
+  if __z::exec::is_init_cmd "$input"; then
+    return 0
+  fi
+
+  # Tokenize using zsh's lexer
+  local -a words
+  words=(${(z)input})
+  (( ${#words} == 0 )) && return 0
+
+  # Guard: pipe to a shell
+  local -i i j
+  local next_cmd base
+  for (( i = 1; i <= ${#words}; i++ )); do
+    if [[ ${words[i]} == '|' ]]; then
+      (( j = i + 1 ))
+      # Find the first real command in the next segment
+      while (( j <= ${#words} )); do
+        case "${words[j]}" in
+          '|' | '||' | '&&' | ';' | '&')
+            break
+            ;;
+          nocorrect | noglob | builtin | command | exec | time | nice | nohup | sudo | doas | env)
+            (( j++ ))
+            continue
+            ;;
+          [[:alpha:]_][[:alnum:]_]*=*)
+            (( j++ ))
+            continue
+            ;;
+        esac
+        next_cmd="${words[j]}"
+        break
+      done
+      if [[ -n ${next_cmd:-} ]]; then
+        base="${next_cmd:t}"
+        case "$base" in
+          sh | bash | zsh | ksh | dash)
+            z::log::error "Dangerous pattern: pipe to shell"
+            return 1
+            ;;
+        esac
+      fi
+    fi
+  done
+
+  # Guard: common fork bomb
+  if [[ $input =~ ':\(\)\{[[:space:]]*:[[:space:]]*\|[[:space:]]*&[[:space:]]*;[[:space:]]*:[[:space:]]*\}' ]]; then
+    z::log::error "Dangerous pattern: fork bomb"
+    return 1
+  fi
+
+  # Build and check segments split across |, ||, &&, ;, &
+  local -a seg=()
+  local w
+  for w in "${words[@]}"; do
+    case "$w" in
+      '|' | '||' | '&&' | ';' | '&')
+        if (( ${#seg} )); then
+          local cmd="${seg[1]}"
+          local -a args=("${(@)seg[2,-1]}")
+          __z::exec::check_segment "$cmd" "${args[@]}" || return 1
+          seg=()
         else
-            if ls --group-directories-first /dev/null >/dev/null 2>&1; then
-                ls_cmd_base="ls -F --color=auto --group-directories-first"
-            else
-                ls_cmd_base="ls -F --color=auto"
-            fi
+          return 1
         fi
-        z::alias::define ls "$ls_cmd_base" || z::log::warn "Failed to create ls alias"
-        z::alias::define ll "$ls_cmd_base -lh" || z::log::warn "Failed to create ll alias"
-        z::alias::define la "$ls_cmd_base -A" || z::log::warn "Failed to create la alias"
-        z::alias::define l "$ls_cmd_base -Alh" || z::log::warn "Failed to create l alias"
-        z::log::info "Configured system ls with enhanced options"
-    fi
+        ;;
+      nocorrect | noglob | builtin | command | exec | time | nice | nohup | sudo | doas | env)
+        # Skip precommands only at segment start
+        if (( ${#seg} == 0 )); then
+          continue
+        else
+          seg+=("$w")
+        fi
+        ;;
+      [[:alpha:]_][[:alnum:]_]*=*)
+        # Skip leading assignments in a segment
+        if (( ${#seg} == 0 )); then
+          continue
+        else
+          seg+=("$w")
+        fi
+        ;;
+      *)
+        seg+=("$w")
+        ;;
+    esac
+  done
 
-    typeset -grx LS_TOOL="$ls_tool"
-    z::log::debug "LS tool configured: $ls_tool"
+  if (( ${#seg} )); then
+    local cmd="${seg[1]}"
+    local -a args=("${(@)seg[2,-1]}")
+    __z::exec::check_segment "$cmd" "${args[@]}" || return 1
+  fi
+
+  return 0
 }
 
-_setup_tree_fallback() {
-    emulate -L zsh
-    setopt no_unset warn_create_global
+# Safe command execution (without eval, with pipefail)
+z::exec::run()
+{
+  emulate -L zsh
+  local input="$1"
+  local -i timeout=${2:-${_z_config[timeout_default]}}
 
-    z::runtime::check_interrupted || return $?
+  if [[ -z "$input" ]]; then
+    z::log::error "Empty input for z::exec::run"
+    return 1
+  fi
 
-    typeset -gr _ZCORETREE_FALLBACK_DEFINED=0
+  # Short-term guard: block ;, &, ( ) unless explicitly whitelisted init
+  if ! __z::exec::is_init_cmd "$input"; then
+    if __z::exec::has_dangerous_metachars "$input"; then
+      z::log::error "Rejected dangerous metacharacters in input"
+      return 1
+    fi
+  fi
 
-    if ! command -v tree >/dev/null 2>&1; then
-        typeset -gr _ZCORETREE_FALLBACK_DEFINED=1
+  # Security scan
+  __z::exec::scan_patterns "$input" || return 1
 
-        tree() {
-            emulate -L zsh
-            setopt LOCAL_OPTIONS NO_NOMATCH
+  
 
-            local dir="${1:-.}"
-            local max_depth="${2:-3}"
+  local -i exit_code=0
 
-            if [[ ! -d $dir ]]; then
-                print -u2 "tree: '$dir': No such directory or not a directory."
-                return 1
-            fi
-            if [[ ! $max_depth = <-> ]] || (( max_depth < 1 || max_depth > 10 )); then
-                print -u2 "tree: invalid depth '$max_depth'. Please use a number between 1 and 10."
-                return 1
-            fi
+  if [[ -n "${_z_timeout_cmd:-}" ]]; then
+    "${_z_timeout_cmd}" "$timeout" zsh -o pipefail -c "$input" || exit_code=$?
+    if (( exit_code == 124 )); then
+      z::log::warn "Command timed out after ${timeout}s"
+    fi
+  else
+    z::log::warn "Timeout command not found, executing directly"
+    zsh -o pipefail -c "$input" || exit_code=$?
+  fi
 
-            dir="$(cd -- "$dir" && pwd -P)" || return 1
-            print -P "%F{blue}${dir:t}/%f"
+  if (( exit_code != 0 && exit_code != 124 )); then
+    z::log::warn "Command failed with exit code $exit_code"
+  fi
+  return $exit_code
+}
 
-            local -a files
-            local full_path
+z::exec::eval()
+{
+  emulate -L zsh
+  local input="$1"
+  local -i timeout=${2:-${_z_config[timeout_default]}}
+  local force_current_shell="${3:-false}"
 
-            # Prefer GNU sort -z when available; otherwise keep unsorted but NUL-safe
-            local have_gnu_sort=0
-            if sort --version >/dev/null 2>&1; then
-                have_gnu_sort=1
-            fi
+  if [[ -z "$input" ]]; then
+    z::log::error "Empty input for z::exec::eval"
+    return 1
+  fi
 
-            if (( have_gnu_sort )); then
-                while IFS= read -r -d '' full_path; do
-                    files+=("$full_path")
-                done < <(command find "$dir" -maxdepth "$max_depth" -mindepth 1 -print0 2>/dev/null | sort -z)
-            else
-                while IFS= read -r -d '' full_path; do
-                    files+=("$full_path")
-                done < <(command find "$dir" -maxdepth "$max_depth" -mindepth 1 -print0 2>/dev/null)
-            fi
+  if [[ "$force_current_shell" == "true" ]]; then
+    z::log::debug "Forcing eval in current shell for init script"
+    
+    local -i exit_code=0
+    eval "$input" || exit_code=$?
+    if (( exit_code != 0 )); then
+      z::log::warn "Forced eval failed with exit code $exit_code"
+    fi
+    return $exit_code
+  fi
 
-            local relative_path depth base_name indent prefix next_path next_depth next_relative current_parent next_parent
-            local -i total=${#files} i=0
+  local is_shell_init=false
+  __z::exec::is_init_cmd "$input" && is_shell_init=true
 
-            for full_path in "${files[@]}"; do
-                (( i++ ))
-                base_name="${full_path:t}"
-                relative_path="${full_path#$dir/}"
-                depth=$(( ${#${relative_path//[^\/]}} + 1 ))
+  local is_package_install=false
+  if [[ $input =~ '(^|[[:space:]])(npm|yarn|pip|pip3|cargo|brew|apt|yum|dnf|pacman)[[:space:]]+(add|install)($|[[:space:]])' ]]; then
+    is_package_install=true
+  fi
 
-                indent=""
-                for (( j=1; j<depth; j++ )); do
-                    indent+="  "
-                done
+  # Security scan (skipped for known safe patterns)
+  if [[ "${_z_config[performance_mode]}" != "true" ]] &&
+    [[ "$is_shell_init" != "true" ]] &&
+    [[ "$is_package_install" != "true" ]]; then
+    __z::exec::scan_patterns "$input" || return 1
+  fi
 
-                prefix="├──"
-                if (( i == total )); then
-                    prefix="└──"
-                else
-                    next_path="${files[i]}"
-                    next_relative="${next_path#$dir/}"
-                    next_depth=$(( ${#${next_relative//[^\/]}} + 1 ))
-                    current_parent="${relative_path%/*}"
-                    next_parent="${next_relative%/*}"
-                    if [[ $next_parent != $current_parent ]] || (( next_depth < depth )); then
-                        prefix="└──"
-                    fi
-                fi
+  
 
-                if [[ -d $full_path ]]; then
-                    print -P -- "${indent}${prefix} %F{blue}${base_name}/%f"
-                elif [[ -x $full_path ]]; then
-                    print -P -- "${indent}${prefix} %F{green}${base_name}*%f"
-                else
-                    print -- "${indent}${prefix} ${base_name}"
-                fi
-            done
-        }
-        z::log::info "Created fallback tree function"
+  if [[ "$is_shell_init" == "true" ]]; then
+    z::log::debug "Detected shell init command (running in subshell): ${input}"
+  fi
+
+  z::exec::run "$input" "$timeout"
+}
+
+###
+# Initializes a tool by safely evaluating its shell hook output.
+#
+# @param 1: string - The name of the command-line tool (e.g., "direnv").
+# @param 2: string - The subcommand to generate the hook (default: "init").
+# @param 3: string - The shell argument for the hook (default: "zsh").
+# @return 0 on success, 1 on failure.
+###
+z::exec::from_hook()
+{
+  emulate -L zsh
+  local tool_name="$1"
+  local subcommand="${2:-init}"
+  local shell_arg="${3:-zsh}"
+
+  
+
+  if ! z::probe::cmd "$tool_name"; then
+    z::log::debug "$tool_name not found, skipping"
+    return 0 # Return 0 because not finding the tool isn't a failure
+  fi
+
+  local init_code
+  if init_code="$("$tool_name" "$subcommand" "$shell_arg" 2> /dev/null)" &&
+    [[ -n "$init_code" ]]; then
+    # Use the 'true' flag to force eval in the current shell context
+    if z::exec::eval "$init_code" 30 true; then
+      z::log::debug "$tool_name initialized successfully via hook"
+      return 0
     else
-        z::log::debug "System tree command available, no fallback needed"
+      z::log::warn "Failed to initialize $tool_name from its hook"
+      return 1
     fi
+  else
+    z::log::warn "Failed to get hook/init code from $tool_name"
+    return 1
+  fi
 }
 
-_setup_additional_utilities() {
-    emulate -L zsh
-    setopt no_unset warn_create_global
+# ==============================================================================
+# 4. FILESYSTEM & SOURCING
+# ==============================================================================
 
-    z::runtime::check_interrupted || return $?
+z::path::resolve()
+{
+  emulate -L zsh
+  local path="$1"
+  if [[ -z "$path" || "$path" =~ ^[[:space:]]*$ ]]; then
+    z::log::error "Empty or whitespace path provided to z::path::resolve"
+    return 1
+  fi
 
-    if command -v find >/dev/null 2>&1 && command -v stat >/dev/null 2>&1; then
-        newest() {
-            emulate -L zsh  # Keep -L here since this is the actual function implementation
-            local count="${1:-10}" path="${2:-.}"
+  # Tilde expansion (handle ~, ~/..., ~+, ~-, without glob side-effects)
+  if [[ $path == '~' || $path == '~/'* ]]; then
+    path="${HOME}${path#\~}"
+  elif [[ $path == '~+' || $path == '~+/'* ]]; then
+    path="${PWD}${path#\~+}"
+  elif [[ $path == '~-' || $path == '~-/'* ]]; then
+    path="${OLDPWD:-$PWD}${path#\~-}"
+  fi
 
-            if [[ ! $count = <-> ]] || (( count < 1 || count > 100 )); then
-                print -u2 "newest: invalid count '$count'. Use 1-100."
-                return 1
-            fi
-            if [[ ! -d $path ]]; then
-                print -u2 "newest: path '$path' not found or not a directory."
-                return 1
-            fi
-            if [[ ! -r $path ]]; then
-                print -u2 "newest: cannot read directory '$path'."
-                return 1
-            fi
+  # Ensure absolute path prior to normalization
+  if [[ "$path" != /* ]]; then
+    path="${PWD%/}/$path"
+  fi
 
-            local z::platform::is_bsd_stat=0
-            if [[ ${OSTYPE:-} == darwin* ]] || stat --version 2>&1 | grep -q "illegal option"; then
-                z::platform::is_bsd_stat=1
-            fi
+  # Prefer zsh's realpath-like modifier (:A) for portability and speed
+  local normalized
+  normalized="${path:A}"
+  if [[ -n "$normalized" ]]; then
+    printf '%s' "$normalized"
+    return 0
+  fi
 
-            if (( z::platform::is_bsd_stat )); then
-                find "$path" -mindepth 1 -type f -print0 2>/dev/null \
-                | xargs -0 stat -f "%m %N" 2>/dev/null \
-                | sort -rnk1,1 \
-                | head -n "$count" \
-                | cut -d' ' -f2-
-            else
-                find "$path" -mindepth 1 -type f -print0 2>/dev/null \
-                | xargs -0 stat -c "%Y %n" 2>/dev/null \
-                | sort -rnk1,1 \
-                | head -n "$count" \
-                | cut -d' ' -f2-
-            fi
-        }
-        z::log::debug "Created newest utility function"
-    else
-        z::log::warn "find or stat not available, newest utility not created"
+  # Fallback: POSIX-friendly manual resolution without readlink -f
+  local current_path="$path"
+  local -i guard=0
+  local -i max_guard=100 # Increased from 40 for complex symlink chains
+  local -a visited_paths=()
+
+  if command -v readlink > /dev/null 2>&1; then
+    while [[ -L "$current_path" && guard < max_guard ]]; do
+      # Cycle detection
+      if (( ${visited_paths[(Ie)$current_path]} )); then
+        z::log::warn "Symlink cycle detected at $current_path"
+        printf '%s' "$path"
+        return 1
+      fi
+      visited_paths+=("$current_path")
+      local target
+      target=$(readlink "$current_path" 2> /dev/null) || break
+      [[ -z "$target" ]] && break
+      if [[ "$target" == /* ]]; then
+        current_path="$target"
+      else
+        current_path="${current_path:h}/$target"
+      fi
+      (( guard++ ))
+    done
+
+    if (( guard >= max_guard )); then
+      z::log::warn "Symlink resolution exceeded maximum depth ($max_guard)"
     fi
+  fi
+
+  if [[ -d "${current_path:h}" ]]; then
+    local physical_dir
+    if physical_dir=$(
+      cd -P "${current_path:h}" 2> /dev/null && pwd -P
+    ); then
+      current_path="${physical_dir}/${current_path:t}"
+    fi
+  fi
+
+  printf '%s' "$current_path"
 }
 
-_setup_smart_cd() {
-    emulate -L zsh
-    setopt no_unset warn_create_global
+z::file::source()
+{
+  emulate -L zsh
+  local file="$1"
+  shift
+  if [[ -z "$file" ]]; then
+    z::log::error "Empty file path for source"
+    return 1
+  fi
 
-    z::runtime::check_interrupted || return $?
+  local resolved_file="$file"
 
-    if [[ -n ${ZCORECD_AUTO_LS:-} ]]; then
-        cd() {
-            # Keep emulate -L here since this function needs to be self-contained
-            emulate -L zsh
-            if builtin cd "$@"; then
-                local item_count
-                if command -v ls >/dev/null 2>&1; then
-                    if item_count=$(command ls -1A 2>/dev/null | command wc -l 2>/dev/null); then
-                        if (( item_count <= ${ZCORECD_AUTO_LS_THRESHOLD:-50} )); then
-                            if command -v eza >/dev/null 2>&1; then
-                                eza
-                            elif command -v lsd >/dev/null 2>&1; then
-                                lsd
-                            else
-                                command ls || true
-                            fi
-                        else
-                            if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput colors >/dev/null 2>&1; then
-                                print -P "%F{yellow}Directory contains $item_count items (use 'ls' to list manually)%f"
-                            else
-                                print "Directory contains $item_count items (use 'ls' to list manually)"
-                            fi
-                        fi
-                    else
-                        print "Changed to: $PWD"
-                    fi
-                else
-                    print "Changed to: $PWD"
-                fi
-                return 0
-            else
-                return $?
-            fi
-        }
-        z::log::info "Smart CD with auto-ls enabled"
-    else
-        z::log::debug "Smart CD not enabled (ZCORECD_AUTO_LS not set)"
+  # Always do cheap tilde expansion (even in performance mode) to avoid surprises
+  case "$resolved_file" in
+    '~' | '~/'*)   resolved_file="${HOME}${resolved_file#~}" ;;
+    '~+' | '~+/'*) resolved_file="${PWD}${resolved_file#~+}" ;;
+    '~-' | '~-/'*) resolved_file="${OLDPWD:-$PWD}${resolved_file#~-}" ;;
+  esac
+
+  # Skip expensive path normalization in performance mode
+  if [[ "${_z_config[performance_mode]}" != "true" ]]; then
+    if ! resolved_file=$(z::path::resolve "$resolved_file"); then
+      z::log::error "Failed to resolve path: $file"
+      return 1
     fi
+  fi
+
+  if [[ ! -f "$resolved_file" || ! -r "$resolved_file" ]]; then
+    z::log::warn "File not found or not readable: $resolved_file"
+    return 1
+  fi
+
+  
+
+  local -i exit_code=0
+  source "$resolved_file" "$@" || exit_code=$?
+
+  if (( exit_code != 0 )); then
+    z::log::warn "Failed to source $resolved_file (code: $exit_code)"
+  else
+    # Clear function cache after successful sourcing to avoid stale entries
+    z::cache::func::clear
+  fi
+  return $exit_code
 }
+
+# ==============================================================================
+# 5. FUNCTION INTROSPECTION & CACHING
+# ==============================================================================
+
+z::cache::func::_purge()
+{
+  emulate -L zsh
+  # Remove oldest entries when cache is full
+  local -i cache_size=${#_func_cache[@]}
+  if (( cache_size > _z_config[cache_max_size] )); then
+    local -i excess=$(( cache_size - _z_config[cache_max_size] ))
+    local -i to_remove=$(( excess / 2 + 1 ))
+    local -i removed=0
+    local key
+
+    while (( removed < to_remove && ${#_func_cache_order[@]} > 0 )); do
+      key="${_func_cache_order[1]}"
+      # Drop the first (oldest) entry from the order array using slicing
+      _func_cache_order=("${_func_cache_order[@]:1}")
+
+      # Remove from the assoc cache if present
+      if (( ${+_func_cache[$key]} )); then
+        unset "_func_cache[$key]"
+      fi
+
+      (( removed++ ))
+    done
+
+    z::log::debug "Cleaned function cache: removed $removed entries, new size: ${#_func_cache[@]}"
+  fi
+}
+
+z::cache::cmd::_purge()
+{
+  emulate -L zsh
+  local -i cache_size=${#_cmd_cache[@]}
+  if (( cache_size > _z_config[cache_max_size] )); then
+    local -i excess=$(( cache_size - _z_config[cache_max_size] ))
+    local -i to_remove=$(( excess / 2 + 1 ))
+    local -i removed=0
+    local key
+
+    while (( removed < to_remove && ${#_cmd_cache_order[@]} > 0 )); do
+      key="${_cmd_cache_order[1]}"
+      # Drop the first (oldest) entry from the order array using slicing
+      _cmd_cache_order=("${_cmd_cache_order[@]:1}")
+
+      if (( ${+_cmd_cache[$key]} )); then
+        unset "_cmd_cache[$key]"
+      fi
+
+      (( removed++ ))
+    done
+
+    z::log::debug "Cleaned command cache: removed $removed entries, new size: ${#_cmd_cache[@]}"
+  fi
+}
+
+# New: explicit cache clear helpers
+z::cache::cmd::clear()
+{
+  emulate -L zsh
+  _cmd_cache=()
+  _cmd_cache_order=()
+  z::log::debug "Cleared command cache"
+}
+
+z::cache::func::clear()
+{
+  emulate -L zsh
+  _func_cache=()
+  _func_cache_order=()
+  z::log::debug "Cleared function cache"
+}
+
+# Command existence check with caching
+z::probe::cmd()
+{
+  emulate -L zsh
+  local cmd="$1"
+  [[ -z "$cmd" ]] && return 1
+
+  local cache_key="cmd_${cmd//[^a-zA-Z0-9_]/_}"
+  if (( ${+_cmd_cache[$cache_key]} )); then
+    return ${_cmd_cache[$cache_key]}
+  fi
+
+  local -i result=1
+  (( $+commands[$cmd] )) && result=0
+
+  # De-duplicate order before appending to avoid unbounded growth
+  _cmd_cache_order=("${(@)_cmd_cache_order:#$cache_key}")
+  _cmd_cache[$cache_key]=$result
+  _cmd_cache_order+=("$cache_key")
+
+  (( ${#_cmd_cache[@]} > _z_config[cache_max_size] )) && z::cache::cmd::_purge
+
+  return $result
+}
+
+z::probe::func()
+{
+  emulate -L zsh
+  local func="$1"
+  if [[ -z "$func" ]]; then
+    return 1
+  fi
+
+  local cache_key="func_exists_${func//[^a-zA-Z0-9_]/_}"
+  if (( ${+_func_cache[$cache_key]} )); then
+    return ${_func_cache[$cache_key]}
+  fi
+
+  local -i result=1
+  if (( $+functions[$func] )); then
+    result=0
+  fi
+
+  # De-duplicate order before appending to avoid unbounded growth
+  _func_cache_order=("${(@)_func_cache_order:#$cache_key}")
+  _func_cache[$cache_key]=$result
+  _func_cache_order+=("$cache_key")
+
+  # Always purge; internal threshold check handles cost
+  z::cache::func::_purge
+
+  return $result
+}
+
+z::func::call()
+{
+  emulate -L zsh
+  local func="$1"
+  if [[ -z "$func" ]]; then
+    z::log::error "Empty function name for z::func::call"
+    return 1
+  fi
+  shift
+
+  if ! z::probe::func "$func"; then
+    case "$func" in
+      _git_prompt_info | __zconvey_on_period_passed* | _*prompt* | _*git*)
+        return 1 # Silently skip known dynamic functions
+        ;;
+      *)
+        z::log::warn "Function '$func' not found"
+        return 1
+        ;;
+    esac
+  fi
+
+  
+
+  local -i exit_code=0
+  "$func" "$@" || exit_code=$?
+
+  if (( exit_code != 0 )); then
+    z::log::warn "Function '$func' failed with code $exit_code"
+  fi
+  return $exit_code
+}
+
+# ==============================================================================
+# 6. STATE MANAGEMENT
+# ==============================================================================
+
+# Private helper: core unset implementation shared by public APIs
+z::state::_unset_impl()
+{
+  emulate -L zsh
+  setopt typeset_silent no_unset
+
+  local target="${1-}"
+  local unset_type="${2:-auto}"
+
+  if [[ -z $target ]]; then
+    z::log::error "Empty target for unset"
+    return 1
+  fi
+
+  case $unset_type in
+    var | func | auto) ;;
+    *)
+      z::log::error "Invalid unset type: $unset_type"
+      return 1
+      ;;
+  esac
+
+  local -i found=0 success=0 rc_var=0 rc_func=0
+
+  # Handle variable unsetting
+  if [[ $unset_type == var || $unset_type == auto ]]; then
+    if (( ${+parameters[$target]} )); then
+      found=1
+      # Check if readonly
+      if [[ ${(tP)target} == *readonly* ]]; then
+        z::log::debug "Cannot unset readonly var: $target"
+        rc_var=1
+      else
+        unset -v -- "$target" 2> /dev/null || rc_var=$?
+        (( rc_var == 0 )) && success=1
+      fi
+    fi
+  fi
+
+  # Handle function unsetting
+  if [[ $unset_type == func || $unset_type == auto ]]; then
+    if (( ${+functions[$target]} )); then
+      found=1
+      unset -f -- "$target" 2> /dev/null || rc_func=$?
+      if (( rc_func == 0 )); then
+        success=1
+        # Update function-existence cache
+        local cache_key="func_exists_${target//[^A-Za-z0-9_]/_}"
+        if (( ${+_func_cache[$cache_key]} )); then
+          unset "_func_cache[$cache_key]"
+          _func_cache_order=("${(@)_func_cache_order:#$cache_key}")
+        fi
+      fi
+    fi
+  fi
+
+  if (( !found )); then
+    z::log::debug "Target not found for unset: $target"
+    return 1
+  fi
+
+  if (( success )); then
+    z::log::debug "Unset: $target"
+    return 0
+  fi
+
+  z::log::warn "Failed to unset $target"
+  return $(( rc_func != 0 ? rc_func : rc_var ))
+}
+
+# Public: unset a variable only
+# Usage: z::var::unset VAR_NAME
+z::var::unset()
+{
+  emulate -L zsh
+  setopt typeset_silent no_unset
+  local target="${1-}"
+  if [[ -z $target ]]; then
+    z::log::error "Empty target for var unset"
+    return 1
+  fi
+  z::state::_unset_impl "$target" var
+}
+
+# Public: unset a function only
+# Usage: z::func::unset FUNC_NAME
+z::func::unset()
+{
+  emulate -L zsh
+  setopt typeset_silent no_unset
+  local target="${1-}"
+  if [[ -z $target ]]; then
+    z::log::error "Empty target for func unset"
+    return 1
+  fi
+  z::state::_unset_impl "$target" func
+}
+
+# Backward-compatible combined API (auto/var/func)
+# Usage: z::state::unset TARGET [auto|var|func]
+z::state::unset()
+{
+  emulate -L zsh
+  setopt typeset_silent no_unset
+  local target="${1-}"
+  local unset_type="${2:-auto}"
+  z::state::_unset_impl "$target" "$unset_type"
+}
+
+# ==============================================================================
+# 7. USER INTERFACE (UI)
+# ==============================================================================
+z::ui::term::width()
+{
+  emulate -L zsh
+  local -i width tput_width
+
+  # Use cached width if COLUMNS hasn't changed and cache is valid
+  if (( _cached_term_width > 0 && _z_prev_columns == ${COLUMNS:-0} )); then
+    print -r -- "$_cached_term_width"
+    return 0
+  fi
+
+  if [[ -n "${COLUMNS:-}" ]] &&
+    [[ "$COLUMNS" =~ ^[0-9]+$ ]] &&
+    (( COLUMNS >= 10 )); then
+    width=$COLUMNS
+  elif (( $+commands[tput] )) &&
+    tput_width=$(tput cols 2> /dev/null) &&
+    [[ "$tput_width" =~ ^[0-9]+$ ]] &&
+    (( tput_width >= 10 )); then
+    width=$tput_width
+  else
+    width=80
+  fi
+
+  _cached_term_width=$width
+  _z_prev_columns=${COLUMNS:-0}
+  print -r -- "$width"
+}
+
+z::ui::progress::_should_show()
+{
+  emulate -L zsh
+  local -i current=$1 total=$2 interval=${_z_config[progress_update_interval]:-20}
+
+  if (( current == 1 || current == total )); then
+    return 0
+  fi
+
+  if (( total <= 10 )); then
+    return 1
+  fi
+
+  if (( total <= 50 )); then
+    (( current % 5 == 0 )) && return 0
+    return 1
+  fi
+
+  if (( current % interval == 0 )) || (( total - current < interval )); then
+    return 0
+  fi
+
+  return 1
+}
+
+z::util::comma()
+{
+  emulate -L zsh
+  setopt localoptions typeset_silent
+  local n="${1:-0}"
+  # Normalize sign and digits
+  local sign=''
+  if [[ $n == -* ]]; then
+    sign='-'
+    n="${n#-}"
+  fi
+  # Non-digit input: return as-is
+  if [[ $n != <-> ]]; then
+    print -r -- "${sign}${n}"
+    return 0
+  fi
+  local -a groups=()
+  local s="$n"
+  while (( ${#s} > 3 )); do
+    groups=("${s[-3,-1]}" "${(@)groups}")
+    s="${s[1,-4]}"
+  done
+  local out="$s"
+  if (( ${#groups} )); then
+    out+=",${(j:,:)groups}"
+  fi
+  print -r -- "${sign}${out}"
+}
+
+z::progress::show()
+{
+  emulate -L zsh
+  setopt typeset_silent
+
+  if [[ ${1-} != <-> || ${2-} != <-> ]]; then
+    z::log::debug "Invalid progress params: must be integers."
+    return 1
+  fi
+  local -i current=$1 total=$2
+
+  local label="${3:-items}"
+  if (( total <= 0 || current < 0 || current > total )); then
+    z::log::debug "Invalid progress range: $current/$total."
+    return 1
+  fi
+
+  if (( _z_verbose_level < _z_config[log_info] )) ||
+    [[ ! -t 2 ]] ||
+    [[ "${_z_config[show_progress]:-true}" == "false" ]]; then
+    return 0
+  fi
+
+  z::ui::progress::_should_show "$current" "$total" || return 0
+
+  local -i term_width
+  term_width=$(z::ui::term::width)
+
+  local -F percent
+  if (( total > 0 )); then
+    (( percent = (current * 100.0) / total ))
+  else
+    percent=0.0
+  fi
+
+  local -i bar_width
+  if (( term_width > 40 )); then
+    bar_width=20
+  else
+    bar_width=10
+  fi
+  local -i filled=$(( (percent * bar_width) / 100 ))
+  (( filled < 0 )) && filled=0
+  (( filled > bar_width )) && filled=$bar_width
+  local -i empty_len=$(( bar_width - filled ))
+
+  local bar_fill bar_empty
+  if (( filled > 0 )); then
+    print -v bar_fill -f "%${filled}s" ""
+    bar_fill=${bar_fill// /█}
+  else
+    bar_fill=""
+  fi
+  if (( empty_len > 0 )); then
+    print -v bar_empty -f "%${empty_len}s" ""
+    bar_empty=${bar_empty// /░}
+  else
+    bar_empty=""
+  fi
+  local progress_bar="${bar_fill}${bar_empty}"
+
+  local current_fmt total_fmt
+  current_fmt=$(z::util::comma "$current")
+  total_fmt=$(z::util::comma "$total")
+
+  if (( term_width > 70 )); then
+    printf '\r[%s] %3.0f%% | %s: %s / %s ' "$progress_bar" "$percent" "$label" "$current_fmt" "$total_fmt" >&2
+  else
+    printf '\r[%s] %3.0f%% (%s/%s)' "$progress_bar" "$percent" "$current_fmt" "$total_fmt" >&2
+  fi
+
+  (( current == total )) && printf '\n' >&2
+}
+
+# ==============================================================================
+# 8. INITIALIZATION
+# ==============================================================================
+
+# Install interrupt handlers
+trap 'z::runtime::handle_interrupt' INT TERM
+
+# Initialize library
+z::log::debug "Zsh utility library initialized (performance_mode=${_z_config[performance_mode]})"

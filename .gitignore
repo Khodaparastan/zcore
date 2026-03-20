@@ -1,4 +1,10 @@
-tmp
-aliases
+_tmp
+.DS_Store
 .idea
-zsh-runtime-detect
+.zed
+docs
+README.md
+.zsh_history
+.zcompdump
+logs
+zlog

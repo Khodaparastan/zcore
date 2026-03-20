@@ -1,174 +1,119 @@
 #!/usr/bin/env zsh
-# Guard: prevent reloading
-if [[ -n "${_zcore_config_loaded:-}" ]]; then
-	return 0
-fi
-typeset -gr _zcore_config_loaded=1
-
-# Intentionally global shell options for interactive init
-setopt PROMPT_SUBST PROMPT_PERCENT
+if [[ -n "${_zcore_init_loaded:-}" ]]; then return 0; fi
+setopt PROMPT_SUBST promptpercent
 umask 022
+zstyle ":plugin:zconvey" greeting "none"
+typeset -gx ZCORE_LIBDIR="${ZDOTDIR}"
+typeset -gx ZCORE_MODDIR="${ZDOTDIR}/modules"
+typeset -gx ZCORE_LOGDIR="${ZDOTDIR}/logs"
 
-# Require zsh 5+
-typeset -i _zsh_major="${${ZSH_VERSION%%.*}:-0}"
-if (( _zsh_major < 5 )); then
-	print -u2 -- "error: zsh 5.0+ required (current: ${ZSH_VERSION})"
-	print -u2 -- "please upgrade zsh or use bash compatibility mode."
-	return 1
-fi
+z::interactive::_init_log() {
+    emulate -L zsh
+    setopt localoptions typeset_silent
+    z::progress::disable
+    __z::log::init_colors
+    z::log::set_file "${ZCORE_LOGDIR}/init.log"
+    z::log::set_file_level debug
+    z::log::set_format "text"
+    z::log::set_level "error"
+    z::log::set_rotation 1
+    z::log::set_max_size $((10 * 1024 * 1024)) # 10MB
+    z::log::set_max_files 5
+    z::log::enable_buffering 50
+    z::log::info "Zsh initialization started" \
+        zsh_version "$ZSH_VERSION" \
+        zdotdir "$ZDOTDIR" \
+        shell_pid "$$"
+    z::log::enable_performance_mode
+    z::log::enable_buffering 1000
+    return 0
+}
+z::interactive::load_mods() {
+    emulate -L zsh
+    setopt localoptions typeset_silent
 
-typeset -gx XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-typeset -gx XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-typeset -gx XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
-typeset -gx XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-typeset -gx ZDOTDIR="${ZDOTDIR:-$HOME/.config/zsh}"
-typeset -g ZCORE_LIBDIR="${ZDOTDIR}/lib"
-typeset -g ZCORE_MODDIR="${ZDOTDIR}/modules"
+    local -ar modules=(
+        "setpath"
+        "environment"
+        "ziplug"
+        "completions"
+        "ls-enhancements"
+        "python"
+        "clipboard"
+        "external-tool-integrations"
+        "prompt"
+        "keybindings"
+        "aliases"
+        "zoxide"
+    )
 
-# Config knobs (env visible so the library can read them)
-typeset -gx ZCORE_CONFIG_SHOW_PROGRESS=false
-typeset -gx ZCORE_CONFIG_PERFORMANCE_MODE=false
-# Honor desired verbosity in the library
-#typeset -gx zcore_config_verbose="${zcore_config_verbose:-3}"
+    local -i loaded_count=0 processed_count=0
+    local -i total_modules=${#modules[@]}
+    local module full_path
 
-# Load core libraries
-source "${ZCORE_LIBDIR}/core.zsh"
-source "${ZCORE_LIBDIR}/platform.zsh"
+    z::log::info "Loading ${total_modules} configuration modules..."
 
-###
-# Loads all specified Zsh configuration files from the modules directory.
-###
-_load_config_files() {
-	emulate -L zsh
+    for module in "${modules[@]}"; do
+        full_path="${ZCORE_MODDIR}/${module}.zsh"
 
-	local config_base=$ZCORE_MODDIR
-	local -ar config_files=(
-		"environment"
-		"path"
-		"extra"
-		"aliases"
-		"load_zi"
-		"completions"
-		"keybindings"
-		"utils"
-		"python"
-		"funcs"
-		"external_tools"
-		"prompt"
-    "clipboard"
-	)
+        if [[ ! -f $full_path ]]; then
+            z::log::warn "Module file not found: ${module}.zsh"
+            ((processed_count++))
+            z::progress::show "$processed_count" "$total_modules" "modules"
+            continue
+        fi
 
-	local -i loaded_files=0
-	local -i total_files=${#config_files[@]}
-	local -i current_file_num=0
+        if z::file::source --global "$full_path"; then
+            ((loaded_count++))
+            z::log::debug "Module loaded: ${module}.zsh"
+        else
+            z::log::warn "Failed to load module: ${module}.zsh"
+        fi
+        ((processed_count++))
+        z::progress::show "$processed_count" "$total_modules" "modules"
 
-	local config_file full_path
-	for config_file in "${config_files[@]}"; do
-		((current_file_num++))
-		z::runtime::check_interrupted || return $?
+    done
 
-		z::ui::progress::show $current_file_num $total_files "config"
-
-		full_path="${config_base}/${config_file}.zsh"
-		if z::path::source "$full_path"; then
-			((loaded_files++))
-		else
-			z::log::debug "Failed to load config: $full_path"
-		fi
-	done
-
-	z::log::info "Loaded $loaded_files/$total_files config files"
-	return 0
+    z::log::info "Successfully loaded ${loaded_count}/${total_modules} modules."
+    return 0
+}
+z::interactive::load_libs() {
+    emulate -L zsh
+    setopt localoptions typeset_silent
+    source "$ZDOTDIR/zlog.zsh"
+    source "$ZDOTDIR/z.zsh"
+    source "$ZDOTDIR/zbus.zsh"
+    return 0
+}
+z::interactive::init() {
+    emulate -L zsh
+    setopt localoptions typeset_silent
+    zmodload zsh/datetime
+    zmodload zsh/nearcolor
+    zmodload zsh/mathfunc
+    zmodload zsh/parameter
+    z::interactive::load_libs
+    z::interactive::_init_log
+    z::interactive::load_mods
+    return 0
 }
 
-_main() {
-	emulate -L zsh
-
-	# Optional modules; silence failures
-	zmodload zsh/datetime 2>/dev/null
-	zmodload zsh/mathfunc 2>/dev/null
-
-	typeset -F start_time end_time init_duration
-	# Fallback if EPOCHREALTIME is unavailable
-	start_time=${EPOCHREALTIME:-$EPOCHSECONDS}
-
-	z::detect::platform
-
-	# Load core configuration files first.
-	_load_config_files || return $?
-
-	local -a init_functions=(
-		_initialize_environment
-		_build_path
-		_setup_environment
-		_define_aliases
-		setup_platform_aliases
-		_create_stub_functions
-	)
-	local -i total_functions=${#init_functions[@]} current_function=0
-	local func
-	for func in "${init_functions[@]}"; do
-		((current_function++))
-		z::runtime::check_interrupted || return $?
-		z::ui::progress::show $current_function $total_functions "init"
-		z::func::call "$func"
-	done
-
-	if z::func::call _install_zi; then
-		z::func::call _load_plugins
-	else
-		z::log::warn "ZI plugin manager not available."
-	fi
-
-	z::func::call _setup_completions
-	z::func::call _setup_keybindings
-	z::func::call _setup_ls
-	# Configure shell options after environment is set up (safe-source)
-	if ! z::path::source "${ZCORE_MODDIR}/options.zsh"; then
-		z::log::warn "Options module not found or unreadable: ${ZCORE_MODDIR}/options.zsh"
-	fi
-	_setup_prompt || return $?
-	# External tools and prompt are now handled by their respective modules
-
-	end_time=${EPOCHREALTIME:-$EPOCHSECONDS}
-	init_duration=$(( end_time - start_time + 0.0 ))
-	z::log::info "Zsh initialized in $(printf '%.4f' "$init_duration")s"
+z::interactive::cleanup() {
+    emulate -L zsh
+    setopt localoptions typeset_silent
+    unset -f -- z::interactive::init z::interactive::load_mods z::interactive::_init_log z::interactive::cleanup
 }
 
-_cleanup_init_functions() {
-	emulate -L zsh
-
-	local -a cleanup_list=(
-		_main
-		_load_config_files
-		_create_stub_functions
-		_cleanup_init_functions
-		_initialize_environment
-		_build_path
-		_setup_environment
-		_define_aliases
-		setup_platform_aliases
-		_install_zi
-		_load_plugins
-		_setup_completions
-		_setup_keybindings
-		_setup_ls
-	)
-
-	local func
-	for func in "${cleanup_list[@]}"; do
-		z::state::unset "$func" "func"
-	done
-
-}
-
-
-# Only run initialization in interactive shells; never exit the shell from here.
 if [[ -o interactive ]]; then
-	_main
-	_configure_setopts || return $?
-	_cleanup_init_functions
+    z::interactive::init || {
+        print -r -- "Zsh initialization failed"
+        z::interactive::cleanup
+        return 1
+    }
+    z::interactive::cleanup
+    z::file::source --global "${ZCORE_MODDIR}/options.zsh" || z::log::warn "Failed to source options module"
+    z::log::flush
+    z::log::disable_performance_mode
 fi
 
-# Always succeed when sourced during startup
 return 0
