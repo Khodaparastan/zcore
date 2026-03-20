@@ -143,8 +143,8 @@ __z::mod::completions::get_ssh_hosts() {
         if (( cache_mtime > 0 && current_time - cache_mtime < cache_age )); then
             local -a cached_hosts=("${(@f)$(< "$cache_file")}")
             if (( ${#cached_hosts} > 0 )); then
-                typeset -ga _zcore_ssh_hosts_cache
-                _zcore_ssh_hosts_cache=("${cached_hosts[@]}")
+                typeset -ga _z_ssh_hosts_cache
+                _z_ssh_hosts_cache=("${cached_hosts[@]}")
                 print -l -- "${cached_hosts[@]}"
                 z::log::debug "Served SSH hosts from fresh cache."
                 return 0
@@ -153,7 +153,7 @@ __z::mod::completions::get_ssh_hosts() {
     fi
 
     z::log::debug "SSH host cache is stale or missing; rebuilding."
-    typeset -ga _zcore_ssh_hosts_cache
+    typeset -ga _z_ssh_hosts_cache
     local -a discovered_hosts=()
     local -a negative_patterns=()
 
@@ -221,23 +221,23 @@ __z::mod::completions::get_ssh_hosts() {
     fi
 
     # Unique + sort once
-    _zcore_ssh_hosts_cache=("${(@ou)discovered_hosts}")
+    _z_ssh_hosts_cache=("${(@ou)discovered_hosts}")
 
     # Write cache file
-    if (( ${#_zcore_ssh_hosts_cache} > 0 )); then
+    if (( ${#_z_ssh_hosts_cache} > 0 )); then
         local cache_dir="${cache_file:h}"
         if [[ -d "$cache_dir" ]] || command mkdir -p -- "$cache_dir"; then
-            if ! print -l -- "${_zcore_ssh_hosts_cache[@]}" >| "$cache_file"; then
+            if ! print -l -- "${_z_ssh_hosts_cache[@]}" >| "$cache_file"; then
                 z::log::warn "Failed to write SSH hosts cache to $cache_file"
             else
-                z::log::debug "Wrote ${#_zcore_ssh_hosts_cache} hosts to cache."
+                z::log::debug "Wrote ${#_z_ssh_hosts_cache} hosts to cache."
             fi
         else
             z::log::warn "Cannot create cache directory: $cache_dir"
         fi
     fi
 
-    print -l -- "${_zcore_ssh_hosts_cache[@]}"
+    print -l -- "${_z_ssh_hosts_cache[@]}"
     return 0
 }
 
@@ -309,8 +309,8 @@ __z::mod::completions::configure_styles() {
 
     # SSH-like commands host completion
     local -a ssh_hosts_array=()
-    if (( ${+_zcore_ssh_hosts_cache} && ${#_zcore_ssh_hosts_cache} > 0 )); then
-        ssh_hosts_array=("${_zcore_ssh_hosts_cache[@]}")
+    if (( ${+_z_ssh_hosts_cache} && ${#_z_ssh_hosts_cache} > 0 )); then
+        ssh_hosts_array=("${_z_ssh_hosts_cache[@]}")
     else
         # Build (and populate cache) on demand; ignore errors
         ssh_hosts_array=("${(@f)$(__z::mod::completions::get_ssh_hosts 2>/dev/null)}")

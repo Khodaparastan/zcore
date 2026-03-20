@@ -158,7 +158,7 @@ __z::mod::env::xdg_is_readonly_fs() {
 	emulate -L zsh -o no_aliases
 	setopt typeset_silent
 	local path="$1"
-	local test_file="${path}/.zcore_test_$$"
+	local test_file="${path}/.z_test_$$"
 
 	if touch -- "$test_file" 2>/dev/null; then
 		rm -f -- "$test_file" 2>/dev/null
@@ -265,7 +265,7 @@ __z::mod::env::create_xdg_dirs() {
 
 	z::log::debug "XDG directory setup completed"
 
-	if [[ ${ZCORE_DEBUG:-0} == 1 ]]; then
+	if [[ ${Z_DEBUG:-0} == 1 ]]; then
 		z::log::info "XDG directories configured:"
 		z::log::info "  Config: $XDG_CONFIG_HOME"
 		z::log::info "  Data:   $XDG_DATA_HOME"

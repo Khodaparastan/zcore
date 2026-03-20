@@ -2,7 +2,7 @@
 #
 # External Tools Configuration Module
 # Handles initialization of external tools and development utilities
-# Fully integrated with the zcore library.
+# Fully integrated with the z library.
 #
 # ==============================================================================
 # INDIVIDUAL TOOL SETUP FUNCTIONS

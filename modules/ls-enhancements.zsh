@@ -50,18 +50,18 @@ __z::mod::ls::setup_ls_aliases()
     )
 
     # Check for icon support (cached to avoid repeated help calls)
-    if [[ -z ${_zcore_eza_icons_checked:-} ]]; then
-      typeset -g _zcore_eza_icons_checked=1
+    if [[ -z ${_z_eza_icons_checked:-} ]]; then
+      typeset -g _z_eza_icons_checked=1
       if eza --help 2>&1 | command grep -q -- '--icons'; then
-        typeset -g _zcore_eza_has_icons=1
+        typeset -g _z_eza_has_icons=1
         z::log::debug "eza supports --icons flag"
       else
-        typeset -g _zcore_eza_has_icons=0
+        typeset -g _z_eza_has_icons=0
         z::log::debug "eza does not support --icons flag"
       fi
     fi
 
-    if (( ${_zcore_eza_has_icons:-0} )); then
+    if (( ${_z_eza_has_icons:-0} )); then
       base_opts+=('--icons')
     fi
 

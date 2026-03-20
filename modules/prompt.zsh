@@ -77,14 +77,14 @@ __z::mod::prompt::setup_fallback()
   # --- Set Terminal Title ---
   # Use add-zsh-hook for safety if available, otherwise append to array
   autoload -Uz add-zsh-hook 2> /dev/null
-  _zcore_update_title()
+  _z_update_title()
   {
     print -Pn '\e]0;%n@%m:%~\a'
   }
   if z::probe::func "add-zsh-hook"; then
-    add-zsh-hook precmd _zcore_update_title
-  elif [[ -z ${(M)precmd_functions:#_zcore_update_title} ]]; then
-    precmd_functions+=_zcore_update_title
+    add-zsh-hook precmd _z_update_title
+  elif [[ -z ${(M)precmd_functions:#_z_update_title} ]]; then
+    precmd_functions+=_z_update_title
   fi
 
   z::log::debug "Configured custom fallback prompt."

@@ -1,37 +1,37 @@
 #!/usr/bin/env zsh
 
 # ==============================================================================
-# ZCORE FRAMEWORK
+# Z FRAMEWORK
 # ==============================================================================
 
 # Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
 zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
 
-typeset -gA _zcore_config
-_zcore_config[log_error]=0
-_zcore_config[log_warn]=1
-_zcore_config[log_info]=2
-_zcore_config[log_debug]=3
-_zcore_config[exit_general_error]=1
-_zcore_config[exit_interrupted]=130
-_zcore_config[progress_update_interval]=10
-_zcore_config[timeout_default]=30
-_zcore_config[log_max_depth]=50
-_zcore_config[cache_max_size]=100
-_zcore_config[performance_mode]=${ZCORE_CONFIG_PERFORMANCE_MODE:-false}
-_zcore_config[show_progress]=${ZCORE_CONFIG_SHOW_PROGRESS:-true}
+typeset -gA _z_config
+_z_config[log_error]=0
+_z_config[log_warn]=1
+_z_config[log_info]=2
+_z_config[log_debug]=3
+_z_config[exit_general_error]=1
+_z_config[exit_interrupted]=130
+_z_config[progress_update_interval]=10
+_z_config[timeout_default]=30
+_z_config[log_max_depth]=50
+_z_config[cache_max_size]=100
+_z_config[performance_mode]=${Z_CONFIG_PERFORMANCE_MODE:-false}
+_z_config[show_progress]=${Z_CONFIG_SHOW_PROGRESS:-true}
 # Optional: allow to extend/override init whitelist via regex (empty by default)
-_zcore_config[init_whitelist_regex]=''
+_z_config[init_whitelist_regex]=''
 
 # Global verbosity level
 # 0 = error only, 1 = warn, 2 = info (default), 3 = debug
-typeset -gi _zcore_verbose_level=${_zcore_config[log_info]}
-if [[ "${zcore_config_verbose:-}" == <-> ]]; then
-  if (( zcore_config_verbose > _zcore_config[log_info] )) &&
-    [[ "${_zcore_config[performance_mode]}" != "true" ]]; then
-    _zcore_verbose_level=$zcore_config_verbose
-  elif (( zcore_config_verbose <= _zcore_config[log_info] )); then
-    _zcore_verbose_level=$zcore_config_verbose
+typeset -gi _z_verbose_level=${_z_config[log_info]}
+if [[ "${z_config_verbose:-}" == <-> ]]; then
+  if (( z_config_verbose > _z_config[log_info] )) &&
+    [[ "${_z_config[performance_mode]}" != "true" ]]; then
+    _z_verbose_level=$z_config_verbose
+  elif (( z_config_verbose <= _z_config[log_info] )); then
+    _z_verbose_level=$z_config_verbose
   fi
 fi
 
@@ -39,7 +39,7 @@ fi
 z::log::enable_debug()
 {
   emulate -L zsh
-  _zcore_verbose_level=${_zcore_config[log_debug]}
+  _z_verbose_level=${_z_config[log_debug]}
   z::log::info "Debug mode enabled"
 }
 
@@ -48,25 +48,25 @@ z::log::get_level()
 {
   emulate -L zsh
   local level_name
-  case $_zcore_verbose_level in
-    (${_zcore_config[log_error]}) level_name="error" ;;
-    (${_zcore_config[log_warn]}) level_name="warn" ;;
-    (${_zcore_config[log_info]}) level_name="info" ;;
-    (${_zcore_config[log_debug]}) level_name="debug" ;;
+  case $_z_verbose_level in
+    (${_z_config[log_error]}) level_name="error" ;;
+    (${_z_config[log_warn]}) level_name="warn" ;;
+    (${_z_config[log_info]}) level_name="info" ;;
+    (${_z_config[log_debug]}) level_name="debug" ;;
     (*) level_name="unknown" ;;
   esac
-  print -r -- "Current verbosity level: $_zcore_verbose_level ($level_name)"
+  print -r -- "Current verbosity level: $_z_verbose_level ($level_name)"
 }
 
 # Function to toggle progress bars on/off
 z::log::toggle_progress()
 {
   emulate -L zsh
-  if [[ "${_zcore_config[show_progress]:-}" == "true" ]]; then
-    _zcore_config[show_progress]=false
+  if [[ "${_z_config[show_progress]:-}" == "true" ]]; then
+    _z_config[show_progress]=false
     z::log::info "Progress bars disabled"
   else
-    _zcore_config[show_progress]=true
+    _z_config[show_progress]=true
     z::log::info "Progress bars enabled"
   fi
 }
@@ -81,20 +81,20 @@ z::ui::progress::clear()
 }
 
 # Performance mode override
-if [[ -n ${ZCORE_CONFIG_PERFORMANCE_MODE:-} ]]; then
-  _zcore_config[performance_mode]="${ZCORE_CONFIG_PERFORMANCE_MODE}"
+if [[ -n ${Z_CONFIG_PERFORMANCE_MODE:-} ]]; then
+  _z_config[performance_mode]="${Z_CONFIG_PERFORMANCE_MODE}"
 fi
 
 # Progress bar override
-if [[ -n ${ZCORE_CONFIG_SHOW_PROGRESS:-} ]]; then
-  _zcore_config[show_progress]="${ZCORE_CONFIG_SHOW_PROGRESS}"
+if [[ -n ${Z_CONFIG_SHOW_PROGRESS:-} ]]; then
+  _z_config[show_progress]="${Z_CONFIG_SHOW_PROGRESS}"
 fi
 
 # Global state variables
-typeset -gi _zcore_config_interrupted=0
+typeset -gi _z_config_interrupted=0
 typeset -gi _log_depth=0
 typeset -gi _cached_term_width=0
-typeset -gi _zcore_prev_columns=0
+typeset -gi _z_prev_columns=0
 
 # Function existence cache
 typeset -gA _func_cache
@@ -105,18 +105,18 @@ typeset -gA _cmd_cache
 typeset -ga _cmd_cache_order
 
 # Timeout command detection (GNU timeout or coreutils gtimeout on macOS)
-typeset -g _zcore_timeout_cmd=""
+typeset -g _z_timeout_cmd=""
 if (( $+commands[timeout] )); then
-  _zcore_timeout_cmd="timeout"
+  _z_timeout_cmd="timeout"
 elif (( $+commands[gtimeout] )); then
-  _zcore_timeout_cmd="gtimeout"
+  _z_timeout_cmd="gtimeout"
 fi
 
-typeset -gA _zcore_colors
+typeset -gA _z_colors
 if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-} != "dumb" ]] &&
    (( $+commands[tput] )) &&
    tput setaf 1 >/dev/null 2>&1; then
-  _zcore_colors=(
+  _z_colors=(
     [red]="$(tput setaf 1)"
     [green]="$(tput setaf 2)"
     [blue]="$(tput setaf 4)"
@@ -124,7 +124,7 @@ if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-} != "dumb" ]] &&
     [reset]="$(tput sgr0)"
   )
 else
-  _zcore_colors=([red]="" [green]="" [blue]="" [yellow]="" [reset]="")
+  _z_colors=([red]="" [green]="" [blue]="" [yellow]="" [reset]="")
 fi
 
 # Timestamp caching for performance
@@ -153,7 +153,7 @@ __z::log::engine()
   setopt localoptions no_unset warn_create_global
 
   # Infinite recursion prevention
-  if (( _log_depth > _zcore_config[log_max_depth] )); then
+  if (( _log_depth > _z_config[log_max_depth] )); then
     print -r -- "FATAL: Recursion in __z::log::engine" >&2
     return 1
   fi
@@ -170,7 +170,7 @@ __z::log::engine()
   shift
 
   # Early return for filtered messages
-  if (( level > _zcore_verbose_level )); then
+  if (( level > _z_verbose_level )); then
     (( _log_depth-- ))
     return 0
   fi
@@ -180,10 +180,10 @@ __z::log::engine()
   # Mapping level to prefix and color
   local prefix=""
   case $level in
-    (${_zcore_config[log_error]}) prefix="${_zcore_colors[red]}[error]${_zcore_colors[reset]}" ;;
-    (${_zcore_config[log_warn]})  prefix="${_zcore_colors[yellow]}[warn]${_zcore_colors[reset]}" ;;
-    (${_zcore_config[log_info]})  prefix="${_zcore_colors[blue]}[info]${_zcore_colors[reset]}" ;;
-    (${_zcore_config[log_debug]}) prefix="${_zcore_colors[green]}[debug]${_zcore_colors[reset]}" ;;
+    (${_z_config[log_error]}) prefix="${_z_colors[red]}[error]${_z_colors[reset]}" ;;
+    (${_z_config[log_warn]})  prefix="${_z_colors[yellow]}[warn]${_z_colors[reset]}" ;;
+    (${_z_config[log_info]})  prefix="${_z_colors[blue]}[info]${_z_colors[reset]}" ;;
+    (${_z_config[log_debug]}) prefix="${_z_colors[green]}[debug]${_z_colors[reset]}" ;;
     (*)                           prefix="[unknown]" ;;
   esac
 
@@ -198,22 +198,22 @@ __z::log::engine()
 z::log::error()
 {
   emulate -L zsh
-  __z::log::engine ${_zcore_config[log_error]} "$@"
+  __z::log::engine ${_z_config[log_error]} "$@"
 }
 z::log::warn()
 {
   emulate -L zsh
-  __z::log::engine ${_zcore_config[log_warn]} "$@"
+  __z::log::engine ${_z_config[log_warn]} "$@"
 }
 z::log::info()
 {
   emulate -L zsh
-  __z::log::engine ${_zcore_config[log_info]} "$@"
+  __z::log::engine ${_z_config[log_info]} "$@"
 }
 z::log::debug()
 {
   emulate -L zsh
-  __z::log::engine ${_zcore_config[log_debug]} "$@"
+  __z::log::engine ${_z_config[log_debug]} "$@"
 }
 
 # --- Interrupt Handling ---
@@ -227,8 +227,8 @@ z::runtime::handle_interrupt()
     return 0 # Don't handle interrupts during ZLE (line editing)
   fi
 
-  if (( _zcore_config_interrupted == 0 )); then
-    _zcore_config_interrupted=1
+  if (( _z_config_interrupted == 0 )); then
+    _z_config_interrupted=1
     z::ui::progress::clear
     z::log::warn "Interrupt received. Gracefully shutting down..."
   fi
@@ -237,9 +237,9 @@ z::runtime::handle_interrupt()
 z::sys::interrupted()
 {
   emulate -L zsh
-  if (( _zcore_config_interrupted )); then
+  if (( _z_config_interrupted )); then
     z::log::info "Operation cancelled by user."
-    return ${_zcore_config[exit_interrupted]}
+    return ${_z_config[exit_interrupted]}
   fi
   return 0
 }
@@ -254,7 +254,7 @@ z::config::set()
     return 1
   fi
 
-  if (( !${+_zcore_config[$key]} )); then
+  if (( !${+_z_config[$key]} )); then
     z::log::warn "z::config::set: Unknown configuration key: '$key'."
     return 1
   fi
@@ -279,7 +279,7 @@ z::config::set()
       ;;
   esac
 
-  _zcore_config[$key]="$value"
+  _z_config[$key]="$value"
   z::log::debug "Configuration updated: $key = $value"
   return 0
 }
@@ -290,7 +290,7 @@ z::runtime::die()
 {
   emulate -L zsh
   local message="${1-}"
-  local -i exit_code=${2:-${_zcore_config[exit_general_error]}}
+  local -i exit_code=${2:-${_z_config[exit_general_error]}}
 
   z::ui::progress::clear
   z::log::error "FATAL: $message"
@@ -469,8 +469,8 @@ __z::exec::is_init_cmd()
   local input="$1"
 
   # Optional user-provided whitelist regex
-  if [[ -n ${_zcore_config[init_whitelist_regex]:-} ]]; then
-    if [[ "$input" =~ ${_zcore_config[init_whitelist_regex]} ]]; then
+  if [[ -n ${_z_config[init_whitelist_regex]:-} ]]; then
+    if [[ "$input" =~ ${_z_config[init_whitelist_regex]} ]]; then
       return 0
     fi
   fi
@@ -727,7 +727,7 @@ z::exec::run()
 {
   emulate -L zsh
   local input="$1"
-  local -i timeout=${2:-${_zcore_config[timeout_default]}}
+  local -i timeout=${2:-${_z_config[timeout_default]}}
 
   if [[ -z "$input" ]]; then
     z::log::error "Empty input for z::exec::run"
@@ -749,8 +749,8 @@ z::exec::run()
 
   local -i exit_code=0
 
-  if [[ -n "${_zcore_timeout_cmd:-}" ]]; then
-    "${_zcore_timeout_cmd}" "$timeout" zsh -o pipefail -c "$input" || exit_code=$?
+  if [[ -n "${_z_timeout_cmd:-}" ]]; then
+    "${_z_timeout_cmd}" "$timeout" zsh -o pipefail -c "$input" || exit_code=$?
     if (( exit_code == 124 )); then
       z::log::warn "Command timed out after ${timeout}s"
     fi
@@ -769,7 +769,7 @@ z::exec::eval()
 {
   emulate -L zsh
   local input="$1"
-  local -i timeout=${2:-${_zcore_config[timeout_default]}}
+  local -i timeout=${2:-${_z_config[timeout_default]}}
   local force_current_shell="${3:-false}"
 
   if [[ -z "$input" ]]; then
@@ -797,7 +797,7 @@ z::exec::eval()
   fi
 
   # Security scan (skipped for known safe patterns)
-  if [[ "${_zcore_config[performance_mode]}" != "true" ]] &&
+  if [[ "${_z_config[performance_mode]}" != "true" ]] &&
     [[ "$is_shell_init" != "true" ]] &&
     [[ "$is_package_install" != "true" ]]; then
     __z::exec::scan_patterns "$input" || return 1
@@ -949,7 +949,7 @@ z::file::source()
   esac
 
   # Skip expensive path normalization in performance mode
-  if [[ "${_zcore_config[performance_mode]}" != "true" ]]; then
+  if [[ "${_z_config[performance_mode]}" != "true" ]]; then
     if ! resolved_file=$(z::path::resolve "$resolved_file"); then
       z::log::error "Failed to resolve path: $file"
       return 1
@@ -984,8 +984,8 @@ z::cache::func::_purge()
   emulate -L zsh
   # Remove oldest entries when cache is full
   local -i cache_size=${#_func_cache[@]}
-  if (( cache_size > _zcore_config[cache_max_size] )); then
-    local -i excess=$(( cache_size - _zcore_config[cache_max_size] ))
+  if (( cache_size > _z_config[cache_max_size] )); then
+    local -i excess=$(( cache_size - _z_config[cache_max_size] ))
     local -i to_remove=$(( excess / 2 + 1 ))
     local -i removed=0
     local key
@@ -1011,8 +1011,8 @@ z::cache::cmd::_purge()
 {
   emulate -L zsh
   local -i cache_size=${#_cmd_cache[@]}
-  if (( cache_size > _zcore_config[cache_max_size] )); then
-    local -i excess=$(( cache_size - _zcore_config[cache_max_size] ))
+  if (( cache_size > _z_config[cache_max_size] )); then
+    local -i excess=$(( cache_size - _z_config[cache_max_size] ))
     local -i to_remove=$(( excess / 2 + 1 ))
     local -i removed=0
     local key
@@ -1070,7 +1070,7 @@ z::probe::cmd()
   _cmd_cache[$cache_key]=$result
   _cmd_cache_order+=("$cache_key")
 
-  (( ${#_cmd_cache[@]} > _zcore_config[cache_max_size] )) && z::cache::cmd::_purge
+  (( ${#_cmd_cache[@]} > _z_config[cache_max_size] )) && z::cache::cmd::_purge
 
   return $result
 }
@@ -1259,7 +1259,7 @@ z::ui::term::width()
   local -i width tput_width
 
   # Use cached width if COLUMNS hasn't changed and cache is valid
-  if (( _cached_term_width > 0 && _zcore_prev_columns == ${COLUMNS:-0} )); then
+  if (( _cached_term_width > 0 && _z_prev_columns == ${COLUMNS:-0} )); then
     print -r -- "$_cached_term_width"
     return 0
   fi
@@ -1278,14 +1278,14 @@ z::ui::term::width()
   fi
 
   _cached_term_width=$width
-  _zcore_prev_columns=${COLUMNS:-0}
+  _z_prev_columns=${COLUMNS:-0}
   print -r -- "$width"
 }
 
 z::ui::progress::_should_show()
 {
   emulate -L zsh
-  local -i current=$1 total=$2 interval=${_zcore_config[progress_update_interval]:-20}
+  local -i current=$1 total=$2 interval=${_z_config[progress_update_interval]:-20}
 
   if (( current == 1 || current == total )); then
     return 0
@@ -1353,9 +1353,9 @@ z::progress::show()
     return 1
   fi
 
-  if (( _zcore_verbose_level < _zcore_config[log_info] )) ||
+  if (( _z_verbose_level < _z_config[log_info] )) ||
     [[ ! -t 2 ]] ||
-    [[ "${_zcore_config[show_progress]:-true}" == "false" ]]; then
+    [[ "${_z_config[show_progress]:-true}" == "false" ]]; then
     return 0
   fi
 
@@ -1418,4 +1418,4 @@ z::progress::show()
 trap 'z::runtime::handle_interrupt' INT TERM
 
 # Initialize library
-z::log::debug "Zsh utility library initialized (performance_mode=${_zcore_config[performance_mode]})"
+z::log::debug "Zsh utility library initialized (performance_mode=${_z_config[performance_mode]})"
