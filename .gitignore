@@ -1,11 +1,10 @@
 _tmp
 .DS_Store
 .idea
-.z*
 docs
 v0.2
 README.md
 .zsh_history
-.compdump
+.zcompdump
 logs
 zlog
