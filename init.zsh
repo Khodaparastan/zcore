@@ -80,7 +80,7 @@ z::interactive::load_mods() {
 z::interactive::load_libs() {
     emulate -L zsh
     setopt localoptions typeset_silent
-    source "$ZDOTDIR/zlog.zsh"
+    source "$ZDOTDIR/zlog"
     source "$ZDOTDIR/z.zsh"
     source "$ZDOTDIR/zbus.zsh"
     return 0

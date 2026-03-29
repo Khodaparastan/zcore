@@ -1,5 +1,97 @@
-
 #!/usr/bin/env zsh
+# ==============================================================================
+#  zlog — A high-performance, feature-rich logging library for Zsh.
+# ==============================================================================
+#
+#  Version  : 1.0.0
+#  License  : MIT
+#  Author   : Khodaparastan
+#  Requires : Zsh 5.1+, zsh/datetime module
+#
+# ------------------------------------------------------------------------------
+#  DESCRIPTION
+#
+#  A single-file, zero-dependency logging framework that brings the ergonomics
+#  of modern structured loggers (zerolog, zap) to Zsh scripts.
+#
+#  Features:
+#    • Four log levels          — ERROR / WARN / INFO / DEBUG
+#    • Dual output              — stderr + file simultaneously
+#    • Two output formats       — human-readable text and machine-readable JSON
+#    • Structured key-value     — attach typed fields to any message
+#    • Context loggers          — reusable loggers with pre-attached fields
+#    • File rotation            — size-based, multi-process safe (lock file)
+#    • Buffered I/O             — batch writes for high-throughput scripts
+#    • Async logging            — background worker via FIFO (experimental)
+#    • Performance mode         — hot-swap to a fast-path engine (~3–4× faster)
+#    • Rate limiting            — cap noisy messages per time window
+#    • Log-once                 — emit a message exactly once per key
+#    • Benchmarking             — wrap commands or blocks, auto-format duration
+#    • Printf-style API         — z::log::infof / warnf / errorf / debugf
+#    • Control-flow helpers     — with_level, silent, always, once, rate_limit
+#    • Color output             — auto-detected: none / basic / 256 / truecolor
+#    • NO_COLOR support         — respects the standard environment variable
+#    • Re-entrant safe          — all globals guarded; safe to source many times
+#
+# ------------------------------------------------------------------------------
+#  QUICK START
+#
+#    source /path/to/zlog
+#
+#    z::log::info  "Server started"  port 8080 env production
+#    z::log::warn  "High memory"     used_mb 1820 limit_mb 2048
+#    z::log::error "Connection lost" host db.internal retries 3
+#
+#  Write to a file as well:
+#    z::log::setup "/var/log/app.log" info text
+#
+#  JSON output:
+#    z::log::set_format json
+#
+# ------------------------------------------------------------------------------
+#  PUBLIC API  (prefix: z::log::)
+#
+#  Core          error / warn / info / debug / log
+#  Printf        errorf / warnf / infof / debugf
+#  Control-flow  with_level / silent / always / once / rate_limit
+#  Context       with_context / remove_context / clear_contexts
+#  Benchmark     benchmark / benchmark_start / benchmark_end / benchmark_block
+#  Config        setup / set_level / set_file_level / set_format / set_file
+#                set_rotation / set_timestamp_format / show_config / reset
+#  Buffering     enable_buffering / disable_buffering / flush
+#  Async         enable_async / disable_async
+#  Performance   enable_performance_mode / disable_performance_mode
+#  Diagnostics   get_stats / reset_stats / show_config
+#  Cleanup       cleanup / remove_log_file
+#
+#  Full reference: docs/api.md
+#  Architecture:   docs/architecture.md
+#
+# ------------------------------------------------------------------------------
+#  LICENSE
+#
+#  Copyright (c) 2026 Khodaparastan
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a copy
+#  of this software and associated documentation files (the "Software"), to deal
+#  in the Software without restriction, including without limitation the rights
+#  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#  copies of the Software, and to permit persons to whom the Software is
+#  furnished to do so, subject to the following conditions:
+#
+#  The above copyright notice and this permission notice shall be included in
+#  all copies or substantial portions of the Software.
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+#  THE SOFTWARE.
+#
+# ==============================================================================
+
 
 
 emulate -L zsh
@@ -600,7 +692,6 @@ __z::log::init_colors() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  # ✅ IMPROVED: Allow forced re-initialization
   local force="${1:-0}"
 
   # Already initialized - prevent re-entry unless forced
@@ -1818,7 +1909,7 @@ __z::log::truncate_message() {
 # Performance: O(1) - uses EPOCHREALTIME with arithmetic (no string ops)
 # Precision: Millisecond (3 decimal places)
 #
-# Example: 1704067200123 (Jan 1, 2024 00:00:00.123 UTC)
+# Example: 1704067200123 (Jan 1, 2026 00:00:00.123 UTC)
 ###
 __z::log::timestamp_ms() {
   emulate -L zsh
@@ -1880,7 +1971,7 @@ __z::log::timestamp_ns() {
 # Returns: 0 always
 #
 # Format: YYYY-MM-DDTHH:MM:SS.sss±HH:MM
-# Example: 2024-01-01T12:30:45.123+00:00
+# Example: 2026-03-01T12:30:45.123+00:00
 #
 # Performance: O(1) - simple string concatenation, no regex
 ###
@@ -2136,8 +2227,8 @@ __z::log::validate_timestamp_cache() {
 # Returns: 0 on success, 1 on invalid format
 #
 # Examples:
-#   z::log::get_timestamp human  # REPLY = "2024-01-01 12:30:45"
-#   z::log::get_timestamp iso    # REPLY = "2024-01-01T12:30:45.123+00:00"
+#   z::log::get_timestamp human  # REPLY = "2026-03-01 12:30:45"
+#   z::log::get_timestamp iso    # REPLY = "2026-03-01T12:30:45.123+00:00"
 #   z::log::get_timestamp epoch  # REPLY = "1704110445"
 #   z::log::get_timestamp ms     # REPLY = "1704110445123"
 #   z::log::get_timestamp ns     # REPLY = "1704110445123456000"
@@ -2170,8 +2261,8 @@ z::log::get_timestamp() {
     *)
       print -u2 "zlog: Invalid timestamp format: $format"
       print -u2 "      Valid formats:"
-      print -u2 "        human, text       - Human-readable (2024-01-01 12:30:45)"
-      print -u2 "        iso, iso8601      - ISO 8601 (2024-01-01T12:30:45.123+00:00)"
+      print -u2 "        human, text       - Human-readable (2026-03-01 12:30:45)"
+      print -u2 "        iso, iso8601      - ISO 8601 (2026-03-01T12:30:45.123+00:00)"
       print -u2 "        epoch, unix       - Unix timestamp (1704110445)"
       print -u2 "        ms, milliseconds  - Milliseconds (1704110445123)"
       print -u2 "        ns, nanoseconds   - Nanoseconds (1704110445123456000)"
@@ -2264,9 +2355,9 @@ z::log::set_timestamp_format() {
     print -u2 "zlog: Timestamp format cannot be empty"
     print -u2 ""
     print -u2 "      Common examples:"
-    print -u2 "        %Y-%m-%d %H:%M:%S  - Default (2024-01-01 12:30:45)"
+    print -u2 "        %Y-%m-%d %H:%M:%S  - Default (2026-03-01 12:30:45)"
     print -u2 "        %H:%M:%S           - Time only (12:30:45)"
-    print -u2 "        %Y-%m-%d           - Date only (2024-01-01)"
+    print -u2 "        %Y-%m-%d           - Date only (2026-03-01)"
     print -u2 "        %b %d %H:%M:%S     - Syslog style (Jan 01 12:30:45)"
     print -u2 ""
     print -u2 "      See 'man strftime' for all format codes"
@@ -2365,13 +2456,13 @@ z::log::reset_timestamp_format() {
 #
 # Examples:
 #   z::log::format_epoch 1704067200
-#   # REPLY = "2024-01-01 00:00:00"
+#   # REPLY = "2026-03-01 00:00:00"
 #
 #   z::log::format_epoch 1704067200 "%Y-%m-%d"
-#   # REPLY = "2024-01-01"
+#   # REPLY = "2026-03-01"
 #
 #   z::log::format_epoch 1704067200 "%b %d, %Y at %I:%M %p"
-#   # REPLY = "Jan 01, 2024 at 12:00 AM"
+#   # REPLY = "Jan 01, 2026 at 12:00 AM"
 ###
 z::log::format_epoch() {
   emulate -L zsh
@@ -3772,7 +3863,7 @@ __z::log::engine() {
 
   # Output to console
   if (( should_console )); then
-    if ! print -u2 -r -- "$formatted" 2>/dev/null; then
+    if ! print -u2 -r -- "$formatted"; then
       (( _zlog_stats[errors_encountered]++ ))
       print -u1 "zlog: stderr write failed: $formatted" 2>/dev/null || true
     fi
@@ -5975,6 +6066,9 @@ z::log::set_file() {
     _zlog_config[stat_cmd]=""
   fi
 
+  # Update fast-path flags so file_enabled reflects the new path
+  __z::log::update_fast_flags
+
   return 0
 }
 
@@ -6125,7 +6219,7 @@ z::log::enable_async() {
   setopt localoptions no_unset
 
   # Check if already enabled
-  if [[ -n "${_zlog_config[async_pid]}" ]] && kill -0 "${_zlog_config[async_pid]}" 2>/dev/null; then
+  if (( ${+_zlog_config[async_pid]} )) && [[ -n "${_zlog_config[async_pid]}" ]] && kill -0 "${_zlog_config[async_pid]}" 2>/dev/null; then
     z::log::warn "Async logging already enabled"
     return 0
   fi
@@ -6187,14 +6281,15 @@ z::log::disable_async() {
   emulate -L zsh
 
   # Check if async is enabled
-  if [[ -z "${_zlog_config[async_pid]}" ]]; then
+  if ! (( ${+_zlog_config[async_pid]} )) || [[ -z "${_zlog_config[async_pid]}" ]]; then
     return 0
   fi
 
   # Send shutdown signal
-  if [[ -n "${_zlog_config[async_fd]}" ]]; then
+  if (( ${+_zlog_config[async_fd]} )) && [[ -n "${_zlog_config[async_fd]}" ]]; then
     print -u "${_zlog_config[async_fd]}" "__ASYNC_SHUTDOWN__"
-    exec {_zlog_config[async_fd]}>&-
+    local _async_fd=${_zlog_config[async_fd]}
+    exec {_async_fd}>&-
   fi
 
   # Wait for worker to finish (with timeout)
@@ -6290,13 +6385,13 @@ __z::log::engine_fast() {
   fi
 
   # Use cached formatting if no context provided
+  local formatted
   if (( $# == 0 )); then
     __z::log::format_simple "$level" "$message"
+    formatted="$REPLY"
   else
-    __z::log::format "$level" "$message" "$@"
+    formatted=$(__z::log::format "$level" "$message" "$@")
   fi
-
-  local formatted="$REPLY"
 
   # Output to console if appropriate
   if (( level <= console_level )); then
