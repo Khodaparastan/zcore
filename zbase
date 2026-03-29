@@ -1,33 +1,43 @@
 #!/usr/bin/env zsh
-# Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
-zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
+# =============================================================================
+# zbase — z::opt  &  z::probe
+#
+# Option parsing and filesystem probing utilities.
+#
+# Dependencies (ONLY):
+#   z::log::error  z::log::warn  z::log::debug  z::log::if_debug
+#   Zsh 5.8+
+#
+# No dependency on z::config, z::kv, z::sys, z::event, or any other module.
+#
+# Convention: functions that return a value set $REPLY.
+#             Callers MUST read $REPLY — never use $() on these functions.
+# =============================================================================
 
-# Standard return codes
-typeset -gri ZCORE_SUCCESS=0
-typeset -gri ZCORE_ERROR_GENERAL=1
-typeset -gri ZCORE_ERROR_NOT_FOUND=2
-typeset -gri ZCORE_ERROR_INVALID_INPUT=3
-typeset -gri ZCORE_ERROR_PERMISSION=4
-typeset -gri ZCORE_ERROR_TIMEOUT=124
-typeset -gri ZCORE_ERROR_INTERRUPTED=130
+# =============================================================================
+# SECTION 1 — Option Parsing  (z::opt::*)
+# =============================================================================
 
 ###
-# Get option value from parsed zparseopts with fallback
+# Get an option value from a zparseopts-produced associative array.
 #
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Short option name WITHOUT dash (e.g., 't') - can be empty
-# @param 3: string - Long option name WITHOUT dashes (e.g., 'type') - can be empty
-# @param 4: string - Default value if not found (optional)
-# @output: string - Resolved option value
+# Short option takes precedence over long when both are present.
+# Presence is tracked with an explicit matched flag — never by comparing
+# the resolved value against the default (which would break when the user
+# supplies a value that happens to equal the default).
+#
+# @param 1: string  - Name of the local -A array (not the array itself)
+# @param 2: string  - Short flag letter WITHOUT dash, e.g. "t"; may be ""
+# @param 3: string  - Long  flag name  WITHOUT dashes, e.g. "type"; may be ""
+# @param 4: string  - Default value when flag is absent (default: "")
+# @sets  REPLY      - Resolved option value
 # @return 0 always
-#
-# @note: Expects opts array keys to include dashes (e.g., '-t', '--type')
-#        as produced by zparseopts or manual assignment
 #
 # @example
 #   local -A opts
 #   zparseopts -D -E -A opts -- t: -type:
-#   local type_value=$(z::opt::get opts 't' 'type' 'default')
+#   z::opt::get opts 't' 'type' 'text'
+#   local fmt="$REPLY"
 ###
 z::opt::get()
 {
@@ -35,60 +45,55 @@ z::opt::get()
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local opts_var="$1" short_opt="$2" long_opt="$3" default_value="${4:-}"
-  local resolved_value="$default_value"
+  REPLY="$default_value"
 
-  # Validate opts_var exists
   if [[ -z $opts_var ]]; then
-    z::log::error "z::opt::get: opts_var parameter required"
-    print -r -- "$default_value"
+    z::log::error "z::opt::get: opts_var parameter required" \
+      param "opts_var"
     return 0
   fi
 
-  # Check if the variable exists and is an associative array
+  # Verify the named variable exists and is an associative array
   if (( ! ${(P)+opts_var} )) || [[ ${(Pt)opts_var} != *association* ]]; then
-    print -r -- "$default_value"
     return 0
   fi
 
-  # Use direct parameter expansion with (P) flag instead of copying entire array
-  # Check short option first (higher precedence)
-  if [[ -n $short_opt ]]; then
-    local key="-${short_opt}"
-    # Use nested parameter expansion: ${(P)var} expands to the value of the variable named by $var
-    # Then we check if that associative array has the key
-    if (( ${(P)+${opts_var}[$key]} )); then
-      resolved_value="${(P)${opts_var}[$key]}"
-    fi
+  # Local copy — never mutate the caller's array
+  local -A _opts
+  _opts=("${(@Pkv)opts_var}")
+
+  local matched=0
+
+  # Short option has higher precedence
+  if [[ -n $short_opt ]] && (( ${+_opts[-${short_opt}]} )); then
+    REPLY="${_opts[-${short_opt}]}"
+    matched=1
   fi
 
-  # Then check long option (only if short didn't match)
-  if [[ $resolved_value == $default_value && -n $long_opt ]]; then
-    local key="--${long_opt}"
-    if (( ${(P)+${opts_var}[$key]} )); then
-      resolved_value="${(P)${opts_var}[$key]}"
-    fi
+  # Long option — only when short did not match
+  if (( !matched )) && [[ -n $long_opt ]] && (( ${+_opts[--${long_opt}]} )); then
+    REPLY="${_opts[--${long_opt}]}"
   fi
 
-  print -r -- "$resolved_value"
   return 0
 }
 
 ###
-# Check if option flag is present in parsed zparseopts
+# Test whether a flag is present in a zparseopts-produced associative array.
 #
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Short option name WITHOUT dash (e.g., 'f') - can be empty
-# @param 3: string - Long option name WITHOUT dashes (e.g., 'force') - can be empty
-# @return 0 if present, 1 if not
+# Uses ${${(P)opts_var}[(I)key]} for direct indirect key-existence check —
+# no full-array copy required.
 #
-# @note: Expects opts array keys to include dashes (e.g., '-f', '--force')
-#        as produced by zparseopts or manual assignment
+# @param 1: string  - Name of the local -A array
+# @param 2: string  - Short flag letter WITHOUT dash; may be ""
+# @param 3: string  - Long  flag name  WITHOUT dashes; may be ""
+# @return 0 if present, 1 if absent
 #
 # @example
 #   local -A opts
 #   zparseopts -D -E -A opts -- f -force
 #   if z::opt::has opts 'f' 'force'; then
-#     echo "Force flag is set"
+#     echo "force is set"
 #   fi
 ###
 z::opt::has()
@@ -98,27 +103,22 @@ z::opt::has()
 
   local opts_var="$1" short_opt="$2" long_opt="$3"
 
-  # Validate opts_var exists
   if [[ -z $opts_var ]]; then
-    z::log::error "z::opt::has: opts_var parameter required"
+    z::log::error "z::opt::has: opts_var parameter required" \
+      param "opts_var"
     return 1
   fi
 
-  # Check if the variable exists and is an associative array
   if (( ! ${(P)+opts_var} )) || [[ ${(Pt)opts_var} != *association* ]]; then
     return 1
   fi
 
-  # Create local reference to the associative array
-  local -A opts_ref
-  opts_ref=("${(@Pkv)opts_var}")
-
-  # Check if either short or long option exists
-  if [[ -n $short_opt ]] && (( ${+opts_ref[-${short_opt}]} )); then
+  # Direct indirect key-existence — O(1), no array copy
+  if [[ -n $short_opt ]] && (( ${${(P)opts_var}[(I)-${short_opt}]} )); then
     return 0
   fi
 
-  if [[ -n $long_opt ]] && (( ${+opts_ref[--${long_opt}]} )); then
+  if [[ -n $long_opt ]] && (( ${${(P)opts_var}[(I)--${long_opt}]} )); then
     return 0
   fi
 
@@ -126,218 +126,213 @@ z::opt::has()
 }
 
 ###
-# Parse --force/-f flag with optional config fallback
+# Parse a generic boolean flag: present → 1, absent → 0.
 #
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Config key for fallback (optional, e.g., 'alias.force_overwrite')
-# @param 3: int - Default value if config not set (default: 0)
-# @output: int - Resolved force value (0 or 1)
-# @return 0 always
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- f -force
-#   typeset -i force
-#   (( force = $(z::opt::parse::force opts 'alias.force_overwrite' 0) ))
-###
-z::opt::parse::force()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local opts_var="$1" config_key="${2:-}"
-  typeset -i default_value force_value
-  (( default_value = ${3:-0} ))
-  (( force_value = default_value ))
-
-  # Check if flag is present
-  if z::opt::has "$opts_var" 'f' 'force'; then
-    (( force_value = 1 ))
-  # Check config fallback if provided and flag not set
-  elif [[ -n $config_key ]]; then
-    local config_result
-    config_result=$(z::config::get "$config_key" "$default_value")
-    (( force_value = config_result ))
-  fi
-
-  print -r -- "$force_value"
-  return 0
-}
-
-###
-# Parse --dry-run flag with optional config fallback
-#
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Config key for fallback (optional)
-# @param 3: int - Default value if config not set (default: 0)
-# @output: int - Resolved dry-run value (0 or 1)
-# @return 0 always
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- n -dry-run
-#   typeset -i dryrun
-#   (( dryrun = $(z::opt::parse::dryrun opts) ))
-###
-z::opt::parse::dryrun()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  local opts_var="$1" config_key="${2:-}"
-  typeset -i default_value dryrun_value
-  (( default_value = ${3:-0} ))
-  (( dryrun_value = default_value ))
-
-  # Check if flag is present
-  if z::opt::has "$opts_var" 'n' 'dry-run'; then
-    (( dryrun_value = 1 ))
-  # Check config fallback if provided
-  elif [[ -n $config_key ]]; then
-    local config_result
-    config_result=$(z::config::get "$config_key" "$default_value")
-    (( dryrun_value = config_result ))
-  fi
-
-  print -r -- "$dryrun_value"
-  return 0
-}
-
-###
-# Parse --verbose/-v flag with optional config fallback
-#
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Config key for fallback (optional)
-# @param 3: int - Default value if config not set (default: 0)
-# @output: int - Resolved verbose value (0 or 1)
-# @return 0 always
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- v -verbose
-#   typeset -i verbose
-#   (( verbose = $(z::opt::parse::verbose opts) ))
-###
-z::opt::parse::verbose()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local opts_var="$1" config_key="${2:-}"
-  typeset -i default_value verbose_value
-  (( default_value = ${3:-0} ))
-  (( verbose_value = default_value ))
-
-  # Check if flag is present
-  if z::opt::has "$opts_var" 'v' 'verbose'; then
-    (( verbose_value = 1 ))
-  # Check config fallback if provided
-  elif [[ -n $config_key ]]; then
-    local config_result
-    config_result=$(z::config::get "$config_key" "$default_value")
-    (( verbose_value = config_result ))
-  fi
-
-  print -r -- "$verbose_value"
-  return 0
-}
-
-###
-# Parse --quiet/-q flag with optional config fallback
-#
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Config key for fallback (optional)
-# @param 3: int - Default value if config not set (default: 0)
-# @output: int - Resolved quiet value (0 or 1)
-# @return 0 always
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- q -quiet
-#   typeset -i quiet
-#   (( quiet = $(z::opt::parse::quiet opts) ))
-###
-z::opt::parse::quiet()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local opts_var="$1" config_key="${2:-}"
-  typeset -i default_value quiet_value
-  (( default_value = ${3:-0} ))
-  (( quiet_value = default_value ))
-
-  # Check if flag is present
-  if z::opt::has "$opts_var" 'q' 'quiet'; then
-    (( quiet_value = 1 ))
-  # Check config fallback if provided
-  elif [[ -n $config_key ]]; then
-    local config_result
-    config_result=$(z::config::get "$config_key" "$default_value")
-    (( quiet_value = config_result ))
-  fi
-
-  print -r -- "$quiet_value"
-  return 0
-}
-
-###
-# Parse generic boolean flag (present=1, absent=0)
-#
-# @param 1: string - Name of associative array containing parsed opts
-# @param 2: string - Short option name WITHOUT dash
-# @param 3: string - Long option name WITHOUT dashes
-# @output: int - 1 if present, 0 if absent
+# @param 1: string  - Name of the local -A array
+# @param 2: string  - Short flag letter WITHOUT dash
+# @param 3: string  - Long  flag name  WITHOUT dashes
+# @sets  REPLY      - "1" if present, "0" if absent
 # @return 0 always
 #
 # @example
 #   local -A opts
 #   zparseopts -D -E -A opts -- r -recursive
-#   typeset -i recursive
-#   (( recursive = $(z::opt::parse::bool opts 'r' 'recursive') ))
+#   z::opt::parse::bool opts 'r' 'recursive'
+#   typeset -i recursive=$REPLY
 ###
 z::opt::parse::bool()
 {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if z::opt::has "$@"; then
-    print -r -- "1"
+  local opts_var="$1"
+
+  if [[ -z $opts_var ]]; then
+    z::log::error "z::opt::parse::bool: opts_var parameter required" \
+      param "opts_var"
+    REPLY=0
+    return 0
+  fi
+
+  if z::opt::has "$opts_var" "${2:-}" "${3:-}"; then
+    REPLY=1
   else
-    print -r -- "0"
+    REPLY=0
   fi
 
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Internal helper — shared implementation for all single-flag boolean helpers.
+#
+# Config fallback is intentionally absent: z::opt::* has no dependency on
+# z::config::*. Callers that need a config fallback must wire it themselves:
+#
+#   z::opt::parse::force opts
+#   if (( !REPLY )); then
+#     z::config::get 'app.force' 0
+#     typeset -i force=$REPLY
+#   else
+#     typeset -i force=$REPLY
+#   fi
+#
+# @param 1: string  - opts_var name
+# @param 2: string  - short flag (without dash)
+# @param 3: string  - long  flag (without dashes)
+# @param 4: int     - default value: 0 or 1
+# @param 5: string  - caller name for error messages
+# @sets  REPLY      - resolved integer value: 0 or 1
+# @return 0 always
+# ---------------------------------------------------------------------------
+_z::opt::parse::flag()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local opts_var="$1" short_flag="$2" long_flag="$3"
+  local caller_name="${5:-z::opt::parse::flag}"
+  typeset -i default_val flag_val
+  (( default_val = ${4:-0} ))
+  (( flag_val    = default_val ))
+
+  if [[ -z $opts_var ]]; then
+    z::log::error "${caller_name}: opts_var parameter required" \
+      param "opts_var"
+    REPLY=$flag_val
+    return 0
+  fi
+
+  if z::opt::has "$opts_var" "$short_flag" "$long_flag"; then
+    (( flag_val = 1 ))
+  fi
+
+  REPLY=$flag_val
+  return 0
+}
 
 ###
-# Validate identifier name (alphanumeric, underscore, hyphen)
-# Used for: alias names, function names, variable names, config keys, etc.
+# Parse --force / -f.
 #
-# @param 1: string - Name to validate
-# @param 2: string - Context description (for error messages, default: "Identifier")
+# @param 1: string  - Name of the local -A array
+# @param 2: int     - Default value when flag absent (default: 0)
+# @sets  REPLY      - 0 or 1
+# @return 0 always
+#
+# @note  No config fallback. To add one:
+#          z::opt::parse::force opts
+#          if (( !REPLY )); then z::config::get 'app.force' 0; fi
+#          typeset -i force=$REPLY
+#
+# @example
+#   local -A opts
+#   zparseopts -D -E -A opts -- f -force
+#   z::opt::parse::force opts
+#   typeset -i force=$REPLY
+###
+z::opt::parse::force()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::opt::parse::flag "$1" 'f' 'force' "${2:-0}" 'z::opt::parse::force'
+}
+
+###
+# Parse --dry-run / -n.
+#
+# @param 1: string  - Name of the local -A array
+# @param 2: int     - Default value when flag absent (default: 0)
+# @sets  REPLY      - 0 or 1
+# @return 0 always
+#
+# @example
+#   local -A opts
+#   zparseopts -D -E -A opts -- n -dry-run
+#   z::opt::parse::dryrun opts
+#   typeset -i dryrun=$REPLY
+###
+z::opt::parse::dryrun()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::opt::parse::flag "$1" 'n' 'dry-run' "${2:-0}" 'z::opt::parse::dryrun'
+}
+
+###
+# Parse --verbose / -v.
+#
+# @param 1: string  - Name of the local -A array
+# @param 2: int     - Default value when flag absent (default: 0)
+# @sets  REPLY      - 0 or 1
+# @return 0 always
+#
+# @example
+#   local -A opts
+#   zparseopts -D -E -A opts -- v -verbose
+#   z::opt::parse::verbose opts
+#   typeset -i verbose=$REPLY
+###
+z::opt::parse::verbose()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::opt::parse::flag "$1" 'v' 'verbose' "${2:-0}" 'z::opt::parse::verbose'
+}
+
+###
+# Parse --quiet / -q.
+#
+# @param 1: string  - Name of the local -A array
+# @param 2: int     - Default value when flag absent (default: 0)
+# @sets  REPLY      - 0 or 1
+# @return 0 always
+#
+# @example
+#   local -A opts
+#   zparseopts -D -E -A opts -- q -quiet
+#   z::opt::parse::quiet opts
+#   typeset -i quiet=$REPLY
+###
+z::opt::parse::quiet()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::opt::parse::flag "$1" 'q' 'quiet' "${2:-0}" 'z::opt::parse::quiet'
+}
+
+# =============================================================================
+# SECTION 2 — Validation  (z::validate::*)
+# =============================================================================
+
+###
+# Validate an identifier name.
+# Accepted characters: alphanumeric, underscore, hyphen  [[:alnum:]_-]
+#
+# @param 1: string  - Name to validate
+# @param 2: string  - Context label for error messages (default: "Identifier")
 # @return 0 if valid, 1 if invalid
 #
 # @example
-#   if z::validate::identifier "$alias_name" "Alias name"; then
-#     # name is valid
-#   fi
+#   z::validate::identifier "$alias_name" "Alias name" || return 1
 ###
 z::validate::identifier()
 {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-
   local name="$1" context="${2:-Identifier}"
 
   if [[ -z $name ]]; then
-    z::log::error "${context} cannot be empty"
+    z::log::error "${context} cannot be empty" \
+      field "$context"
     return 1
   fi
 
   if [[ $name != [[:alnum:]_-]## ]]; then
-    z::log::error "Invalid ${context} '${name}': must contain only alphanumeric characters, underscore, or hyphen"
+    z::log::error "Invalid ${context}" \
+      field   "$context"               \
+      value   "$name"                  \
+      allowed "alphanumeric, underscore, hyphen"
     return 1
   fi
 
@@ -345,14 +340,14 @@ z::validate::identifier()
 }
 
 ###
-# Validate non-empty string
+# Validate that a value is non-empty.
 #
-# @param 1: string - Value to validate
-# @param 2: string - Field name (for error messages, default: "Value")
-# @return 0 if valid, 1 if invalid
+# @param 1: string  - Value to validate
+# @param 2: string  - Field label for error messages (default: "Value")
+# @return 0 if non-empty, 1 if empty
 #
 # @example
-#   z::validate::nonempty "$value" "Configuration value" || return 1
+#   z::validate::nonempty "$value" "Config value" || return 1
 ###
 z::validate::nonempty()
 {
@@ -362,7 +357,8 @@ z::validate::nonempty()
   local value="$1" field_name="${2:-Value}"
 
   if [[ -z $value ]]; then
-    z::log::error "${field_name} cannot be empty"
+    z::log::error "${field_name} cannot be empty" \
+      field "$field_name"
     return 1
   fi
 
@@ -370,10 +366,10 @@ z::validate::nonempty()
 }
 
 ###
-# Validate integer value
+# Validate that a value is an integer (optional leading minus sign).
 #
-# @param 1: string - Value to validate
-# @param 2: string - Field name (for error messages, default: "Value")
+# @param 1: string  - Value to validate
+# @param 2: string  - Field label for error messages (default: "Value")
 # @return 0 if valid integer, 1 if invalid
 #
 # @example
@@ -387,7 +383,9 @@ z::validate::integer()
   local value="$1" field_name="${2:-Value}"
 
   if [[ $value != (-[0-9]##|[0-9]##) ]]; then
-    z::log::error "${field_name} must be an integer: '${value}'"
+    z::log::error "${field_name} must be an integer" \
+      field "$field_name"                            \
+      value "$value"
     return 1
   fi
 
@@ -395,18 +393,17 @@ z::validate::integer()
 }
 
 ###
-# Validate integer within range
+# Validate that an integer falls within an inclusive range.
+# Both min and max are independently validated as integers before use.
 #
-# @param 1: string - Value to validate
-# @param 2: int - Minimum value (inclusive)
-# @param 3: int - Maximum value (inclusive)
-# @param 4: string - Field name (for error messages, default: "Value")
+# @param 1: string  - Value to validate
+# @param 2: int     - Minimum value (inclusive)
+# @param 3: int     - Maximum value (inclusive)
+# @param 4: string  - Field label for error messages (default: "Value")
 # @return 0 if valid, 1 if invalid
 #
-# @note: Parameters 2 and 3 must be valid integers
-#
 # @example
-#   z::validate::integer::range "$priority" 0 100 "Priority" || return 1
+#   z::validate::integer::range "$port" 1 65535 "Port" || return 1
 ###
 z::validate::integer::range()
 {
@@ -417,17 +414,27 @@ z::validate::integer::range()
   typeset -i min_val max_val int_value
 
   if [[ -z ${2-} || -z ${3-} ]]; then
-    z::log::error "z::validate::integer::range: min and max parameters required"
+    z::log::error "z::validate::integer::range: min and max parameters required" \
+      param_2 "${2:-<missing>}"                                                   \
+      param_3 "${3:-<missing>}"
     return 1
   fi
 
-  (( min_val = ${2} ))
-  (( max_val = ${3} ))
+  z::validate::integer "$2" "min_val" || return 1
+  z::validate::integer "$3" "max_val" || return 1
+
+  (( min_val   = ${2} ))
+  (( max_val   = ${3} ))
+
   z::validate::integer "$value" "$field_name" || return 1
   (( int_value = value ))
 
   if (( int_value < min_val || int_value > max_val )); then
-    z::log::error "${field_name} must be between ${min_val} and ${max_val}: got ${int_value}"
+    z::log::error "${field_name} out of range" \
+      field "$field_name"                      \
+      value "$int_value"                       \
+      min   "$min_val"                         \
+      max   "$max_val"
     return 1
   fi
 
@@ -435,160 +442,45 @@ z::validate::integer::range()
 }
 
 ###
-# Validate file/directory path exists
+# Validate that a value is one of an allowed set (enum).
 #
-# @param 1: string - Path to validate
-# @param 2: string - Type: 'file', 'dir', or 'any' (default: 'any')
-# @param 3: string - Field name (for error messages, default: "Path")
+# @param 1: string  - Pipe-separated allowed values, e.g. "red|green|blue"
+# @param 2: string  - Value to validate
+# @param 3: string  - Field label for error messages (default: "Value")
 # @return 0 if valid, 1 if invalid
 #
 # @example
-#   z::probe::path "$config_file" 'file' "Config file" || return 1
-###
-z::probe::path()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  local path="$1" path_type="${2:-any}" field_name="${3:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::error "${field_name} cannot be empty"
-    return 1
-  fi
-
-  case $path_type in
-    file)
-      if [[ ! -f $path ]]; then
-        z::log::error "${field_name} does not exist or is not a file: ${path}"
-        return 1
-      fi
-      ;;
-    dir)
-      if [[ ! -d $path ]]; then
-        z::log::error "${field_name} does not exist or is not a directory: ${path}"
-        return 1
-      fi
-      ;;
-    any)
-      if [[ ! -e $path ]]; then
-        z::log::error "${field_name} does not exist: ${path}"
-        return 1
-      fi
-      ;;
-    *)
-      z::log::error "z::probe::path: invalid path_type '${path_type}' (must be file, dir, or any)"
-      return 1
-      ;;
-  esac
-
-  return 0
-}
-
-###
-# Validate path is readable
-#
-# @param 1: string - Path to validate
-# @param 2: string - Field name (for error messages, default: "Path")
-# @return 0 if readable, 1 if not
-#
-# @example
-#   z::probe::path::readable "$input_file" "Input file" || return 1
-###
-z::probe::path::readable()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1" field_name="${2:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::error "${field_name} cannot be empty"
-    return 1
-  fi
-
-  if [[ ! -r $path ]]; then
-    z::log::error "${field_name} is not readable: ${path}"
-    return 1
-  fi
-
-  return 0
-}
-
-###
-# Validate path is writable
-#
-# @param 1: string - Path to validate
-# @param 2: string - Field name (for error messages, default: "Path")
-# @return 0 if writable, 1 if not
-#
-# @example
-#   z::probe::path::writable "$output_file" "Output file" || return 1
-###
-z::probe::path::writable()
-{
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1" field_name="${2:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::error "${field_name} cannot be empty"
-    return 1
-  fi
-
-  # If path exists, check if writable
-  if [[ -e $path ]]; then
-    if [[ ! -w $path ]]; then
-      z::log::error "${field_name} is not writable: ${path}"
-      return 1
-    fi
-  else
-    # If path doesn't exist, check if parent directory is writable
-    local parent_dir="${path:h}"
-    if [[ ! -w $parent_dir ]]; then
-      z::log::error "Cannot write to ${field_name}: parent directory not writable: ${parent_dir}"
-      return 1
-    fi
-  fi
-
-  return 0
-}
-
-###
-# Validate value is in allowed set (enum validation)
-#
-# @param 1: string - Pipe-separated allowed values (e.g., "red|green|blue")
-# @param 2: string - Value to validate
-# @param 3: string - Field name (for error messages, default: "Value")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::validate::enum "regular|global|suffix" "$type" "Alias type" || return 1
+#   z::validate::enum "text|json|csv" "$format" "Output format" || return 1
 ###
 z::validate::enum()
 {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
   local allowed_values="$1" value="$2" field_name="${3:-Value}"
   local -a allowed_array
 
   if [[ -z $allowed_values ]]; then
-    z::log::error "z::validate::enum: allowed_values parameter required"
+    z::log::error "z::validate::enum: allowed_values parameter required" \
+      param "allowed_values"
     return 1
   fi
 
   if [[ -z $value ]]; then
-    z::log::error "${field_name} cannot be empty"
+    z::log::error "${field_name} cannot be empty" \
+      field   "$field_name"                       \
+      allowed "$allowed_values"
     return 1
   fi
 
-  # Split allowed values by pipe
   allowed_array=("${(@s:|:)allowed_values}")
 
-  # Check if value is in allowed set
-  # (Ie) flag: I=index, e=exact match; returns 0 if not found
-  if (( ${allowed_array[(Ie)$value]} == 0 )); then
-    z::log::error "Invalid ${field_name} '${value}': must be one of: ${allowed_values}"
+  # (I) returns last matching index; 0 means not found
+  if (( ${allowed_array[(I)$value]} == 0 )); then
+    z::log::error "Invalid ${field_name}" \
+      field   "$field_name"               \
+      value   "$value"                    \
+      allowed "$allowed_values"
     return 1
   fi
 
@@ -596,11 +488,12 @@ z::validate::enum()
 }
 
 ###
-# Validate boolean value (0, 1, true, false, yes, no, on, off)
+# Validate that a value is a recognised boolean representation.
+# Accepted (case-insensitive): 0, 1, true, false, yes, no, on, off
 #
-# @param 1: string - Value to validate
-# @param 2: string - Field name (for error messages, default: "Value")
-# @return 0 if valid boolean, 1 if invalid
+# @param 1: string  - Value to validate
+# @param 2: string  - Field label for error messages (default: "Value")
+# @return 0 if valid, 1 if invalid
 #
 # @example
 #   z::validate::boolean "$enabled" "Enabled flag" || return 1
@@ -617,8 +510,156 @@ z::validate::boolean()
       return 0
       ;;
     *)
-      z::log::error "Invalid ${field_name} '${value}': must be boolean (0, 1, true, false, yes, no, on, off)"
+      z::log::error "Invalid ${field_name}" \
+        field   "$field_name"               \
+        value   "$value"                    \
+        allowed "0, 1, true, false, yes, no, on, off"
       return 1
       ;;
   esac
+}
+
+# =============================================================================
+# SECTION 3 — Path Probing  (z::probe::*)
+# =============================================================================
+
+###
+# Validate that a path exists, with an optional type constraint.
+#
+# @param 1: string  - Path to test
+# @param 2: string  - Expected type: "file" | "dir" | "any"  (default: "any")
+# @param 3: string  - Field label for error messages (default: "Path")
+# @return 0 if valid, 1 if invalid
+#
+# @example
+#   z::probe::path "$config" file "Config file" || return 1
+#   z::probe::path "$dir"    dir  "Output dir"  || return 1
+###
+z::probe::path()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local path="$1" path_type="${2:-any}" field_name="${3:-Path}"
+
+  if [[ -z $path ]]; then
+    z::log::error "${field_name} cannot be empty" \
+      field "$field_name"
+    return 1
+  fi
+
+  case $path_type in
+    file)
+      if [[ ! -f $path ]]; then
+        z::log::error "${field_name} does not exist or is not a regular file" \
+          field "$field_name"                                                  \
+          path  "$path"
+        return 1
+      fi
+      ;;
+    dir)
+      if [[ ! -d $path ]]; then
+        z::log::error "${field_name} does not exist or is not a directory" \
+          field "$field_name"                                               \
+          path  "$path"
+        return 1
+      fi
+      ;;
+    any)
+      if [[ ! -e $path ]]; then
+        z::log::error "${field_name} does not exist" \
+          field "$field_name"                         \
+          path  "$path"
+        return 1
+      fi
+      ;;
+    *)
+      z::log::error "z::probe::path: invalid path_type" \
+        path_type "$path_type"                           \
+        allowed   "file, dir, any"
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+###
+# Validate that a path is readable by the current process.
+#
+# @param 1: string  - Path to test
+# @param 2: string  - Field label for error messages (default: "Path")
+# @return 0 if readable, 1 if not
+#
+# @example
+#   z::probe::path::readable "$input" "Input file" || return 1
+###
+z::probe::path::readable()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local path="$1" field_name="${2:-Path}"
+
+  if [[ -z $path ]]; then
+    z::log::error "${field_name} cannot be empty" \
+      field "$field_name"
+    return 1
+  fi
+
+  if [[ ! -r $path ]]; then
+    z::log::error "${field_name} is not readable" \
+      field "$field_name"                          \
+      path  "$path"
+    return 1
+  fi
+
+  return 0
+}
+
+###
+# Validate that a path is writable by the current process.
+# If the path does not yet exist, the parent directory is checked instead.
+# Uses Zsh :h modifier — no dirname subprocess.
+#
+# @param 1: string  - Path to test
+# @param 2: string  - Field label for error messages (default: "Path")
+# @return 0 if writable, 1 if not
+#
+# @example
+#   z::probe::path::writable "$output" "Output file" || return 1
+###
+z::probe::path::writable()
+{
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local path="$1" field_name="${2:-Path}"
+
+  if [[ -z $path ]]; then
+    z::log::error "${field_name} cannot be empty" \
+      field "$field_name"
+    return 1
+  fi
+
+  if [[ -e $path ]]; then
+    if [[ ! -w $path ]]; then
+      z::log::error "${field_name} is not writable" \
+        field "$field_name"                          \
+        path  "$path"
+      return 1
+    fi
+  else
+    # Path does not exist yet — check parent directory writability
+    local parent_dir="${path:h}"
+    if [[ ! -w $parent_dir ]]; then
+      z::log::error "${field_name} cannot be created: parent directory not writable" \
+        field      "$field_name" \
+        path       "$path"       \
+        parent_dir "$parent_dir"
+      return 1
+    fi
+  fi
+
+  return 0
 }
