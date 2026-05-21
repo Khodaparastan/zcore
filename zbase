@@ -2,20 +2,32 @@
 # =============================================================================
 # zbase — z::opt  &  z::probe
 #
-# Option parsing and filesystem probing utilities.
+# Description:
+#   Option parsing, input validation, filesystem probing, command/function
+#   introspection, variable management, environment management, and execution
+#   safety scanning utilities for the zbase framework.
 #
-# Dependencies (ONLY):
+# Usage:
+#   Source this file from within a zsh session or framework loader:
+#     source /path/to/zbase.zsh
+#
+# Conventions:
+#   - Functions that return a value set $REPLY.
+#     Callers MUST read $REPLY — never use $() on these functions.
+#   - Internal (private) functions are prefixed with _z::
+#
+# Dependencies:
 #   z::log::error  z::log::warn  z::log::debug  z::log::if_debug
 #   Zsh 5.8+
 #
 # No dependency on z::config, z::kv, z::sys, z::event, or any other module.
 #
-# Convention: functions that return a value set $REPLY.
-#             Callers MUST read $REPLY — never use $() on these functions.
+# Author: Khodaparastan
+# Date:   2026-04-21
 # =============================================================================
 
 # =============================================================================
-# SECTION 1 — Option Parsing  (z::opt::*)
+# SECTION 1 — OPTION PARSING  (z::opt::*)
 # =============================================================================
 
 ###
@@ -301,7 +313,7 @@ z::opt::parse::quiet()
 }
 
 # =============================================================================
-# SECTION 2 — Validation  (z::validate::*)
+# SECTION 2 — VALIDATION  (z::validate::*)
 # =============================================================================
 
 ###
@@ -328,6 +340,7 @@ z::validate::identifier()
     return 1
   fi
 
+  # [[:alnum:]_-]## — extendedglob: one or more of the allowed character class
   if [[ $name != [[:alnum:]_-]## ]]; then
     z::log::error "Invalid ${context}" \
       field   "$context"               \
@@ -382,6 +395,7 @@ z::validate::integer()
 
   local value="$1" field_name="${2:-Value}"
 
+  # Pattern: optional leading minus followed by one or more digits
   if [[ $value != (-[0-9]##|[0-9]##) ]]; then
     z::log::error "${field_name} must be an integer" \
       field "$field_name"                            \
@@ -473,9 +487,10 @@ z::validate::enum()
     return 1
   fi
 
+  # (s:|:) — split on literal pipe character
   allowed_array=("${(@s:|:)allowed_values}")
 
-  # (I) returns last matching index; 0 means not found
+  # (I) returns the last matching index; 0 means not found
   if (( ${allowed_array[(I)$value]} == 0 )); then
     z::log::error "Invalid ${field_name}" \
       field   "$field_name"               \
@@ -505,6 +520,7 @@ z::validate::boolean()
 
   local value="$1" field_name="${2:-Value}"
 
+  # :l — lowercase modifier; avoids a separate tolower call
   case "${value:l}" in
     0|1|true|false|yes|no|on|off)
       return 0
@@ -520,7 +536,7 @@ z::validate::boolean()
 }
 
 # =============================================================================
-# SECTION 3 — Path Probing  (z::probe::*)
+# SECTION 3 — PATH PROBING  (z::probe::*)
 # =============================================================================
 
 ###
@@ -651,7 +667,7 @@ z::probe::path::writable()
     fi
   else
     # Path does not exist yet — check parent directory writability
-    local parent_dir="${path:h}"
+    local parent_dir="${path:h}"  # :h is Zsh's equivalent of dirname
     if [[ ! -w $parent_dir ]]; then
       z::log::error "${field_name} cannot be created: parent directory not writable" \
         field      "$field_name" \
@@ -662,4 +678,823 @@ z::probe::path::writable()
   fi
 
   return 0
+}
+# =============================================================================
+# SECTION 4 — COMMAND & FUNCTION PROBING  (z::probe::cmd, z::probe::func,
+#              z::cmd::which, z::func::*)
+# =============================================================================
+
+###
+# Test whether an external command is available in $PATH.
+#
+# Uses $+commands — O(1) Zsh hash lookup, no subprocess.
+#
+# @param 1: string - Command name
+# @return 0 if available, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not found
+#
+# @example
+#   if z::probe::cmd "git"; then ...
+###
+z::probe::cmd() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local cmd="${1:-}"
+
+  z::validate::nonempty "$cmd" "cmd" || return $ZCORE_ERROR_INVALID_INPUT
+
+  # ${+commands[name]} — 1 if key exists in the commands hash, 0 otherwise
+  (( ${+commands[$cmd]} ))
+}
+
+###
+# Return the full path of a command.
+# Sets $REPLY — never use $() to call this function.
+#
+# @param 1:  string - Command name
+# @sets $REPLY      - Full path if found, empty string if not
+# @return 0 if found, ZCORE_ERROR_NOT_FOUND if not found
+#
+# @example
+#   z::cmd::which "git"; local git_path="$REPLY"
+###
+z::cmd::which() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local cmd="${1:-}"
+  REPLY=""
+
+  z::validate::nonempty "$cmd" "cmd" || return $ZCORE_ERROR_INVALID_INPUT
+
+  if ! z::probe::cmd "$cmd"; then
+    z::log::error "Command not found" cmd "$cmd"
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  REPLY="${commands[$cmd]}"
+  return 0
+}
+
+###
+# Test whether a Zsh function is defined in the current session.
+#
+# Uses $+functions — O(1) Zsh hash lookup, no subprocess.
+#
+# @param 1: string - Function name
+# @return 0 if defined, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not found
+#
+# @example
+#   if z::probe::func "my::handler"; then ...
+###
+z::probe::func() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local func="${1:-}"
+
+  z::validate::nonempty "$func" "func" || return $ZCORE_ERROR_INVALID_INPUT
+
+  # ${+functions[name]} — 1 if function is defined, 0 otherwise
+  (( ${+functions[$func]} ))
+}
+
+###
+# Call a function by name with arguments.
+# Validates existence before calling — no special-case suppression lists.
+# PIL3 event emission is the caller's responsibility.
+#
+# @param 1:   string - Function name
+# @param ...: any    - Arguments forwarded to the function
+# @return Function exit code, or ZCORE_ERROR_* on validation failure
+#
+# @example
+#   z::func::call "my::handler" arg1 arg2
+###
+z::func::call() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local func="${1:-}"
+
+  z::validate::nonempty "$func" "func" || return $ZCORE_ERROR_INVALID_INPUT
+  shift
+
+  if ! z::probe::func "$func"; then
+    z::log::warn "Function not found" func "$func"
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  typeset -i exit_code=0
+  "$func" "$@" || exit_code=$?
+
+  if (( exit_code != 0 )); then
+    z::log::debug "Function returned non-zero" func "$func" exit_code "$exit_code"
+  fi
+
+  return $exit_code
+}
+
+###
+# Unset a function by name.
+#
+# @param 1: string - Function name
+# @return 0 on success, ZCORE_ERROR_* on failure
+#
+# @example
+#   z::func::unset "my::old::handler"
+###
+z::func::unset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local target="${1:-}"
+
+  z::validate::nonempty "$target" "func" || return $ZCORE_ERROR_INVALID_INPUT
+
+  if ! (( ${+functions[$target]} )); then
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  if unset -f -- "$target"; then
+    z::log::debug "Function unset" func "$target"
+    return 0
+  fi
+
+  return $ZCORE_ERROR_GENERAL
+}
+
+###
+# List all defined functions matching a glob pattern.
+#
+# @param 1: string - Glob pattern (optional, default: *)
+# @stdout  One function name per line, sorted
+# @return 0 always
+#
+# @example
+#   z::func::list "z::kv::*"
+###
+z::func::list() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local pattern="${1:-*}"
+
+  # (Mok) — M: keep only matching, o: sort ascending, k: keys of functions hash
+  # ${~pattern} — force glob expansion of the pattern variable
+  local func
+  for func in ${(Mok)functions:#${~pattern}}; do
+    print -r -- "$func"
+  done
+  return 0
+}
+
+# =============================================================================
+# SECTION 5 — VARIABLE MANAGEMENT  (z::probe::var, z::var::*)
+# =============================================================================
+
+###
+# Test whether a parameter (variable) is defined.
+#
+# @param 1: string - Variable name
+# @return 0 if defined, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not defined
+#
+# @example
+#   if z::probe::var "MY_CONFIG"; then ...
+###
+z::probe::var() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local name="${1:-}"
+
+  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
+
+  # ${+parameters[name]} — 1 if the parameter is set, 0 otherwise
+  (( ${+parameters[$name]} ))
+}
+
+###
+# Get the value of a variable by name.
+# Sets $REPLY — never use $() to call this function.
+#
+# @param 1: string - Variable name
+# @param 2: string - Default value if variable is not defined (default: "")
+# @sets $REPLY     - Variable value or default
+# @return 0 always
+#
+# @example
+#   z::var::get "MY_TIMEOUT" "30"; local timeout="$REPLY"
+###
+z::var::get() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local name="${1:-}" default="${2:-}"
+  REPLY="$default"
+
+  if [[ -z $name ]]; then
+    return 0
+  fi
+
+  if z::probe::var "$name"; then
+    REPLY="${(P)name}"  # (P) — indirect expansion: value of the variable named by $name
+  fi
+
+  return 0
+}
+
+###
+# Set a global variable by name.
+#
+# @param 1: string - Variable name
+# @param 2: string - Value to assign
+# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if name is empty
+#
+# @example
+#   z::var::set "MY_CONFIG" "/etc/app.conf"
+###
+z::var::set() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local name="${1:-}" value="${2:-}"
+
+  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
+
+  typeset -g "$name=$value"
+  z::log::debug "Variable set" name "$name" value "$value"
+
+  return 0
+}
+
+###
+# Unset a variable by name.
+# Refuses to unset readonly variables.
+#
+# @param 1: string - Variable name
+# @return 0 on success, ZCORE_ERROR_* on failure
+#
+# @example
+#   z::var::unset "MY_TEMP_VAR"
+###
+z::var::unset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local target="${1:-}"
+
+  z::validate::nonempty "$target" "name" || return $ZCORE_ERROR_INVALID_INPUT
+
+  if ! (( ${+parameters[$target]} )); then
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  # (tP) — parameter type flags via indirect expansion; check for readonly
+  if [[ ${(tP)target} == *readonly* ]]; then
+    z::log::error "Cannot unset readonly variable" name "$target"
+    return $ZCORE_ERROR_PERMISSION
+  fi
+
+  if unset -v -- "$target"; then
+    z::log::debug "Variable unset" name "$target"
+    return 0
+  fi
+
+  return $ZCORE_ERROR_GENERAL
+}
+
+# =============================================================================
+# SECTION 6 — FILESYSTEM CONVENIENCE PROBES
+#
+# Thin wrappers that extend z::probe::* with full setopt guards.
+# These complement z::probe::path — they are silent boolean checks
+# with no error emission (callers decide how to handle failure).
+# =============================================================================
+
+###
+# Test whether a path is a regular file.
+#
+# @param 1: string - Path to test
+# @return 0 if regular file, 1 otherwise
+###
+z::probe::file() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  [[ -f ${1:-} ]]
+}
+
+###
+# Test whether a path is a directory.
+#
+# @param 1: string - Path to test
+# @return 0 if directory, 1 otherwise
+###
+z::probe::dir() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  [[ -d ${1:-} ]]
+}
+
+###
+# Test whether a path is readable.
+#
+# @param 1: string - Path to test
+# @return 0 if readable, 1 otherwise
+###
+z::file::readable() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  [[ -r ${1:-} ]]
+}
+
+###
+# Test whether a path is writable.
+#
+# @param 1: string - Path to test
+# @return 0 if writable, 1 otherwise
+###
+z::file::writable() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  [[ -w ${1:-} ]]
+}
+
+# =============================================================================
+# SECTION 7 — ENVIRONMENT MANAGEMENT  (z::env::*)
+#
+# Path normalization uses only tilde expansion via parameter substitution
+# and the :A modifier for absolute path resolution — no subprocesses.
+# =============================================================================
+
+###
+# Normalize a path using pure Zsh.
+# Handles ~, ~+, ~-, and relative paths.
+# Sets $REPLY to the normalized absolute path.
+#
+# @param 1:  string - Path to normalize
+# @sets $REPLY      - Normalized absolute path
+# @return 0 always
+# @private
+###
+_z::env::normalize_path() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local path="$1"
+  REPLY=""
+
+  case $path in
+    '~')         path="$HOME"                      ;;
+    '~/'*)       path="${HOME}/${path#~/}"          ;;
+    '~+'|'~+/'*) path="${PWD}${path#\~+}"           ;;  # ~+ expands to $PWD
+    '~-'|'~-/'*) path="${OLDPWD:-$PWD}${path#\~-}"  ;;  # ~- expands to $OLDPWD
+    [^/]*)       path="${PWD%/}/$path"              ;;  # relative path — prepend CWD
+  esac
+
+  # :A — resolve symlinks and canonicalize to absolute path (no subprocess)
+  REPLY="${path:A}"
+  return 0
+}
+
+###
+# Add a directory to PATH.
+# Normalizes path using pure Zsh — no PIL2 dependency.
+# Skips silently if directory does not exist or is already in PATH.
+#
+# @param 1: string - Directory path
+# @param 2: string - Position: "prepend" | "append" (default: "append")
+# @return 0 on success, ZCORE_ERROR_* on failure
+#
+# @example
+#   z::env::path_add "$HOME/.local/bin" prepend
+###
+z::env::path_add() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local dir="${1:-}"
+  local position="${2:-append}"
+
+  z::validate::nonempty "$dir" "dir" || return $ZCORE_ERROR_INVALID_INPUT
+  z::validate::enum "prepend|append" "$position" "position" || return $ZCORE_ERROR_INVALID_INPUT
+
+  _z::env::normalize_path "$dir"
+  dir="$REPLY"
+
+  if [[ ! -d $dir ]]; then
+    z::log::debug "Directory does not exist, skipping PATH add" dir "$dir"
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  # Sentinel colons prevent false partial matches (e.g. /usr matching /usr/local)
+  if [[ ":${PATH}:" == *":${dir}:"* ]]; then
+    z::log::debug "Directory already in PATH" dir "$dir"
+    return 0
+  fi
+
+  case $position in
+    prepend) export PATH="${dir}:${PATH}" ;;
+    append)  export PATH="${PATH}:${dir}" ;;
+  esac
+
+  # Flush the command hash table so newly added paths are found immediately
+  builtin hash -r 2>/dev/null || true
+
+  z::log::debug "Added to PATH" dir "$dir" position "$position"
+  return 0
+}
+
+###
+# Remove a directory from PATH.
+# Normalizes path using pure Zsh.
+#
+# @param 1: string - Directory path to remove
+# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if empty
+#
+# @example
+#   z::env::path_remove "$HOME/.local/bin"
+###
+z::env::path_remove() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local dir="${1:-}"
+
+  z::validate::nonempty "$dir" "dir" || return $ZCORE_ERROR_INVALID_INPUT
+
+  _z::env::normalize_path "$dir"
+  dir="$REPLY"
+
+  # Split PATH on ':', filter out the target dir, then rejoin with ':'
+  local -a path_array
+  path_array=("${(s.:.)PATH}")
+  path_array=("${path_array[@]:#$dir}")
+  export PATH="${(j.:.)path_array}"
+
+  # Flush the command hash table after modifying PATH
+  builtin hash -r 2>/dev/null || true
+
+  z::log::debug "Removed from PATH" dir "$dir"
+  return 0
+}
+
+###
+# Test whether a directory is in PATH.
+#
+# @param 1: string - Directory path
+# @return 0 if present, ZCORE_ERROR_INVALID_INPUT if empty, 1 if absent
+###
+z::env::path_has() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local dir="${1:-}"
+
+  z::validate::nonempty "$dir" "dir" || return $ZCORE_ERROR_INVALID_INPUT
+
+  # Sentinel colons prevent false partial matches
+  [[ ":${PATH}:" == *":${dir}:"* ]]
+}
+
+###
+# Create a shell alias.
+#
+# @param 1: string - Alias name (no spaces, no = sign)
+# @param 2: string - Alias value
+# @return 0 on success, ZCORE_ERROR_* on failure
+#
+# @example
+#   z::env::alias_set "ll" "ls -lah"
+###
+z::env::alias_set() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local alias_name="${1:-}" alias_value="${2:-}"
+
+  z::validate::nonempty "$alias_name"  "alias_name"  || return $ZCORE_ERROR_INVALID_INPUT
+  z::validate::nonempty "$alias_value" "alias_value" || return $ZCORE_ERROR_INVALID_INPUT
+
+  if [[ $alias_name == *[[:space:]=]* ]]; then
+    z::log::error "Invalid alias name: contains spaces or equals sign" \
+      name "$alias_name"
+    return $ZCORE_ERROR_INVALID_INPUT
+  fi
+
+  if ! builtin alias "${alias_name}=${alias_value}"; then
+    z::log::error "Failed to create alias" name "$alias_name"
+    return $ZCORE_ERROR_GENERAL
+  fi
+
+  z::log::debug "Alias created" name "$alias_name" value "$alias_value"
+  return 0
+}
+
+###
+# Remove a shell alias.
+#
+# @param 1: string - Alias name
+# @return 0 on success, ZCORE_ERROR_* on failure
+#
+# @example
+#   z::env::alias_unset "ll"
+###
+z::env::alias_unset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local alias_name="${1:-}"
+
+  z::validate::nonempty "$alias_name" "alias_name" || return $ZCORE_ERROR_INVALID_INPUT
+
+  if ! builtin unalias "$alias_name"; then
+    z::log::debug "Alias not found" name "$alias_name"
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+
+  z::log::debug "Alias removed" name "$alias_name"
+  return 0
+}
+
+###
+# Export a variable to the environment.
+#
+# @param 1: string - Variable name
+# @param 2: string - Value
+# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if name is empty
+#
+# @example
+#   z::env::export "APP_ENV" "production"
+###
+z::env::export() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local name="${1:-}" value="${2:-}"
+
+  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
+
+  export "$name=$value"
+  z::log::debug "Variable exported" name "$name" value "$value"
+  return 0
+}
+
+# =============================================================================
+# SECTION 8 — EXECUTION SAFETY VALIDATORS  (_z::exec::*, z::exec::scan,
+#              z::exec::is_safe)
+#
+# Pure safety analysis — no side effects beyond logging.
+# =============================================================================
+
+###
+# Detect shell tool init commands — these are exempt from safety scanning
+# as they are known-safe patterns from trusted tools.
+#
+# @param 1: string - Command string to test
+# @return 0 if init command, 1 otherwise
+# @private
+###
+_z::exec::is_init_cmd() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local input="$1"
+  # Match known shell-tool initializers (e.g. "starship init zsh", "mise init")
+  [[ $input =~ '(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)' ]]
+}
+
+###
+# Detect dangerous shell metacharacters in a command string.
+#
+# @param 1: string - Command string to test
+# @return 0 if dangerous chars found, 1 if clean
+# @private
+###
+_z::exec::has_dangerous_metachars() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local input="$1"
+  [[ -z $input ]] && return 1
+  # Semicolons, ampersands, parens, and backticks can chain or subshell commands
+  [[ $input =~ '[;&()]' ]] || [[ $input == *'`'* ]]
+}
+
+###
+# Check a single parsed command segment for dangerous patterns.
+# Currently detects: destructive rm -rf on root paths, dd to block devices.
+#
+# @param 1:   string - Command name
+# @param ...: string - Command arguments
+# @return 0 if safe, 1 if dangerous
+# @private
+###
+_z::exec::check_segment() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local cmd="$1"
+  shift
+  local -a args=("$@")
+
+  if [[ $cmd == rm ]]; then
+    typeset -i have_r=0 have_f=0
+    local a
+    for a in "${args[@]}"; do
+      if [[ $a == --* ]]; then
+        continue                          # skip long options (e.g. --recursive)
+      elif [[ $a == -* ]]; then
+        [[ $a == *r* ]] && (( have_r = 1 ))
+        [[ $a == *f* ]] && (( have_f = 1 ))
+        continue
+      fi
+    done
+    # Only dangerous when both -r and -f are present
+    if (( have_r && have_f )); then
+      for a in "${args[@]}"; do
+        case $a in
+          /|/*|~|~/*|'$HOME'|'$HOME'/*)
+            z::log::error "Dangerous rm detected" \
+              cmd  "rm" \
+              path "$a"
+            return 1
+            ;;
+        esac
+      done
+    fi
+  fi
+
+  if [[ $cmd == dd ]]; then
+    local kv dev base
+    for kv in "${args[@]}"; do
+      if [[ $kv == of=/dev/* ]]; then
+        dev="${kv#of=}"
+        base="${dev#/dev/}"
+        # Match common raw block device name patterns
+        case $base in
+          sd*|hd*|nvme*|disk*|rdisk*)
+            z::log::error "Dangerous dd detected" \
+              cmd    "dd" \
+              device "$dev"
+            return 1
+            ;;
+        esac
+      fi
+    done
+  fi
+
+  return 0
+}
+
+###
+# Scan a full command string for dangerous patterns.
+# Tokenizes via Zsh (z) flag — no subprocess.
+# Checks: pipe-to-shell, fork bomb, per-segment dangerous commands.
+#
+# @param 1: string - Command string to scan
+# @return 0 if safe, 1 if dangerous pattern detected
+# @private
+###
+_z::exec::scan_patterns() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local input="${1:-}"
+  [[ -z $input ]] && return 0
+
+  if _z::exec::is_init_cmd "$input"; then
+    return 0
+  fi
+
+  # (z) — tokenize using shell word-splitting rules, no subprocess
+  local -a words
+  words=(${(z)input})
+  (( ${#words} == 0 )) && return 0
+
+  typeset -i i j
+  local next_cmd base
+
+  # Scan for pipe-to-shell patterns: cmd | sh / bash / zsh / etc.
+  for (( i = 1; i <= ${#words}; i++ )); do
+    if [[ ${words[i]} == '|' ]]; then
+      (( j = i + 1 ))
+      next_cmd=""
+      while (( j <= ${#words} )); do
+        case ${words[j]} in
+          '|'|'||'|'&&'|';'|'&') break ;;
+          # Skip command prefixes that don't change the effective command
+          nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
+            (( j += 1 ))
+            continue
+            ;;
+          # Skip leading VAR=value assignments
+          [[:alpha:]_][[:alnum:]_]*=*)
+            (( j += 1 ))
+            continue
+            ;;
+        esac
+        next_cmd="${words[j]}"
+        break
+      done
+      if [[ -n ${next_cmd:-} ]]; then
+        base="${next_cmd:t}"  # :t — tail (basename) of the path
+        case $base in
+          sh|bash|zsh|ksh|dash)
+            z::log::error "Dangerous pattern: pipe to shell" \
+              shell "$base" \
+              input "$input"
+            return 1
+            ;;
+        esac
+      fi
+    fi
+  done
+
+  # Detect fork bomb pattern: :() { :|: & }
+  if [[ $input =~ ':\(\)' && $input =~ ':\|:' ]]; then
+    z::log::error "Dangerous pattern: fork bomb detected" input "$input"
+    return 1
+  fi
+
+  # Walk tokens and dispatch each pipeline segment to _z::exec::check_segment
+  local -a seg=()
+  local w
+  for w in "${words[@]}"; do
+    case $w in
+      '|'|'||'|'&&'|';'|'&')
+        # Segment boundary — check accumulated segment, then reset
+        if (( ${#seg} )); then
+          local cmd="${seg[1]}"
+          local -a args=("${(@)seg[2,-1]}")
+          _z::exec::check_segment "$cmd" "${args[@]}" || return 1
+          seg=()
+        fi
+        ;;
+      # Skip command prefixes only at the start of a segment
+      nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
+        if (( ${#seg} == 0 )); then
+          continue
+        else
+          seg+=("$w")
+        fi
+        ;;
+      # Skip leading VAR=value assignments only at the start of a segment
+      [[:alpha:]_][[:alnum:]_]*=*)
+        if (( ${#seg} == 0 )); then
+          continue
+        else
+          seg+=("$w")
+        fi
+        ;;
+      *)
+        seg+=("$w")
+        ;;
+    esac
+  done
+
+  # Check the final segment (no trailing delimiter)
+  if (( ${#seg} )); then
+    local cmd="${seg[1]}"
+    local -a args=("${(@)seg[2,-1]}")
+    _z::exec::check_segment "$cmd" "${args[@]}" || return 1
+  fi
+
+  return 0
+}
+
+###
+# Public interface: scan a command string for dangerous patterns.
+#
+# @param 1: string - Command string to scan
+# @return 0 if safe, 1 if dangerous, ZCORE_ERROR_INVALID_INPUT if empty
+#
+# @example
+#   z::exec::scan "cat file | bash" || return 1
+###
+z::exec::scan() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local input="${1:-}"
+
+  z::validate::nonempty "$input" "input" || return $ZCORE_ERROR_INVALID_INPUT
+
+  _z::exec::scan_patterns "$input"
+}
+
+###
+# Alias for z::exec::scan — semantic sugar for conditional use.
+#
+# @param 1: string - Command string to test
+# @return 0 if safe, 1 if dangerous
+#
+# @example
+#   if z::exec::is_safe "$cmd"; then z::exec::run "$cmd"; fi
+###
+z::exec::is_safe() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  z::exec::scan "$@"
 }
