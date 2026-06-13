@@ -94,9 +94,18 @@
 
 
 
-emulate -L zsh
-setopt warn_create_global typeset_silent no_unset
-zmodload zsh/datetime 2>/dev/null
+if [[ -z ${ZSH_VERSION-} ]]; then
+  print -r -u2 -- "ERROR: This framework requires Zsh"
+  return 1 2>/dev/null || exit 1
+fi
+
+emulate zsh
+setopt typeset_silent
+
+if ! zmodload zsh/datetime 2>/dev/null; then
+  print -r -u2 -- "zlog: zsh/datetime module is required"
+  return 1 2>/dev/null || exit 1
+fi
 
 ###############################################################################
 # INITIALIZATION GUARD
@@ -343,8 +352,8 @@ __z::log::init_globals() {
 
   # Cache system information
   _zlog_sys_cache[pid]="$$"
-  _zlog_sys_cache[hostname]="${HOST:-$(hostname 2>/dev/null || print unknown)}"
-  _zlog_sys_cache[username]="${USER:-${USERNAME:-$(whoami 2>/dev/null || print unknown)}}"
+  _zlog_sys_cache[hostname]="${HOST:-$(hostname 2>/dev/null || print -r -- unknown)}"
+  _zlog_sys_cache[username]="${USER:-${USERNAME:-$(whoami 2>/dev/null || print -r -- unknown)}}"
 
   # Detect stat command type
   if command -v gstat &>/dev/null; then
@@ -395,7 +404,7 @@ __z::log::init_globals
 ###############################################################################
 
 __z::log::validate_globals() {
-  emulate -R zsh
+  emulate -L zsh
   setopt no_unset
 
   local -i changed=0
@@ -403,13 +412,13 @@ __z::log::validate_globals() {
   # Validate rotate_size
   if (( _zlog_config[rotate_size] < _ZLOG_MIN_ROTATE_SIZE )); then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: rotate_size too small (${_zlog_config[rotate_size]}), setting to ${_ZLOG_MIN_ROTATE_SIZE} bytes"
+      print -r -u2 -- "zlog: Warning: rotate_size too small (${_zlog_config[rotate_size]}), setting to ${_ZLOG_MIN_ROTATE_SIZE} bytes"
     fi
     _zlog_config[rotate_size]=$_ZLOG_MIN_ROTATE_SIZE
     (( changed++ ))
   elif (( _zlog_config[rotate_size] > _ZLOG_MAX_ROTATE_SIZE )); then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: rotate_size too large (${_zlog_config[rotate_size]}), setting to ${_ZLOG_MAX_ROTATE_SIZE} bytes"
+      print -r -u2 -- "zlog: Warning: rotate_size too large (${_zlog_config[rotate_size]}), setting to ${_ZLOG_MAX_ROTATE_SIZE} bytes"
     fi
     _zlog_config[rotate_size]=$_ZLOG_MAX_ROTATE_SIZE
     (( changed++ ))
@@ -427,7 +436,7 @@ __z::log::validate_globals() {
   # Validate log level
   if (( _zlog_config[level] < 0 || _zlog_config[level] > 3 )); then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: invalid log level (${_zlog_config[level]}), resetting to INFO"
+      print -r -u2 -- "zlog: Warning: invalid log level (${_zlog_config[level]}), resetting to INFO"
     fi
     _zlog_config[level]=2
     (( changed++ ))
@@ -436,7 +445,7 @@ __z::log::validate_globals() {
   # Validate file level
   if (( _zlog_config[file_level] < -1 || _zlog_config[file_level] > 3 )); then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: invalid file log level (${_zlog_config[file_level]}), setting to follow console"
+      print -r -u2 -- "zlog: Warning: invalid file log level (${_zlog_config[file_level]}), setting to follow console"
     fi
     _zlog_config[file_level]=-1
     (( changed++ ))
@@ -445,7 +454,7 @@ __z::log::validate_globals() {
   # Validate format
   if [[ "${_zlog_config[format]}" != "text" ]] && [[ "${_zlog_config[format]}" != "json" ]]; then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: invalid format (${_zlog_config[format]}), resetting to text"
+      print -r -u2 -- "zlog: Warning: invalid format (${_zlog_config[format]}), resetting to text"
     fi
     _zlog_config[format]="text"
     (( changed++ ))
@@ -457,7 +466,7 @@ __z::log::validate_globals() {
     (( changed++ ))
   elif (( _zlog_config[rotate_keep] > 100 )); then
     if (( _zlog_config[debug_mode] )); then
-      print -u2 "zlog: Warning: rotate_keep too large (${_zlog_config[rotate_keep]}), setting to 100"
+      print -r -u2 -- "zlog: Warning: rotate_keep too large (${_zlog_config[rotate_keep]}), setting to 100"
     fi
     _zlog_config[rotate_keep]=100
     (( changed++ ))
@@ -527,10 +536,12 @@ __z::log::detect_color_support() {
   fi
 
   # Check for true color support
-  if [[ "${COLORTERM-}" == (truecolor|24bit) ]]; then
-    REPLY="truecolor"
-    return 0
-  fi
+  case "${COLORTERM-}" in
+    truecolor|24bit)
+      REPLY="truecolor"
+      return 0
+      ;;
+  esac
 
   # Check TERM for true color indicators
   if [[ "$term" == *truecolor* ]] || [[ "$term" == *24bit* ]]; then
@@ -605,11 +616,12 @@ __z::log::rgb_to_256() {
   if (( r == g && g == b )); then
     if (( r < 8 )); then
       REPLY="16"  # Black
-    elif (( r > 248 )); then
+    elif (( r >= 248 )); then
       REPLY="231"  # White
     else
       # Grayscale ramp: 232-255 (24 steps)
       REPLY=$(( 232 + (r - 8) / 10 ))
+      (( REPLY > 255 )) && REPLY=255
     fi
     return 0
   fi
@@ -704,7 +716,7 @@ __z::log::init_colors() {
 
   # Verbose initialization
   if [[ -n "${ZLOG_VERBOSE_INIT-}" ]]; then
-    print -u2 "zlog: Initializing color system..."
+    print -r -u2 -- "zlog: Initializing color system..."
   fi
 
   # Detect color support if in auto mode
@@ -729,7 +741,7 @@ __z::log::init_colors() {
     )
 
     if [[ -n "${ZLOG_VERBOSE_INIT-}" ]]; then
-      print -u2 "zlog: Color system ready (mode: none)"
+      print -r -u2 -- "zlog: Color system ready (mode: none)"
     fi
 
     return 0
@@ -851,7 +863,7 @@ __z::log::init_colors() {
   _zlog_colors[bg_success]="${_zlog_colors[bg_bright_green]}"
 
   if [[ -n "${ZLOG_VERBOSE_INIT-}" ]]; then
-    print -u2 "zlog: Color system ready (mode: ${_zlog_color_cache[mode]})"
+    print -r -u2 -- "zlog: Color system ready (mode: ${_zlog_color_cache[mode]})"
   fi
 
   return 0
@@ -865,11 +877,16 @@ z::log::colorize() {
   emulate -L zsh
   setopt localoptions no_unset
 
+  if (( $# < 2 )); then
+    REPLY="${2-}"
+    return 1
+  fi
+
   # Auto-initialize colors on first use
   (( _zlog_color_cache[initialized] )) || __z::log::init_colors
 
-  local color_spec="$1"
-  local text="$2"
+  local color_spec="${1-}"
+  local text="${2-}"
 
   # Normalize RGB spec: remove spaces
   color_spec="${color_spec// /}"
@@ -916,7 +933,12 @@ z::log::set_color_mode() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local mode="$1"
+  local mode="${1-}"
+
+  if [[ -z "$mode" ]]; then
+    print -r -u2 -- "zlog: Color mode cannot be empty (use: auto, none, basic, 256, truecolor)"
+    return 1
+  fi
 
   case "$mode" in
     auto|none|basic|256|truecolor)
@@ -928,7 +950,7 @@ z::log::set_color_mode() {
       return 0
       ;;
     *)
-      print -u2 "zlog: Invalid color mode: $mode (use: auto, none, basic, 256, truecolor)"
+      print -r -u2 -- "zlog: Invalid color mode: $mode (use: auto, none, basic, 256, truecolor)"
       return 1
       ;;
   esac
@@ -958,34 +980,34 @@ z::log::show_colors() {
 
   (( _zlog_color_cache[initialized] )) || __z::log::init_colors
 
-  print "Color Mode: ${_zlog_color_cache[mode]}"
-  print ""
-  print "Basic Colors:"
+  print -r -- "Color Mode: ${_zlog_color_cache[mode]}"
+  print -r -- ""
+  print -r -- "Basic Colors:"
 
   local color
   for color in black red green yellow blue magenta cyan white; do
     z::log::colorize "$color" "  ■ $color"
-    print "$REPLY"
+    print -r -- "$REPLY"
   done
 
-  print ""
-  print "Bright Colors:"
+  print -r -- ""
+  print -r -- "Bright Colors:"
   for color in bright_black bright_red bright_green bright_yellow bright_blue bright_magenta bright_cyan bright_white; do
     z::log::colorize "$color" "  ■ $color"
-    print "$REPLY"
+    print -r -- "$REPLY"
   done
 
-  print ""
-  print "Log Level Colors:"
+  print -r -- ""
+  print -r -- "Log Level Colors:"
   for color in error warn info debug success; do
     z::log::colorize "$color" "  ■ $color"
-    print "$REPLY"
+    print -r -- "$REPLY"
   done
 
-  print ""
-  print "RGB Example (if supported):"
+  print -r -- ""
+  print -r -- "RGB Example (if supported):"
   z::log::colorize "rgb(255,100,50)" "  ■ rgb(255,100,50) - Custom orange"
-  print "$REPLY"
+  print -r -- "$REPLY"
 }
 ###############################################################################
 # INTERNAL DEBUGGING
@@ -1007,7 +1029,7 @@ __z::log::debug_internal() {
     ts="--:--:--"
   fi
 
-  print -u2 "[${ts}] zlog[DEBUG]: $*"
+  print -r -u2 -- "[${ts}] zlog[DEBUG]: $*"
   return 0
 }
 
@@ -1044,10 +1066,10 @@ __z::json::escape() {
   emulate -L zsh
   setopt localoptions extended_glob no_unset
 
-  local input="$1"
+  local input="${1-}"
 
   # Fast path
-  if [[ "$input" != *[\\\"$'\n\r\t\b\f\x00-\x1f']* ]]; then
+  if [[ "$input" != *[\\\"$'\n\r\t\b\f\x00-\x1f\x7f']* ]]; then
     REPLY="$input"
     return 0
   fi
@@ -1146,11 +1168,11 @@ __z::json::validate() {
 ###
 __z::sys::hostname() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt localoptions extended_glob no_unset
 
   # Return cached value if available
   if [[ -n "$_zlog_sys_cache[hostname]" ]]; then
-    REPLY="$_zlog_sys_cache[hostname]"
+    REPLY="${_zlog_sys_cache[hostname]}"
     return 0
   fi
 
@@ -1222,11 +1244,11 @@ __z::sys::pid() {
 ###
 __z::sys::username() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt localoptions extended_glob no_unset
 
   # Return cached value if available
   if [[ -n "$_zlog_sys_cache[username]" ]]; then
-    REPLY="$_zlog_sys_cache[username]"
+    REPLY="${_zlog_sys_cache[username]}"
     return 0
   fi
 
@@ -1303,7 +1325,7 @@ z::log::clear_sys_cache() {
       __z::log::debug_internal "All system caches cleared"
       ;;
     *)
-      print -u2 "zlog: Invalid cache type: $type (use: hostname, username, pid, all)"
+      print -r -u2 -- "zlog: Invalid cache type: $type (use: hostname, username, pid, all)"
       return 1
       ;;
   esac
@@ -1319,7 +1341,7 @@ z::log::clear_sys_cache() {
 #   local username="${REPLY[username]}"
 #   local pid="${REPLY[pid]}"
 #
-# Output: Sets REPLY as associative array with keys: hostname, username, pid
+# Output: Sets reply as key/value pairs: hostname value username value pid value
 # Returns: 0 always
 #
 # Note: This is more efficient than calling each function separately
@@ -1339,13 +1361,7 @@ __z::sys::get_all_info() {
   __z::sys::pid
   local pid="$REPLY"
 
-  # Return as associative array
-  # Note: We declare it global temporarily, caller should copy to local
-  typeset -gA REPLY=(
-    [hostname]="$hostname"
-    [username]="$username"
-    [pid]="$pid"
-  )
+  reply=(hostname "$hostname" username "$username" pid "$pid")
 
   return 0
 }
@@ -1369,7 +1385,7 @@ __z::str::trim() {
   emulate -L zsh
   setopt localoptions extended_glob no_unset
 
-  local input="$1"
+  local input="${1-}"
 
   # Remove leading and trailing whitespace using extended_glob
   REPLY="${input##[[:space:]]##}"
@@ -1393,7 +1409,7 @@ __z::str::is_empty() {
   emulate -L zsh
   setopt localoptions extended_glob no_unset
 
-  local input="$1"
+  local input="${1-}"
 
   # Check if empty or only whitespace
   [[ -z "$input" || "$input" == [[:space:]]## ]]
@@ -1418,8 +1434,8 @@ __z::str::truncate() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local text="$1"
-  local max_length="$2"
+  local text="${1-}"
+  local max_length="${2-}"
   local suffix="${3:-...}"
 
   # Validate max_length is a positive integer
@@ -1467,8 +1483,8 @@ __z::str::repeat() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local text="$1"
-  local count="$2"
+  local text="${1-}"
+  local count="${2-}"
 
   # Validate count is a non-negative integer
   if [[ ! "$count" =~ '^[0-9]+$' ]]; then
@@ -1522,8 +1538,8 @@ __z::str::pad() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local text="$1"
-  local width="$2"
+  local text="${1-}"
+  local width="${2-}"
   local align="${3:-left}"
   local pad_char="${4:- }"
 
@@ -1562,7 +1578,7 @@ __z::str::pad() {
       REPLY="${left}${text}${right}"
       ;;
     *)
-      print -u2 "zlog: Invalid alignment: $align (use: left, right, center)"
+      print -r -u2 -- "zlog: Invalid alignment: $align (use: left, right, center)"
       REPLY="$text"
       return 1
       ;;
@@ -1599,7 +1615,7 @@ __z::log::parse_size() {
   emulate -L zsh
   setopt localoptions extended_glob no_unset
 
-  local input="$1"
+  local input="${1-}"
 
   # Remove whitespace
   input="${input//[[:space:]]/}"
@@ -1689,7 +1705,7 @@ __z::log::format_size() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local bytes="$1"
+  local bytes="${1-}"
 
   # Validate input is a non-negative integer
   if [[ ! "$bytes" =~ '^[0-9]+$' ]]; then
@@ -1757,27 +1773,28 @@ z::log::set_max_message_size() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local size_input="$1"
+  local size_input="${1-}"
 
   # Validate input
   if [[ -z "$size_input" ]]; then
-    print -u2 "zlog: Message size cannot be empty"
+    print -r -u2 -- "zlog: Message size cannot be empty"
     return 1
   fi
 
   # Parse size
   __z::log::parse_size "$size_input"
+  local parse_status=$?
   local size_bytes="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid message size: $size_input"
-    print -u2 "      Use: bytes (e.g., 1024) or human-readable (e.g., 10KB, 1.5MB)"
+  if (( parse_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid message size: $size_input"
+    print -r -u2 -- "      Use: bytes (e.g., 1024) or human-readable (e.g., 10KB, 1.5MB)"
     return 1
   fi
 
   # Validate non-negative
   if (( size_bytes < 0 )); then
-    print -u2 "zlog: Message size cannot be negative: $size_bytes"
+    print -r -u2 -- "zlog: Message size cannot be negative: $size_bytes"
     return 1
   fi
 
@@ -1806,10 +1823,10 @@ z::log::get_max_message_size() {
   local size="${_zlog_config[max_message_size]:-0}"
 
   if (( size == 0 )); then
-    print "unlimited"
+    print -r -- "unlimited"
   else
     __z::log::format_size "$size"
-    print "$REPLY"
+    print -r -- "$REPLY"
   fi
 
   return 0
@@ -1828,10 +1845,10 @@ z::log::set_truncate_marker() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local marker="$1"
+  local marker="${1-}"
 
   if [[ -z "$marker" ]]; then
-    print -u2 "zlog: Truncate marker cannot be empty"
+    print -r -u2 -- "zlog: Truncate marker cannot be empty"
     return 1
   fi
 
@@ -1867,7 +1884,7 @@ __z::log::truncate_message() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local message="$1"
+  local message="${1-}"
   local max_size="${_zlog_config[max_message_size]:-0}"
 
   # No limit or message is short enough
@@ -1979,13 +1996,13 @@ __z::log::format_iso_timestamp() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local base_ts="$1"
-  local ms="$2"
-  local tz_offset="$3"
+  local base_ts="${1-}"
+  local ms="${2-000}"
+  local tz_offset="${3-}"
 
   # Format timezone: +0100 → +01:00 (ISO 8601 extended format)
   # Use parameter expansion instead of regex (faster)
-  if [[ ${#tz_offset} -eq 5 && "$tz_offset" == [+-]#### ]]; then
+  if [[ ${#tz_offset} -eq 5 && "$tz_offset" == [+-][0-9][0-9][0-9][0-9] ]]; then
     tz_offset="${tz_offset[1,3]}:${tz_offset[4,5]}"
   elif [[ -z "$tz_offset" ]]; then
     tz_offset="+00:00"
@@ -2058,6 +2075,8 @@ __z::log::update_timestamp_uncached() {
   local epoch_real="${EPOCHREALTIME}"
   local current_epoch="${EPOCHSECONDS}"
 
+  _zlog_timestamp_cache[epoch]="$current_epoch"
+
   # Extract parts once
   local int_part="${epoch_real%%.*}"
   local frac_part="${epoch_real#*.}"
@@ -2071,7 +2090,6 @@ __z::log::update_timestamp_uncached() {
   # Build millisecond timestamp (inline, no function call)
   _zlog_timestamp_cache[ms]="${int_part}${ms_part}"
 
-  # OPTIMIZATION: Try single strftime call first
   local user_format="${_zlog_timestamp_cache[custom_format]:-%Y-%m-%d %H:%M:%S}"
 
   # Check if we can use strftime (check once, cache result)
@@ -2091,12 +2109,10 @@ __z::log::update_timestamp_uncached() {
     combined_output=$(strftime "$combined_format" "$current_epoch" 2>/dev/null)
 
     if [[ -n "$combined_output" ]]; then
-      local -a parts
-      parts=("${(@s:|:)combined_output}")
-
-      local iso_base="${parts[1]}"
-      local tz_offset="${parts[2]}"
-      _zlog_timestamp_cache[formatted]="${parts[3]}"
+      local iso_base="${combined_output%%|*}"
+      local remainder="${combined_output#*|}"
+      local tz_offset="${remainder%%|*}"
+      _zlog_timestamp_cache[formatted]="${remainder#*|}"
 
       # Format timezone: +0100 → +01:00
       if [[ ${#tz_offset} -eq 5 ]]; then
@@ -2259,13 +2275,13 @@ z::log::get_timestamp() {
       __z::log::timestamp_ns
       ;;
     *)
-      print -u2 "zlog: Invalid timestamp format: $format"
-      print -u2 "      Valid formats:"
-      print -u2 "        human, text       - Human-readable (2026-03-01 12:30:45)"
-      print -u2 "        iso, iso8601      - ISO 8601 (2026-03-01T12:30:45.123+00:00)"
-      print -u2 "        epoch, unix       - Unix timestamp (1704110445)"
-      print -u2 "        ms, milliseconds  - Milliseconds (1704110445123)"
-      print -u2 "        ns, nanoseconds   - Nanoseconds (1704110445123456000)"
+      print -r -u2 -- "zlog: Invalid timestamp format: $format"
+      print -r -u2 -- "      Valid formats:"
+      print -r -u2 -- "        human, text       - Human-readable (2026-03-01 12:30:45)"
+      print -r -u2 -- "        iso, iso8601      - ISO 8601 (2026-03-01T12:30:45.123+00:00)"
+      print -r -u2 -- "        epoch, unix       - Unix timestamp (1704110445)"
+      print -r -u2 -- "        ms, milliseconds  - Milliseconds (1704110445123)"
+      print -r -u2 -- "        ns, nanoseconds   - Nanoseconds (1704110445123456000)"
       REPLY=""
       return 1
       ;;
@@ -2282,7 +2298,7 @@ z::log::get_timestamp() {
 #        local human="${timestamps[human]}"
 #        local iso="${timestamps[iso]}"
 #
-# Output: Sets REPLY as associative array with keys: human, iso, epoch, ms, ns
+# Output: Sets reply as key/value pairs: human value iso value epoch value ms value ns value
 # Returns: 0 always
 #
 # Performance: More efficient than calling get_timestamp multiple times
@@ -2300,13 +2316,12 @@ __z::log::get_all_timestamps() {
   __z::log::timestamp_ns
   ns="$REPLY"
 
-  # Return as associative array
-  typeset -gA REPLY=(
-    [human]="$_zlog_timestamp_cache[formatted]"
-    [iso]="$_zlog_timestamp_cache[iso]"
-    [epoch]="$EPOCHSECONDS"
-    [ms]="$_zlog_timestamp_cache[ms]"
-    [ns]="$ns"
+  reply=(
+    human "$_zlog_timestamp_cache[formatted]"
+    iso "$_zlog_timestamp_cache[iso]"
+    epoch "$EPOCHSECONDS"
+    ms "$_zlog_timestamp_cache[ms]"
+    ns "$ns"
   )
 
   return 0
@@ -2348,19 +2363,19 @@ z::log::set_timestamp_format() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local format="$1"
+  local format="${1-}"
 
   # Validate input
   if [[ -z "$format" ]]; then
-    print -u2 "zlog: Timestamp format cannot be empty"
-    print -u2 ""
-    print -u2 "      Common examples:"
-    print -u2 "        %Y-%m-%d %H:%M:%S  - Default (2026-03-01 12:30:45)"
-    print -u2 "        %H:%M:%S           - Time only (12:30:45)"
-    print -u2 "        %Y-%m-%d           - Date only (2026-03-01)"
-    print -u2 "        %b %d %H:%M:%S     - Syslog style (Jan 01 12:30:45)"
-    print -u2 ""
-    print -u2 "      See 'man strftime' for all format codes"
+    print -r -u2 -- "zlog: Timestamp format cannot be empty"
+    print -r -u2 -- ""
+    print -r -u2 -- "      Common examples:"
+    print -r -u2 -- "        %Y-%m-%d %H:%M:%S  - Default (2026-03-01 12:30:45)"
+    print -r -u2 -- "        %H:%M:%S           - Time only (12:30:45)"
+    print -r -u2 -- "        %Y-%m-%d           - Date only (2026-03-01)"
+    print -r -u2 -- "        %b %d %H:%M:%S     - Syslog style (Jan 01 12:30:45)"
+    print -r -u2 -- ""
+    print -r -u2 -- "      See 'man strftime' for all format codes"
     return 1
   fi
 
@@ -2375,17 +2390,17 @@ z::log::set_timestamp_format() {
 
   # Validate that format produces output
   if [[ -z "$test_output" ]]; then
-    print -u2 "zlog: Invalid timestamp format: $format"
-    print -u2 "      Format produced no output"
-    print -u2 ""
-    print -u2 "      Common format codes:"
-    print -u2 "        %Y  Year (4 digits)       %m  Month (01-12)"
-    print -u2 "        %d  Day (01-31)           %H  Hour (00-23)"
-    print -u2 "        %M  Minute (00-59)        %S  Second (00-59)"
-    print -u2 "        %b  Month name (Jan)      %a  Weekday (Mon)"
-    print -u2 "        %z  Timezone (+0100)      %Z  Timezone (UTC)"
-    print -u2 ""
-    print -u2 "      See 'man strftime' for complete reference"
+    print -r -u2 -- "zlog: Invalid timestamp format: $format"
+    print -r -u2 -- "      Format produced no output"
+    print -r -u2 -- ""
+    print -r -u2 -- "      Common format codes:"
+    print -r -u2 -- "        %Y  Year (4 digits)       %m  Month (01-12)"
+    print -r -u2 -- "        %d  Day (01-31)           %H  Hour (00-23)"
+    print -r -u2 -- "        %M  Minute (00-59)        %S  Second (00-59)"
+    print -r -u2 -- "        %b  Month name (Jan)      %a  Weekday (Mon)"
+    print -r -u2 -- "        %z  Timezone (+0100)      %Z  Timezone (UTC)"
+    print -r -u2 -- ""
+    print -r -u2 -- "      See 'man strftime' for complete reference"
     return 1
   fi
 
@@ -2468,13 +2483,13 @@ z::log::format_epoch() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local epoch="$1"
+  local epoch="${1-}"
   local format="${2:-${_zlog_timestamp_cache[custom_format]:-%Y-%m-%d %H:%M:%S}}"
 
   # Validate epoch is a number
   if [[ ! "$epoch" =~ '^[0-9]+$' ]]; then
-    print -u2 "zlog: Invalid epoch timestamp: $epoch"
-    print -u2 "      Expected: positive integer (seconds since 1970-01-01)"
+    print -r -u2 -- "zlog: Invalid epoch timestamp: $epoch"
+    print -r -u2 -- "      Expected: positive integer (seconds since 1970-01-01)"
     REPLY=""
     return 1
   fi
@@ -2484,8 +2499,8 @@ z::log::format_epoch() {
 
   if [[ -z "$REPLY" ]]; then
     # Fallback to prompt expansion (less reliable for arbitrary epochs)
-    print -u2 "zlog: Failed to format epoch: $epoch"
-    print -u2 "      strftime not available or format invalid"
+    print -r -u2 -- "zlog: Failed to format epoch: $epoch"
+    print -r -u2 -- "      strftime not available or format invalid"
     REPLY=""
     return 1
   fi
@@ -2604,15 +2619,15 @@ z::log::time_diff() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local start_ms="$1"
-  local end_ms="$2"
+  local start_ms="${1-}"
+  local end_ms="${2-}"
 
   # Validate inputs are positive integers
   if [[ ! "$start_ms" =~ '^[0-9]+$' ]] || [[ ! "$end_ms" =~ '^[0-9]+$' ]]; then
-    print -u2 "zlog: Invalid timestamp values"
-    print -u2 "      start_ms: $start_ms"
-    print -u2 "      end_ms: $end_ms"
-    print -u2 "      Expected: positive integers (milliseconds)"
+    print -r -u2 -- "zlog: Invalid timestamp values"
+    print -r -u2 -- "      start_ms: $start_ms"
+    print -r -u2 -- "      end_ms: $end_ms"
+    print -r -u2 -- "      Expected: positive integers (milliseconds)"
     REPLY="<invalid>"
     return 1
   fi
@@ -2622,10 +2637,10 @@ z::log::time_diff() {
 
   # Check for negative duration
   if (( diff_ms < 0 )); then
-    print -u2 "zlog: Negative duration detected"
-    print -u2 "      start_ms: $start_ms"
-    print -u2 "      end_ms: $end_ms"
-    print -u2 "      diff: $diff_ms"
+    print -r -u2 -- "zlog: Negative duration detected"
+    print -r -u2 -- "      start_ms: $start_ms"
+    print -r -u2 -- "      end_ms: $end_ms"
+    print -r -u2 -- "      diff: $diff_ms"
     REPLY="<negative>"
     return 1
   fi
@@ -2655,12 +2670,12 @@ z::log::time_diff_signed() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local start_ms="$1"
-  local end_ms="$2"
+  local start_ms="${1-}"
+  local end_ms="${2-}"
 
   # Validate inputs
   if [[ ! "$start_ms" =~ '^[0-9]+$' ]] || [[ ! "$end_ms" =~ '^[0-9]+$' ]]; then
-    print -u2 "zlog: Invalid timestamp values"
+    print -r -u2 -- "zlog: Invalid timestamp values"
     REPLY="<invalid>"
     return 1
   fi
@@ -2732,7 +2747,7 @@ z::log::benchmark_elapsed() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local start_time="$1"
+  local start_time="${1-}"
 
   # Get current time
   z::log::benchmark_now
@@ -2743,9 +2758,6 @@ z::log::benchmark_elapsed() {
   return $?
 }
 
-###############################################################################
-# END OF TIMESTAMP MANAGEMENT
-###############################################################################
 ###############################################################################
 # LEVEL MANAGEMENT
 ###############################################################################
@@ -2975,7 +2987,9 @@ __z::log::release_rotation_lock() {
 ###
 __z::log::get_file_size() {
   emulate -L zsh
-  local filepath="$1"
+  setopt localoptions no_unset
+
+  local filepath="${1-}"
 
   # Check if file exists
   if [[ ! -f "$filepath" ]]; then
@@ -2984,36 +2998,54 @@ __z::log::get_file_size() {
   fi
 
   # Detect and cache stat command type (only once)
-  if [[ -z "${_zlog_config[stat_cmd]}" ]]; then
-    if stat -c%s "$filepath" 2>/dev/null >/dev/null; then
-      _zlog_config[stat_cmd]="gnu"
-    elif stat -f%z "$filepath" 2>/dev/null >/dev/null; then
-      _zlog_config[stat_cmd]="bsd"
+  if [[ -z "${_zlog_state[stat_cmd]:-}" || "${_zlog_state[stat_cmd]:-}" == "none" ]]; then
+    if command -v gstat >/dev/null 2>&1 && gstat -c%s "$filepath" >/dev/null 2>&1; then
+      _zlog_state[stat_cmd]="gnu"
+      _zlog_state[stat_bin]="gstat"
+    elif stat -c%s "$filepath" >/dev/null 2>&1; then
+      _zlog_state[stat_cmd]="gnu"
+      _zlog_state[stat_bin]="stat"
+    elif stat -f%z "$filepath" >/dev/null 2>&1; then
+      _zlog_state[stat_cmd]="bsd"
+      _zlog_state[stat_bin]="stat"
     else
-      _zlog_config[stat_cmd]="none"
+      _zlog_state[stat_cmd]="none"
       __z::log::debug_internal "Cannot detect stat command"
     fi
   fi
 
   # Get file size using cached command
   local file_size=0
-  case "${_zlog_config[stat_cmd]}" in
+  local stat_bin="${_zlog_state[stat_bin]:-stat}"
+  case "${_zlog_state[stat_cmd]:-none}" in
     gnu)
-      file_size=$(stat -c%s "$filepath" 2>/dev/null) || file_size=0
+      if [[ "$stat_bin" == "stat" ]] && ! stat -c%s "$filepath" >/dev/null 2>&1; then
+        if command -v gstat >/dev/null 2>&1 && gstat -c%s "$filepath" >/dev/null 2>&1; then
+          stat_bin="gstat"
+          _zlog_state[stat_bin]="gstat"
+        fi
+      fi
+      file_size=$("$stat_bin" -c%s "$filepath" 2>/dev/null) || file_size=0
       ;;
     bsd)
-      file_size=$(stat -f%z "$filepath" 2>/dev/null) || file_size=0
+      file_size=$("$stat_bin" -f%z "$filepath" 2>/dev/null) || file_size=0
       ;;
     none)
       # Fallback: use wc -c
       if command -v wc &>/dev/null; then
-        file_size=$(wc -c < "$filepath" 2>/dev/null | tr -d ' ') || file_size=0
+        file_size=$(wc -c < "$filepath" 2>/dev/null) || file_size=0
+        file_size="${file_size//[[:space:]]/}"
       else
         REPLY="0"
         return 1
       fi
       ;;
   esac
+
+  if [[ ! "$file_size" =~ '^[0-9]+$' ]]; then
+    REPLY="0"
+    return 1
+  fi
 
   REPLY="$file_size"
   return 0
@@ -3039,9 +3071,10 @@ __z::log::rotate_if_needed() {
 
   # Get file size
   __z::log::get_file_size "$logfile"
+  local size_status=$?
   local file_size="$REPLY"
 
-  if (( $? != 0 )); then
+  if (( size_status != 0 )); then
     __z::log::debug_internal "Cannot determine file size, skipping rotation"
     return 0
   fi
@@ -3063,8 +3096,7 @@ __z::log::rotate_if_needed() {
     return 1
   fi
 
-  # Ensure lock is released on exit
-  trap '__z::log::release_rotation_lock' EXIT INT TERM HUP QUIT
+  {
 
   # Re-check size after acquiring lock (another process may have rotated)
   __z::log::get_file_size "$logfile"
@@ -3072,13 +3104,24 @@ __z::log::rotate_if_needed() {
 
   if (( file_size < max_size )); then
     __z::log::debug_internal "File already rotated by another process"
-    __z::log::release_rotation_lock
-    trap - EXIT INT TERM HUP QUIT
     return 0
   fi
 
   # Perform rotation
   local i
+
+  # rotate_keep=0 means retain no rotated files.
+  # Truncate in place so permissions and ownership are preserved.
+  if (( keep_count == 0 )); then
+    if : > "$logfile" 2>/dev/null; then
+      (( _zlog_stats[rotations_performed]++ ))
+      __z::log::debug_internal "Rotated by truncating current log: $logfile"
+      return 0
+    else
+      __z::log::debug_internal "Failed to truncate current log during rotation"
+      return 1
+    fi
+  fi
 
   # Remove oldest file if it exists
   if [[ -f "${logfile}.${keep_count}" ]]; then
@@ -3105,8 +3148,6 @@ __z::log::rotate_if_needed() {
     __z::log::debug_internal "Rotated: $logfile -> ${logfile}.1"
   else
     __z::log::debug_internal "Failed to rotate current log"
-    __z::log::release_rotation_lock
-    trap - EXIT INT TERM HUP QUIT
     return 1
   fi
 
@@ -3131,11 +3172,14 @@ __z::log::rotate_if_needed() {
     __z::log::debug_internal "Created new log file: $logfile"
   else
     __z::log::debug_internal "Failed to create new log file"
+    return 1
   fi
 
-  # Release lock
+  (( _zlog_stats[rotations_performed]++ ))
+
+  } always {
   __z::log::release_rotation_lock
-  trap - EXIT INT TERM HUP QUIT
+  }
 
   return 0
 }
@@ -3147,7 +3191,7 @@ __z::log::rotate_if_needed() {
 ###
 __z::log::ensure_log_dir() {
   emulate -L zsh
-  local logfile="$1"
+  local logfile="${1-}"
   local logdir="${logfile:h}"
 
   # Check if directory already exists
@@ -3158,7 +3202,7 @@ __z::log::ensure_log_dir() {
     __z::log::debug_internal "Created log directory: $logdir"
     return 0
   else
-    print -u2 "zlog: Failed to create log directory: $logdir"
+    print -r -u2 -- "zlog: Failed to create log directory: $logdir"
     return 1
   fi
 }
@@ -3172,7 +3216,7 @@ __z::log::write_file() {
   emulate -L zsh
   setopt localoptions
 
-  local message="$1"
+  local message="${1-}"
   local logfile="${_zlog_config[file]}"
 
   # No file configured
@@ -3186,9 +3230,16 @@ __z::log::write_file() {
   # Ensure directory exists
   __z::log::ensure_log_dir "$logfile" || return 1
 
+  # Use async writer when enabled.
+  local async_fd="${_zlog_state[async_fd]:--1}"
+  if [[ "$async_fd" =~ '^[0-9]+$' ]] && (( async_fd >= 0 )) && (( ${+functions[__z::log::write_async]} )); then
+    __z::log::write_async "$message"
+    return $?
+  fi
+
   # Write directly to file
   if ! print -r -- "$message" >> "$logfile" 2>/dev/null; then
-    print -u2 "zlog: Failed to write to log file: $logfile"
+    print -r -u2 -- "zlog: Failed to write to log file: $logfile"
     return 1
   fi
 
@@ -3207,7 +3258,7 @@ z::log::set_rotation_lock_timeout() {
   local timeout="$1"
 
   if [[ ! "$timeout" =~ '^[0-9]+$' ]] || (( timeout < 1 )); then
-    print -u2 "zlog: Invalid timeout: $timeout (must be positive integer)"
+    print -r -u2 -- "zlog: Invalid timeout: $timeout (must be positive integer)"
     return 1
   fi
 
@@ -3234,61 +3285,22 @@ z::log::set_rotation_lock_timeout() {
 ###
 z::log::enable_buffering() {
   emulate -L zsh
-  setopt localoptions
+  setopt localoptions no_unset
   local size="${1:-50}"
 
   # Validate buffer size
   if [[ ! "$size" =~ '^[0-9]+$' ]] || (( size < 1 )); then
-    print -u2 "zlog: Invalid buffer size: $size (must be positive integer)"
+    print -r -u2 -- "zlog: Invalid buffer size: $size (must be positive integer)"
     return 1
   fi
 
   _zlog_config[buffered]=1
   _zlog_config[buffer_max]=$size
 
-  # Try multiple approaches for exit handling
-  local hook_method="none"
+  z::log::register_cleanup
+  _zlog_config[exit_hook_method]="cleanup"
 
-  # Method 1: Try add-zsh-hook (most robust for interactive shells)
-  if autoload -Uz add-zsh-hook 2>/dev/null; then
-    add-zsh-hook zshexit z::log::flush
-    hook_method="add-zsh-hook"
-    __z::log::debug_internal "Using add-zsh-hook for exit handler"
-  # Method 2: Try TRAPEXIT function
-  elif ! (( ${+functions[TRAPEXIT]} )); then
-    # Define TRAPEXIT function
-    function TRAPEXIT() {
-      z::log::flush
-    }
-    hook_method="TRAPEXIT"
-    __z::log::debug_internal "Created TRAPEXIT function for exit handler"
-  # Method 3: Existing TRAPEXIT - wrap it
-  else
-    # Save existing TRAPEXIT
-    if ! (( ${+functions[__zlog_original_TRAPEXIT]} )); then
-      functions[__zlog_original_TRAPEXIT]="${functions[TRAPEXIT]}"
-    fi
-
-    # Redefine TRAPEXIT to call both
-    function TRAPEXIT() {
-      z::log::flush
-      __zlog_original_TRAPEXIT
-    }
-    hook_method="TRAPEXIT_wrapped"
-    __z::log::debug_internal "Wrapped existing TRAPEXIT function"
-  fi
-
-  # Store which method we used
-  _zlog_config[exit_hook_method]="$hook_method"
-
-  # For subshells and scripts, also use EXIT trap
-  # This is more reliable than zshexit in subshells
-  trap 'z::log::flush' EXIT
-
-  # Signal traps (always set these)
-  trap 'z::log::flush' INT TERM HUP QUIT
-
-  __z::log::debug_internal "Buffering enabled: buffer_max=$size, hook_method=$hook_method"
+  __z::log::debug_internal "Buffering enabled: buffer_max=$size"
   return 0
 }
 
@@ -3299,42 +3311,12 @@ z::log::disable_buffering() {
   emulate -L zsh
 
   # Flush any pending messages
-  z::log::flush
+  if ! z::log::flush; then
+    print -r -u2 -- "zlog: Failed to flush buffer; buffering remains enabled"
+    return 1
+  fi
 
   _zlog_config[buffered]=0
-
-  # Clean up based on method used
-  local hook_method="${_zlog_config[exit_hook_method]:-none}"
-
-  case "$hook_method" in
-    add-zsh-hook)
-      if autoload -Uz add-zsh-hook 2>/dev/null; then
-        add-zsh-hook -d zshexit z::log::flush
-        __z::log::debug_internal "Removed zshexit hook"
-      fi
-      ;;
-    TRAPEXIT)
-      # Remove our TRAPEXIT
-      unfunction TRAPEXIT 2>/dev/null
-      __z::log::debug_internal "Removed TRAPEXIT function"
-      ;;
-    TRAPEXIT_wrapped)
-      # Restore original TRAPEXIT
-      if (( ${+functions[__zlog_original_TRAPEXIT]} )); then
-        functions[TRAPEXIT]="${functions[__zlog_original_TRAPEXIT]}"
-        unfunction __zlog_original_TRAPEXIT
-        __z::log::debug_internal "Restored original TRAPEXIT function"
-      fi
-      ;;
-    *)
-      __z::log::debug_internal "No exit hook to remove"
-      ;;
-  esac
-
-  # Remove all traps
-  trap - EXIT INT TERM HUP QUIT
-
-  # Clear hook method
   _zlog_config[exit_hook_method]=""
 
   __z::log::debug_internal "Buffering disabled"
@@ -3352,11 +3334,12 @@ z::log::disable_buffering() {
 ###
 __z::log::buffer_add() {
   emulate -L zsh
-  local message="$1"
-  local level="$2"
+  local message="${1-}"
+  local level="${2-}"
 
   # Add to buffer
   _zlog_buffer+=("$message")
+  _zlog_state[buffer_count]=${#_zlog_buffer}
 
   # Auto-flush on errors or when buffer full
   if (( level == ${_ZLOG_LEVEL_ERROR:-0} || ${#_zlog_buffer} >= ${_zlog_config[buffer_max]:-50} )); then
@@ -3386,6 +3369,7 @@ z::log::flush() {
   # No file configured - just clear buffer
   if [[ -z "$logfile" ]]; then
     _zlog_buffer=()
+    _zlog_state[buffer_count]=0
     return 0
   fi
 
@@ -3402,9 +3386,11 @@ z::log::flush() {
   if printf '%s\n' "${_zlog_buffer[@]}" >> "$logfile" 2>/dev/null; then
     __z::log::debug_internal "Successfully flushed $buffer_count messages"
     _zlog_buffer=()
+    _zlog_state[buffer_count]=0
+    (( _zlog_stats[buffer_flushes]++ ))
     return 0
   else
-    print -u2 "zlog: Failed to write buffer to: $logfile ($buffer_count messages retained)"
+    print -r -u2 -- "zlog: Failed to write buffer to: $logfile ($buffer_count messages retained)"
     return 1
   fi
 }
@@ -3445,14 +3431,19 @@ z::log::is_buffered() {
 #   message - Log message
 #   ... - Optional key-value pairs (must be even number of args)
 #
-# Output: Prints JSON string to stdout
+# Output: Sets REPLY to the JSON string
 ###
 __z::log::format_json() {
   emulate -L zsh
   setopt localoptions extended_glob
 
-  local level="$1"
-  local message="$2"
+  if (( $# < 2 )); then
+    REPLY=""
+    return 1
+  fi
+
+  local level="${1-}"
+  local message="${2-}"
   shift 2
 
   # Truncate message if needed
@@ -3518,8 +3509,8 @@ __z::log::format_json() {
         continue
       fi
 
-      # Validate key format (alphanumeric, underscore, hyphen only)
-      if [[ ! "$key" =~ '^[a-zA-Z0-9_-]+$' ]]; then
+      # Validate key format and avoid reserved keys
+      if ! __z::log::validate_context_key "$key"; then
         __z::log::debug_internal "Skipping invalid context key: $key"
         continue
       fi
@@ -3537,7 +3528,7 @@ __z::log::format_json() {
   # Close JSON object
   json_output+="}"
 
-  print -r -- "$json_output"
+  REPLY="$json_output"
 
   return 0
 }
@@ -3553,14 +3544,19 @@ __z::log::format_json() {
 #   message - Log message
 #   ... - Optional key-value pairs (must be even number of args)
 #
-# Output: Prints formatted text to stdout
+# Output: Sets REPLY to the formatted text
 ###
 __z::log::format_text() {
   emulate -L zsh
   setopt localoptions
 
-  local level="$1"
-  local message="$2"
+  if (( $# < 2 )); then
+    REPLY=""
+    return 1
+  fi
+
+  local level="${1-}"
+  local message="${2-}"
   shift 2
 
   # Truncate message if needed
@@ -3643,8 +3639,8 @@ __z::log::format_text() {
         continue
       fi
 
-      # Validate key format
-      if [[ ! "$key" =~ '^[a-zA-Z0-9_-]+$' ]]; then
+      # Validate key format and avoid reserved keys
+      if ! __z::log::validate_context_key "$key"; then
         __z::log::debug_internal "Skipping invalid context key: $key"
         continue
       fi
@@ -3661,7 +3657,7 @@ __z::log::format_text() {
     fi
   fi
 
-  print -r -- "$output"
+  REPLY="$output"
 
   return 0
 }
@@ -3676,6 +3672,12 @@ __z::log::format_text() {
 ###
 __z::log::format() {
   emulate -L zsh
+  setopt localoptions no_unset
+
+  if (( $# < 2 )); then
+    REPLY=""
+    return 1
+  fi
 
   local level="$1"
   local message="$2"
@@ -3690,7 +3692,7 @@ __z::log::format() {
       ;;
   esac
 
-  return 0
+  return $?
 }
 
 ###
@@ -3700,7 +3702,7 @@ __z::log::format() {
 ###
 __z::log::validate_context_key() {
   emulate -L zsh
-  local key="$1"
+  local key="${1-}"
 
   # Empty key
   [[ -z "$key" ]] && return 1
@@ -3732,7 +3734,7 @@ __z::log::sanitize_context_key() {
   emulate -L zsh
   setopt localoptions extended_glob
 
-  local key="$1"
+  local key="${1-}"
 
   # Remove invalid characters
   key="${key//[^a-zA-Z0-9_-]/}"
@@ -3790,38 +3792,43 @@ __z::log::engine() {
   emulate -L zsh
   setopt localoptions no_unset
 
+  if (( $# < 2 )); then
+    print -r -u2 -- "zlog: engine requires level and message"
+    return 2
+  fi
+
   # Recursion protection
   local max_depth="${_zlog_config[max_depth]:-5}"
   local current_depth="${_zlog_state[depth]:-0}"
 
   if (( current_depth >= max_depth )); then
-    print -u2 "zlog: Maximum recursion depth ($max_depth) exceeded at depth $current_depth"
-    print -u2 "      This usually indicates a logging loop. Check your log handlers."
+    print -r -u2 -- "zlog: Maximum recursion depth ($max_depth) exceeded at depth $current_depth"
+    print -r -u2 -- "      This usually indicates a logging loop. Check your log handlers."
     return 1
   fi
 
   _zlog_state[depth]=$((current_depth + 1))
 
-  local level="$1"
-  local message="$2"
+  local level="${1-}"
+  local message="${2-}"
   shift 2
 
   # Validate level - restore depth on error
   if [[ -z "$level" ]]; then
-    print -u2 "zlog: Log level cannot be empty"
+    print -r -u2 -- "zlog: Log level cannot be empty"
     _zlog_state[depth]=$current_depth
     return 2
   fi
 
   if [[ ! "$level" =~ ${_zlog_patterns[number]} ]]; then
-    print -u2 "zlog: Invalid log level: '$level' (must be numeric 0-3)"
+    print -r -u2 -- "zlog: Invalid log level: '$level' (must be numeric 0-3)"
     _zlog_state[depth]=$current_depth
     return 2
   fi
 
   if (( level < 0 || level > 3 )); then
-    print -u2 "zlog: Log level out of range: $level (must be 0-3)"
-    print -u2 "      0=ERROR, 1=WARN, 2=INFO, 3=DEBUG"
+    print -r -u2 -- "zlog: Log level out of range: $level (must be 0-3)"
+    print -r -u2 -- "      0=ERROR, 1=WARN, 2=INFO, 3=DEBUG"
     _zlog_state[depth]=$current_depth
     return 2
   fi
@@ -3847,15 +3854,21 @@ __z::log::engine() {
     return 0
   fi
 
-  # Format message with error handling
+  # Format message with error handling. Do not use command substitution here:
+  # it would run the formatter in a subshell and discard cache updates.
   local formatted
-  if ! formatted=$(__z::log::format "$level" "$message" "$@" 2>&1); then
-    # Fallback formatting on error
-    print -u2 "zlog: Format failed, using fallback"
+  __z::log::format "$level" "$message" "$@"
+  local format_status=$?
 
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || print "UNKNOWN")
+  if (( format_status != 0 )); then
+    # Fallback formatting on error
+    print -r -u2 -- "zlog: Format failed, using fallback"
+
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || print -r -- "UNKNOWN")
     local level_name="${_ZLOG_LEVEL_NAMES[$level]:-UNKNOWN}"
     formatted="$timestamp [$level_name] ($$) [FORMAT_ERROR] $message"
+  else
+    formatted="$REPLY"
   fi
 
   # Track statistics
@@ -3863,9 +3876,9 @@ __z::log::engine() {
 
   # Output to console
   if (( should_console )); then
-    if ! print -u2 -r -- "$formatted"; then
+    if ! print -r -u2 -- "$formatted"; then
       (( _zlog_stats[errors_encountered]++ ))
-      print -u1 "zlog: stderr write failed: $formatted" 2>/dev/null || true
+      print -r -u2 -- "zlog: stderr write failed: $formatted" 2>/dev/null || true
     fi
   fi
 
@@ -3884,9 +3897,9 @@ __z::log::engine() {
     if (( write_status != 0 )); then
       (( _zlog_stats[errors_encountered]++ ))
       if (( _zlog_stats[errors_encountered] <= 5 )); then
-        print -u2 "zlog: File write failed (status: $write_status, error count: ${_zlog_stats[errors_encountered]})"
+        print -r -u2 -- "zlog: File write failed (status: $write_status, error count: ${_zlog_stats[errors_encountered]})"
       elif (( _zlog_stats[errors_encountered] == 6 )); then
-        print -u2 "zlog: File write errors continue, suppressing further error messages"
+        print -r -u2 -- "zlog: File write errors continue, suppressing further error messages"
       fi
     fi
   fi
@@ -3916,8 +3929,12 @@ __z::log::engine_fast() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  local level="$1"
-  local message="$2"
+  if (( $# < 2 )); then
+    return 1
+  fi
+
+  local level="${1-}"
+  local message="${2-}"
   shift 2
 
   # Fast level check (most common case: filtered out)
@@ -3930,17 +3947,17 @@ __z::log::engine_fast() {
     return 0
   fi
 
-  # ✅ OPTIMIZATION: Use simple formatter if no context
   local formatted
   if (( $# == 0 )); then
     __z::log::format_simple "$level" "$message"
     formatted="$REPLY"
   else
-    formatted=$(__z::log::format "$level" "$message" "$@")
+    __z::log::format "$level" "$message" "$@" || return 1
+    formatted="$REPLY"
   fi
 
   # Output to console if appropriate
-  (( level <= console_level )) && print -u2 -r -- "$formatted"
+  (( level <= console_level )) && print -r -u2 -- "$formatted"
 
   # Output to file if appropriate
   if (( level <= file_level && _zlog_state[file_enabled] )); then
@@ -3982,11 +3999,10 @@ z::log::error() {
   setopt localoptions no_unset
 
   if (( $# < 1 )); then
-    print -u2 "zlog: error() requires at least a message"
+    print -r -u2 -- "zlog: error() requires at least a message"
     return 1
   fi
 
-  # ✅ OPTIMIZATION: Early exit using fast-path flags
   if (( ! _zlog_state[any_logging_enabled] )); then
     return 0
   fi
@@ -4022,11 +4038,10 @@ z::log::warn() {
   setopt localoptions no_unset
 
   if (( $# < 1 )); then
-    print -u2 "zlog: warn() requires at least a message"
+    print -r -u2 -- "zlog: warn() requires at least a message"
     return 1
   fi
 
-  # ✅ OPTIMIZATION: Early exit
   if (( ! _zlog_state[any_logging_enabled] )); then
     return 0
   fi
@@ -4061,11 +4076,10 @@ z::log::info() {
   setopt localoptions no_unset
 
   if (( $# < 1 )); then
-    print -u2 "zlog: info() requires at least a message"
+    print -r -u2 -- "zlog: info() requires at least a message"
     return 1
   fi
 
-  # ✅ OPTIMIZATION: Early exit
   if (( ! _zlog_state[any_logging_enabled] )); then
     return 0
   fi
@@ -4100,11 +4114,10 @@ z::log::debug() {
   setopt localoptions no_unset
 
   if (( $# < 1 )); then
-    print -u2 "zlog: debug() requires at least a message"
+    print -r -u2 -- "zlog: debug() requires at least a message"
     return 1
   fi
 
-  # ✅ OPTIMIZATION: Early exit
   if (( ! _zlog_state[any_logging_enabled] )); then
     return 0
   fi
@@ -4141,24 +4154,24 @@ z::log::log() {
 
   # Validate input
   if (( $# < 2 )); then
-    print -u2 "zlog: log() requires level and message"
+    print -r -u2 -- "zlog: log() requires level and message"
     return 1
   fi
 
   local level_input="$1"
   shift
 
-  # ✅ OPTIMIZATION: Early exit
   if (( ! _zlog_state[any_logging_enabled] )); then
     return 0
   fi
 
   # Convert level name to number
   __z::log::level_number "$level_input"
+  local level_status=$?
   local level_num="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid level: $level_input"
+  if (( level_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid level: $level_input"
     return 1
   fi
 
@@ -4183,17 +4196,17 @@ z::log::get_stats() {
   emulate -L zsh
   setopt localoptions no_unset
 
-  print "Logging Statistics:"
-  print "  Messages logged:     ${_zlog_stats[messages_logged]}"
-  print "  Messages dropped:    ${_zlog_stats[messages_dropped]}"
-  print "  Rotations performed: ${_zlog_stats[rotations_performed]}"
-  print "  Buffer flushes:      ${_zlog_stats[buffer_flushes]}"
-  print "  Errors encountered:  ${_zlog_stats[errors_encountered]}"
-  print ""
-  print "Active Resources:"
-  print "  Contexts:            ${_zlog_state[context_count]}"
-  print "  Timers:              ${_zlog_state[timer_count]}"
-  print "  Buffered messages:   ${#_zlog_buffer}"
+  print -r -- "Logging Statistics:"
+  print -r -- "  Messages logged:     ${_zlog_stats[messages_logged]}"
+  print -r -- "  Messages dropped:    ${_zlog_stats[messages_dropped]}"
+  print -r -- "  Rotations performed: ${_zlog_stats[rotations_performed]}"
+  print -r -- "  Buffer flushes:      ${_zlog_stats[buffer_flushes]}"
+  print -r -- "  Errors encountered:  ${_zlog_stats[errors_encountered]}"
+  print -r -- ""
+  print -r -- "Active Resources:"
+  print -r -- "  Contexts:            ${_zlog_state[context_count]}"
+  print -r -- "  Timers:              ${_zlog_state[timer_count]}"
+  print -r -- "  Buffered messages:   ${#_zlog_buffer}"
 
   return 0
 }
@@ -4228,19 +4241,19 @@ z::log::reset_stats() {
 __z::log::printf_helper() {
   emulate -L zsh
 
-  local level="$1"
-  local format="$2"
+  local level="${1-}"
+  local format="${2-}"
   shift 2
 
   # Validate format string
   if [[ -z "$format" ]]; then
-    print -u2 "zlog: printf format string cannot be empty"
+    print -r -u2 -- "zlog: printf format string cannot be empty"
     return 1
   fi
 
   # Format message using printf
   local message
-  if message=$(printf "$format" "$@" 2>&1); then
+  if printf -v message -- "$format" "$@" 2>/dev/null; then
     __z::log::engine "$level" "$message"
   else
     # Format failed - log error with sanitized format string
@@ -4268,7 +4281,7 @@ z::log::errorf() {
   emulate -L zsh
 
   if (( $# < 1 )); then
-    print -u2 "zlog: errorf requires at least a format string"
+    print -r -u2 -- "zlog: errorf requires at least a format string"
     return 1
   fi
 
@@ -4300,7 +4313,7 @@ z::log::warnf() {
   emulate -L zsh
 
   if (( $# < 1 )); then
-    print -u2 "zlog: warnf requires at least a format string"
+    print -r -u2 -- "zlog: warnf requires at least a format string"
     return 1
   fi
 
@@ -4332,7 +4345,7 @@ z::log::infof() {
   emulate -L zsh
 
   if (( $# < 1 )); then
-    print -u2 "zlog: infof requires at least a format string"
+    print -r -u2 -- "zlog: infof requires at least a format string"
     return 1
   fi
 
@@ -4364,7 +4377,7 @@ z::log::debugf() {
   emulate -L zsh
 
   if (( $# < 1 )); then
-    print -u2 "zlog: debugf requires at least a format string"
+    print -r -u2 -- "zlog: debugf requires at least a format string"
     return 1
   fi
 
@@ -4398,8 +4411,8 @@ __z::log::is_level_active() {
   # If file level is -1, follow console level
   (( file_level == -1 )) && file_level=$console_level
 
-  # Return 0 (true) if either console or file will log this level
-  (( check_level <= console_level || check_level <= file_level ))
+  # Return 0 (true) if either console or an enabled file target will log this level
+  (( check_level <= console_level || ( _zlog_state[file_enabled] && check_level <= file_level ) ))
 }
 
 ###
@@ -4493,7 +4506,7 @@ z::log::with_level() {
 
   # Validate input
   if (( $# < 2 )); then
-    print -u2 "zlog: with_level requires level and command"
+    print -r -u2 -- "zlog: with_level requires level and command"
     return 1
   fi
 
@@ -4505,23 +4518,24 @@ z::log::with_level() {
 
   # Validate and set new level
   __z::log::level_number "$new_level"
+  local level_status=$?
   local level_num="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid level for with_level: $new_level"
+  if (( level_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid level for with_level: $new_level"
     return 1
   fi
 
-  # Set new level
-  _zlog_config[level]=$level_num
-
-  # Execute command and capture exit code
   local exit_code
+  {
+  _zlog_config[level]=$level_num
+    __z::log::update_fast_flags
   "$@"
   exit_code=$?
-
-  # Restore original level
+  } always {
   _zlog_config[level]=$saved_level
+    __z::log::update_fast_flags
+  }
 
   return $exit_code
 }
@@ -4543,7 +4557,7 @@ z::log::silent() {
 
   # Validate input
   if (( $# < 1 )); then
-    print -u2 "zlog: silent requires a command to execute"
+    print -r -u2 -- "zlog: silent requires a command to execute"
     return 1
   fi
 
@@ -4551,19 +4565,18 @@ z::log::silent() {
   local saved_console="${_zlog_config[level]:-2}"
   local saved_file="${_zlog_config[file_level]:--1}"
 
-  # Set levels below error (effectively disabling all logging)
-  # Use -1 which is below error level (0)
+  local exit_code
+  {
   _zlog_config[level]=-1
   _zlog_config[file_level]=-1
-
-  # Execute command and capture exit code
-  local exit_code
+    __z::log::update_fast_flags
   "$@"
   exit_code=$?
-
-  # Restore levels
+  } always {
   _zlog_config[level]=$saved_console
   _zlog_config[file_level]=$saved_file
+    __z::log::update_fast_flags
+  }
 
   return $exit_code
 }
@@ -4586,7 +4599,7 @@ z::log::always() {
 
   # Validate input
   if (( $# < 1 )); then
-    print -u2 "zlog: always requires a message"
+    print -r -u2 -- "zlog: always requires a message"
     return 1
   fi
 
@@ -4597,18 +4610,24 @@ z::log::always() {
   local saved_console="${_zlog_config[level]:-2}"
   local saved_file="${_zlog_config[file_level]:--1}"
 
-  # Temporarily set to error level (always logged)
-  _zlog_config[level]=${_ZLOG_LEVEL_ERROR:-0}
-  _zlog_config[file_level]=${_ZLOG_LEVEL_ERROR:-0}
+  local result_status=0
+  {
+    # Temporarily set to error level (always logged)
+    _zlog_config[level]=${_ZLOG_LEVEL_ERROR:-0}
+    _zlog_config[file_level]=${_ZLOG_LEVEL_ERROR:-0}
+    __z::log::update_fast_flags
 
-  # Log as error
-  __z::log::engine "${_ZLOG_LEVEL_ERROR}" "$message" "$@"
+    # Log as error
+    __z::log::engine "${_ZLOG_LEVEL_ERROR}" "$message" "$@"
+    result_status=$?
+  } always {
+    # Restore levels
+    _zlog_config[level]=$saved_console
+    _zlog_config[file_level]=$saved_file
+    __z::log::update_fast_flags
+  }
 
-  # Restore levels
-  _zlog_config[level]=$saved_console
-  _zlog_config[file_level]=$saved_file
-
-  return 0
+  return $result_status
 }
 
 ###
@@ -4632,7 +4651,7 @@ z::log::once() {
 
   # Validate input
   if (( $# < 3 )); then
-    print -u2 "zlog: once requires key, level, and message"
+    print -r -u2 -- "zlog: once requires key, level, and message"
     return 1
   fi
 
@@ -4641,19 +4660,34 @@ z::log::once() {
   local message="$3"
   shift 3
 
-  # Check if already logged
-  local storage_key="once_${key}"
-  if [[ -n "${_zlog_contexts_parsed[$storage_key]-}" ]]; then
+  if [[ -z "$key" ]]; then
+    print -r -u2 -- "zlog: once key cannot be empty"
+    return 1
+  fi
+
+  if [[ -n "${_zlog_once_keys[$key]-}" ]]; then
     return 0
   fi
 
-  # Mark as logged
-  _zlog_contexts_parsed[$storage_key]="1"
+  __z::log::level_number "$level" || {
+    print -r -u2 -- "zlog: Invalid level for once: $level"
+    return 1
+  }
+  local level_num="$REPLY"
+
+  if ! __z::log::is_level_active "$level_num"; then
+    return 0
+  fi
 
   # Log the message
-  z::log::log "$level" "$message" "$@"
+  z::log::log "$level_num" "$message" "$@"
+  local log_status=$?
 
-  return 0
+  if (( log_status == 0 )); then
+    _zlog_once_keys[$key]=1
+  fi
+
+  return $log_status
 }
 
 ###
@@ -4672,21 +4706,13 @@ z::log::clear_once() {
   emulate -L zsh
   setopt localoptions
 
-  local key="$1"
+  local key="${1-}"
 
   if [[ -n "$key" ]]; then
-    # Clear specific key
-    local storage_key="once_${key}"
-    unset "_zlog_contexts_parsed[$storage_key]"
+    unset "_zlog_once_keys[$key]"
     __z::log::debug_internal "Cleared once marker: $key"
   else
-    # Clear all "once" markers
-    local k
-    for k in "${(@k)_zlog_contexts_parsed}"; do
-      if [[ "$k" == once_* ]]; then
-        unset "_zlog_contexts_parsed[$k]"
-      fi
-    done
+    _zlog_once_keys=()
     __z::log::debug_internal "Cleared all once markers"
   fi
 
@@ -4717,7 +4743,7 @@ z::log::rate_limit() {
 
   # Validate input
   if (( $# < 5 )); then
-    print -u2 "zlog: rate_limit requires key, max_count, time_window, level, and message"
+    print -r -u2 -- "zlog: rate_limit requires key, max_count, time_window, level, and message"
     return 1
   fi
 
@@ -4728,29 +4754,47 @@ z::log::rate_limit() {
   local message="$5"
   shift 5
 
+  if [[ -z "$key" ]]; then
+    print -r -u2 -- "zlog: rate_limit key cannot be empty"
+    return 1
+  fi
+
   # Validate max_count
   if [[ ! "$max_count" =~ '^[0-9]+$' ]] || (( max_count < 1 )); then
-    print -u2 "zlog: rate_limit max_count must be a positive integer"
+    print -r -u2 -- "zlog: rate_limit max_count must be a positive integer"
     return 1
   fi
 
   # Validate time_window
   if [[ ! "$time_window" =~ '^[0-9]+$' ]] || (( time_window < 1 )); then
-    print -u2 "zlog: rate_limit time_window must be a positive integer"
+    print -r -u2 -- "zlog: rate_limit time_window must be a positive integer"
     return 1
   fi
 
-  # Storage key for rate limit data
-  local storage_key="ratelimit_${key}"
+  __z::log::level_number "$level" || {
+    print -r -u2 -- "zlog: Invalid level for rate_limit: $level"
+    return 1
+  }
+  local level_num="$REPLY"
+
+  if ! __z::log::is_level_active "$level_num"; then
+    return 0
+  fi
+
   local current_time=$EPOCHSECONDS
 
   # Get existing rate limit data (format: "timestamp:count")
-  local rate_data="${_zlog_contexts_parsed[$storage_key]-}"
+  local rate_data="${_zlog_rate_limits[$key]-}"
+
+  if [[ -n "$rate_data" && ! "$rate_data" =~ '^[0-9]+:[0-9]+$' ]]; then
+    __z::log::debug_internal "Resetting corrupt rate limit state for key: $key"
+    rate_data=""
+  fi
 
   if [[ -z "$rate_data" ]]; then
     # First message - initialize
-    _zlog_contexts_parsed[$storage_key]="${current_time}:1"
-    z::log::log "$level" "$message" "$@"
+    _zlog_rate_limits[$key]="${current_time}:1"
+    z::log::log "$level_num" "$message" "$@"
     return 0
   fi
 
@@ -4761,20 +4805,21 @@ z::log::rate_limit() {
   # Check if we're in a new time window
   if (( current_time - window_start >= time_window )); then
     # New window - reset
-    _zlog_contexts_parsed[$storage_key]="${current_time}:1"
-    z::log::log "$level" "$message" "$@"
+    _zlog_rate_limits[$key]="${current_time}:1"
+    z::log::log "$level_num" "$message" "$@"
     return 0
   fi
 
   # Same window - check count
   if (( count < max_count )); then
     # Under limit - log and increment
-    _zlog_contexts_parsed[$storage_key]="${window_start}:$((count + 1))"
-    z::log::log "$level" "$message" "$@"
+    _zlog_rate_limits[$key]="${window_start}:$((count + 1))"
+    z::log::log "$level_num" "$message" "$@"
     return 0
   fi
 
   # Rate limited - don't log
+  (( _zlog_stats[messages_dropped]++ ))
   __z::log::debug_internal "Rate limited: $key ($count/$max_count in ${time_window}s window)"
   return 1
 }
@@ -4794,21 +4839,13 @@ z::log::clear_rate_limits() {
   emulate -L zsh
   setopt localoptions
 
-  local key="$1"
+  local key="${1-}"
 
   if [[ -n "$key" ]]; then
-    # Clear specific key
-    local storage_key="ratelimit_${key}"
-    unset "_zlog_contexts_parsed[$storage_key]"
+    unset "_zlog_rate_limits[$key]"
     __z::log::debug_internal "Cleared rate limit: $key"
   else
-    # Clear all rate limits
-    local k
-    for k in "${(@k)_zlog_contexts_parsed}"; do
-      if [[ "$k" == ratelimit_* ]]; then
-        unset "_zlog_contexts_parsed[$k]"
-      fi
-    done
+    _zlog_rate_limits=()
     __z::log::debug_internal "Cleared all rate limits"
   fi
 
@@ -4841,7 +4878,7 @@ z::log::with_context() {
 
   # Validate input
   if (( $# < 2 || $# % 2 != 0 )); then
-    print -u2 "zlog: with_context requires even number of arguments (key-value pairs), got $#"
+    print -r -u2 -- "zlog: with_context requires even number of arguments (key-value pairs), got $#"
     return 1
   fi
 
@@ -4850,16 +4887,9 @@ z::log::with_context() {
   local i
   for (( i=1; i<=${#context_pairs}; i+=2 )); do
     local key="${context_pairs[i]}"
-    local value="${context_pairs[i+1]}"
 
-    # Validate key is non-empty and contains no special characters
-    if [[ -z "$key" ]]; then
-      print -u2 "zlog: Context key cannot be empty at position $i"
-      return 1
-    fi
-
-    if [[ "$key" =~ [^a-zA-Z0-9_-] ]]; then
-      print -u2 "zlog: Context key '$key' contains invalid characters (only alphanumeric, _, - allowed)"
+    if ! __z::log::validate_context_key "$key"; then
+      print -r -u2 -- "zlog: Invalid context key at position $i: $key"
       return 1
     fi
   done
@@ -4885,7 +4915,7 @@ z::log::with_context() {
   done
 
   if (( attempt >= max_attempts )); then
-    print -u2 "zlog: Failed to generate unique context ID after $max_attempts attempts"
+    print -r -u2 -- "zlog: Failed to generate unique context ID after $max_attempts attempts"
     REPLY=""
     return 1
   fi
@@ -4893,12 +4923,14 @@ z::log::with_context() {
   # Store context data (null-separated for easy splitting)
   _zlog_contexts[$ctx_id]="${(pj:\0:)context_pairs}"
   _zlog_contexts_order+=("$ctx_id")
+  _zlog_state[context_count]=${#_zlog_contexts}
 
   # Create logging functions for this context
   if ! __z::log::create_context_functions "$ctx_id"; then
-    print -u2 "zlog: Failed to create context functions for $ctx_id"
+    print -r -u2 -- "zlog: Failed to create context functions for $ctx_id"
     unset "_zlog_contexts[$ctx_id]"
     _zlog_contexts_order=("${(@)_zlog_contexts_order:#$ctx_id}")
+    _zlog_state[context_count]=${#_zlog_contexts}
     REPLY=""
     return 1
   fi
@@ -4917,11 +4949,11 @@ __z::log::create_context_functions() {
   emulate -L zsh
   setopt localoptions
 
-  local ctx_id="$1"
+  local ctx_id="${1-}"
 
   # Validate context ID format
   if [[ ! "$ctx_id" =~ ^zlog_ctx_[0-9]+_[0-9]+_[0-9]+$ ]]; then
-    print -u2 "zlog: Invalid context ID format: $ctx_id"
+    print -r -u2 -- "zlog: Invalid context ID format: $ctx_id"
     return 1
   fi
 
@@ -4943,16 +4975,16 @@ __z::log::create_context_function() {
   emulate -L zsh
   setopt localoptions
 
-  local ctx_id="$1"
-  local level="$2"
-  local formatted="$3"
+  local ctx_id="${1-}"
+  local level="${2-}"
+  local formatted="${3-}"
 
   local func_name="${ctx_id}::${level}"
   [[ "$formatted" == "true" ]] && func_name="${func_name}f"
 
   # Validate function name format
   if [[ ! "$func_name" =~ ^zlog_ctx_[0-9]+_[0-9]+_[0-9]+::(error|warn|info|debug)f?$ ]]; then
-    print -u2 "zlog: Invalid function name: $func_name"
+    print -r -u2 -- "zlog: Invalid function name: $func_name"
     return 1
   fi
 
@@ -4963,20 +4995,26 @@ __z::log::create_context_function() {
     eval "
 function ${func_name}() {
   emulate -L zsh
+  setopt localoptions no_unset
   local func_name=\"\${0}\"
   local func_ctx_id=\"\${func_name%%::*}\"
   local func_level=\"\${func_name##*::}\"
   func_level=\"\${func_level%f}\"
 
   if [[ -z \"\${_zlog_contexts[\$func_ctx_id]-}\" ]]; then
-    print -u2 \"zlog: Context \$func_ctx_id no longer exists\"
+    print -r -u2 -- \"zlog: Context \$func_ctx_id no longer exists\"
+    return 1
+  fi
+
+  if (( \$# < 1 )); then
+    print -r -u2 -- \"zlog: \$func_name requires a format string\"
     return 1
   fi
 
   local fmt=\"\$1\"
   shift
   local msg
-  if msg=\$(printf \"\$fmt\" \"\$@\" 2>&1); then
+  if printf -v msg -- \"\$fmt\" \"\$@\" 2>/dev/null; then
     :
   else
     msg=\"<printf error: \$fmt>\"
@@ -4992,12 +5030,18 @@ function ${func_name}() {
     eval "
 function ${func_name}() {
   emulate -L zsh
+  setopt localoptions no_unset
   local func_name=\"\${0}\"
   local func_ctx_id=\"\${func_name%%::*}\"
   local func_level=\"\${func_name##*::}\"
 
   if [[ -z \"\${_zlog_contexts[\$func_ctx_id]-}\" ]]; then
-    print -u2 \"zlog: Context \$func_ctx_id no longer exists\"
+    print -r -u2 -- \"zlog: Context \$func_ctx_id no longer exists\"
+    return 1
+  fi
+
+  if (( \$# < 1 )); then
+    print -r -u2 -- \"zlog: \$func_name requires a message\"
     return 1
   fi
 
@@ -5012,13 +5056,13 @@ function ${func_name}() {
 
   local eval_status=$?
   if (( eval_status != 0 )); then
-    print -u2 "zlog: eval failed for function $func_name (status: $eval_status)"
+    print -r -u2 -- "zlog: eval failed for function $func_name (status: $eval_status)"
     return 1
   fi
 
   # Verify function was created
   if (( ! ${+functions[$func_name]} )); then
-    print -u2 "zlog: Failed to create function: $func_name"
+    print -r -u2 -- "zlog: Failed to create function: $func_name"
     return 1
   fi
 
@@ -5049,16 +5093,18 @@ __z::log::remove_context_silent() {
   emulate -L zsh
   setopt localoptions
 
-  local ctx_id="$1"
+  local ctx_id="${1-}"
 
   [[ -z "$ctx_id" ]] && return 1
   [[ -z "${_zlog_contexts[$ctx_id]-}" ]] && return 1
 
   # Remove from storage
   unset "_zlog_contexts[$ctx_id]"
+  unset "_zlog_contexts_parsed[$ctx_id]" 2>/dev/null || true
 
   # Remove from order tracking
   _zlog_contexts_order=("${(@)_zlog_contexts_order:#$ctx_id}")
+  _zlog_state[context_count]=${#_zlog_contexts}
 
   # Unset functions
   local level suffix
@@ -5091,17 +5137,17 @@ z::log::remove_context() {
   emulate -L zsh
   setopt localoptions
 
-  local ctx_id="$1"
+  local ctx_id="${1-}"
 
   # Validate input
   if [[ -z "$ctx_id" ]]; then
-    print -u2 "zlog: remove_context requires a context ID"
+    print -r -u2 -- "zlog: remove_context requires a context ID"
     return 1
   fi
 
   # Check if context exists
   if [[ -z "${_zlog_contexts[$ctx_id]-}" ]]; then
-    print -u2 "zlog: Context $ctx_id does not exist or already removed"
+    print -r -u2 -- "zlog: Context $ctx_id does not exist or already removed"
     return 1
   fi
 
@@ -5132,7 +5178,9 @@ z::log::remove_all_contexts() {
 
   # Clear all storage
   _zlog_contexts=()
+  _zlog_contexts_parsed=()
   _zlog_contexts_order=()
+  _zlog_state[context_count]=0
 
   return 0
 }
@@ -5151,7 +5199,7 @@ z::log::list_contexts() {
   setopt localoptions
 
   if (( ${#_zlog_contexts_order} == 0 )); then
-    print "No active contexts"
+    print -r -- "No active contexts"
     return 0
   fi
 
@@ -5168,7 +5216,7 @@ z::log::list_contexts() {
         print -n "${ctx_data[i]}=${ctx_data[i+1]} "
       done
 
-      print
+      print -r --
     fi
   done
 }
@@ -5198,7 +5246,7 @@ z::log::benchmark() {
 
   # Validate input
   if (( $# < 2 )); then
-    print -u2 "zlog: benchmark requires operation name and command"
+    print -r -u2 -- "zlog: benchmark requires operation name and command"
     return 1
   fi
 
@@ -5207,7 +5255,7 @@ z::log::benchmark() {
 
   # Validate operation name
   if [[ -z "$operation_name" ]]; then
-    print -u2 "zlog: benchmark operation name cannot be empty"
+    print -r -u2 -- "zlog: benchmark operation name cannot be empty"
     return 1
   fi
 
@@ -5218,18 +5266,21 @@ z::log::benchmark() {
     return $?
   fi
 
-  local start_time=$EPOCHREALTIME
+  z::log::benchmark_now
+  local start_time="$REPLY"
 
   # Execute command and capture exit code
   local exit_code
   "$@"
   exit_code=$?
 
-  local end_time=$EPOCHREALTIME
+  z::log::benchmark_now
+  local end_time="$REPLY"
 
   # Calculate duration in milliseconds
   local duration_ms
-  duration_ms=$(( (end_time - start_time) * 1000 ))
+  duration_ms=$(( end_time - start_time ))
+  (( duration_ms < 0 )) && duration_ms=0
 
   # Format duration
   __z::log::format_duration "$duration_ms"
@@ -5263,11 +5314,11 @@ z::log::benchmark_start() {
   emulate -L zsh
   setopt localoptions
 
-  local operation_name="$1"
+  local operation_name="${1-}"
 
   # Validate input
   if [[ -z "$operation_name" ]]; then
-    print -u2 "zlog: benchmark_start requires operation name"
+    print -r -u2 -- "zlog: benchmark_start requires operation name"
     return 1
   fi
 
@@ -5299,14 +5350,16 @@ z::log::benchmark_start() {
   done
 
   if (( attempt >= max_attempts )); then
-    print -u2 "zlog: Failed to generate unique timer ID after $max_attempts attempts"
+    print -r -u2 -- "zlog: Failed to generate unique timer ID after $max_attempts attempts"
     REPLY=""
     return 1
   fi
 
   # Store timer data: start_time|operation_name
-  _zlog_benchmark_timers[$timer_id]="${EPOCHREALTIME}|${operation_name}"
+  z::log::benchmark_now
+  _zlog_benchmark_timers[$timer_id]="${REPLY}|${operation_name}"
   _zlog_benchmark_timer_order+=("$timer_id")
+  _zlog_state[timer_count]=${#_zlog_benchmark_timers}
 
   # Return timer ID via REPLY
   REPLY="$timer_id"
@@ -5334,7 +5387,7 @@ z::log::benchmark_end() {
   emulate -L zsh
   setopt localoptions
 
-  local timer_id="$1"
+  local timer_id="${1-}"
 
   # Handle empty timer (when info logging is disabled)
   if [[ -z "$timer_id" ]]; then
@@ -5343,13 +5396,13 @@ z::log::benchmark_end() {
 
   # Validate input format
   if [[ ! "$timer_id" =~ ^zbt_[0-9]+_[0-9]+_[0-9]+$ ]]; then
-    print -u2 "zlog: Invalid timer ID format: $timer_id"
+    print -r -u2 -- "zlog: Invalid timer ID format: $timer_id"
     return 1
   fi
 
   # Check if timer exists
   if [[ -z "${_zlog_benchmark_timers[$timer_id]-}" ]]; then
-    print -u2 "zlog: Timer not found: $timer_id"
+    print -r -u2 -- "zlog: Timer not found: $timer_id"
     return 1
   fi
 
@@ -5358,10 +5411,20 @@ z::log::benchmark_end() {
   local start_time="${timer_data%%|*}"
   local operation_name="${timer_data#*|}"
 
+  if [[ ! "$start_time" =~ '^[0-9]+$' ]]; then
+    print -r -u2 -- "zlog: Corrupt timer data for: $timer_id"
+    unset "_zlog_benchmark_timers[$timer_id]"
+    _zlog_benchmark_timer_order=("${(@)_zlog_benchmark_timer_order:#$timer_id}")
+    _zlog_state[timer_count]=${#_zlog_benchmark_timers}
+    return 1
+  fi
+
   # Calculate duration
-  local end_time=$EPOCHREALTIME
+  z::log::benchmark_now
+  local end_time="$REPLY"
   local duration_ms
-  duration_ms=$(( (end_time - start_time) * 1000 ))
+  duration_ms=$(( end_time - start_time ))
+  (( duration_ms < 0 )) && duration_ms=0
 
   # Format duration
   __z::log::format_duration "$duration_ms"
@@ -5374,6 +5437,7 @@ z::log::benchmark_end() {
   # Cleanup timer
   unset "_zlog_benchmark_timers[$timer_id]"
   _zlog_benchmark_timer_order=("${(@)_zlog_benchmark_timer_order:#$timer_id}")
+  _zlog_state[timer_count]=${#_zlog_benchmark_timers}
 
   __z::log::debug_internal "Ended timer: $timer_id"
 
@@ -5401,11 +5465,11 @@ z::log::benchmark_block() {
   emulate -L zsh
   setopt localoptions
 
-  local operation_name="$1"
+  local operation_name="${1-}"
 
   # Validate input
   if [[ -z "$operation_name" ]]; then
-    print -u2 "zlog: benchmark_block requires operation name"
+    print -r -u2 -- "zlog: benchmark_block requires operation name"
     return 1
   fi
 
@@ -5416,18 +5480,21 @@ z::log::benchmark_block() {
     return $?
   fi
 
-  local start_time=$EPOCHREALTIME
+  z::log::benchmark_now
+  local start_time="$REPLY"
 
   # Execute the code block from stdin
   local exit_code
   eval "$(cat)"
   exit_code=$?
 
-  local end_time=$EPOCHREALTIME
+  z::log::benchmark_now
+  local end_time="$REPLY"
 
   # Calculate duration
   local duration_ms
-  duration_ms=$(( (end_time - start_time) * 1000 ))
+  duration_ms=$(( end_time - start_time ))
+  (( duration_ms < 0 )) && duration_ms=0
 
   # Format duration
   __z::log::format_duration "$duration_ms"
@@ -5456,49 +5523,12 @@ __z::log::cleanup_oldest_timer() {
 
   # Remove from order array (shift left)
   _zlog_benchmark_timer_order=("${(@)_zlog_benchmark_timer_order[2,-1]}")
+  _zlog_state[timer_count]=${#_zlog_benchmark_timers}
 
   __z::log::debug_internal "Cleaned up oldest timer: $oldest_timer"
 }
 
-###
-# Internal: Format duration in human-readable format
-# Sets REPLY variable with formatted duration string
-#
-# Arguments:
-#   duration_ms - Duration in milliseconds
-#
-# Output:
-#   Sets REPLY with formatted string (e.g., "1.23ms", "2.45s", "1m30.50s")
-###
-__z::log::format_duration() {
-  emulate -L zsh
-  local duration_ms="$1"
-
-  # Validate input
-  if [[ ! "$duration_ms" =~ ^[0-9]+\.?[0-9]*$ ]]; then
-    REPLY="<invalid duration>"
-    return 1
-  fi
-
-  # Format based on magnitude
-  if (( duration_ms < 1 )); then
-    # Sub-millisecond: show microseconds
-    REPLY=$(printf "%.0fµs" "$(( duration_ms * 1000 ))")
-  elif (( duration_ms < 1000 )); then
-    # Milliseconds
-    REPLY=$(printf "%.2fms" "$duration_ms")
-  elif (( duration_ms < 60000 )); then
-    # Seconds
-    REPLY=$(printf "%.2fs" "$(( duration_ms / 1000.0 ))")
-  else
-    # Minutes and seconds
-    local minutes=$(( duration_ms / 60000 ))
-    local seconds=$(( (duration_ms % 60000) / 1000.0 ))
-    REPLY=$(printf "%dm%.2fs" "$minutes" "$seconds")
-  fi
-
-  return 0
-}
+# Duration formatting is defined once in the timestamp utilities section.
 
 ###
 # List all active benchmark timers
@@ -5514,7 +5544,7 @@ z::log::list_timers() {
   setopt localoptions
 
   if (( ${#_zlog_benchmark_timer_order} == 0 )); then
-    print "No active timers"
+    print -r -- "No active timers"
     return 0
   fi
 
@@ -5530,7 +5560,7 @@ z::log::list_timers() {
       __z::log::format_duration "$elapsed_ms"
       local elapsed_str="$REPLY"
 
-      print "$timer_id $operation_name (elapsed: $elapsed_str)"
+      print -r -- "$timer_id $operation_name (elapsed: $elapsed_str)"
     fi
   done
 }
@@ -5552,6 +5582,7 @@ z::log::clear_timers() {
 
   _zlog_benchmark_timers=()
   _zlog_benchmark_timer_order=()
+  _zlog_state[timer_count]=0
 
   __z::log::debug_internal "Cleared $count timer(s)"
 
@@ -5570,25 +5601,29 @@ z::log::clear_timers() {
 ###
 z::log::cleanup() {
   emulate -L zsh
-  setopt local_options no_unset 2>/dev/null || true
+  setopt localoptions no_unset
 
-  # Guard: prevent multiple cleanup runs (use global variable)
-  (( ${_zlog_state[cleanup_registered]:-0} == 0 )) && return 0
+  (( ${_zlog_state[cleanup_running]:-0} )) && return 0
+  _zlog_state[cleanup_running]=1
 
-  # Disable async logging first to prevent new writes
-  if [[ -n "${_zlog_config[async_pid]:-}" ]]; then
+  {
+
+  # Flush any buffered logs
+  if (( ${#_zlog_buffer} > 0 )); then
+    (( ${+functions[z::log::flush]} )) && z::log::flush 2>/dev/null || true
+  fi
+  _zlog_state[buffer_count]=${#_zlog_buffer}
+
+  # Disable async logging after flushing so queued buffered messages can drain.
+  if [[ -n "${_zlog_state[async_pid]:-}" ]]; then
     (( ${+functions[z::log::disable_async]} )) && z::log::disable_async 2>/dev/null || true
   fi
 
-  # Flush any buffered logs
-  if (( ${_zlog_config[buffered]:-0} && ${_zlog_config[buffer_count]:-0} > 0 )); then
-    (( ${+functions[z::log::flush]} )) && z::log::flush 2>/dev/null || true
-  fi
-
   # Close file descriptor if open
-  if [[ "${_zlog_config[fd]:-"-1"}" != "-1" ]]; then
-    exec {_zlog_config[fd]}>&- 2>/dev/null || true
-    _zlog_config[fd]=-1
+  if [[ "${_zlog_state[fd]:--1}" != "-1" ]]; then
+    local zlog_fd="${_zlog_state[fd]}"
+    exec {zlog_fd}>&- 2>/dev/null || true
+    _zlog_state[fd]=-1
   fi
 
   # Clear all context loggers silently
@@ -5599,12 +5634,17 @@ z::log::cleanup() {
         __z::log::remove_context_silent "$ctx_id" 2>/dev/null || true
     done
   fi
+  _zlog_contexts=()
+  _zlog_contexts_parsed=()
+  _zlog_contexts_order=()
+  _zlog_state[context_count]=0
 
   # Clear benchmark timers
   if (( ${#_zlog_benchmark_timers} > 0 )); then
     _zlog_benchmark_timers=()
     _zlog_benchmark_timer_order=()
   fi
+  _zlog_state[timer_count]=0
 
   # Clear rate limits and once keys
   if (( ${#_zlog_rate_limits} > 0 )); then
@@ -5615,8 +5655,9 @@ z::log::cleanup() {
     _zlog_once_keys=()
   fi
 
-  # Mark cleanup as complete (modify global)
-  typeset -g _zlog_state[cleanup_registered]=0
+  } always {
+    _zlog_state[cleanup_running]=0
+  }
 
   return 0
 }
@@ -5627,7 +5668,8 @@ z::log::cleanup() {
 # Usage: z::log::register_cleanup
 ###
 z::log::register_cleanup() {
-  emulate -R zsh
+  emulate -L zsh
+  setopt localoptions no_unset
 
   # Guard: prevent multiple registrations
   (( ${_zlog_state[cleanup_registered]:-0} )) && return 0
@@ -5640,37 +5682,28 @@ z::log::register_cleanup() {
   # Try to use add-zsh-hook if available (cleaner, more composable)
   if (( ${+functions[add-zsh-hook]} )); then
     if add-zsh-hook zshexit z::log::cleanup 2>/dev/null; then
-      typeset -g _zlog_state[cleanup_registered]=1
+      _zlog_state[cleanup_registered]=1
+      _zlog_config[exit_hook_method]="add-zsh-hook"
       return 0
     fi
   fi
 
-  # Fallback: use TRAPEXIT function (zsh native)
-  # Check if TRAPEXIT already exists
-  if (( ${+functions[TRAPEXIT]} )); then
-    # Save existing TRAPEXIT body
-    local existing_body="${functions[TRAPEXIT]}"
-
-    # Check if our cleanup is already registered
-    if [[ "$existing_body" == *"z::log::cleanup"* ]]; then
-      typeset -g _zlog_state[cleanup_registered]=1
-      return 0
-    fi
-
-    # Create new TRAPEXIT that calls both
-    eval "function TRAPEXIT {
-      ${existing_body}
-      z::log::cleanup
-    }"
-  else
-    # Create new TRAPEXIT at global scope
-    eval "function TRAPEXIT {
-      z::log::cleanup
-    }"
+  # Fallback: reversible TRAPEXIT wrapper.
+  if (( ${+functions[TRAPEXIT]} && ! ${+functions[__zlog_original_TRAPEXIT]} )); then
+    functions[__zlog_original_TRAPEXIT]="${functions[TRAPEXIT]}"
   fi
 
-  # Explicitly set global variable
-  typeset -g _zlog_state[cleanup_registered]=1
+  function TRAPEXIT() {
+    local zlog_status=$?
+    if (( ${+functions[__zlog_original_TRAPEXIT]} )); then
+      __zlog_original_TRAPEXIT
+    fi
+      z::log::cleanup
+    return $zlog_status
+  }
+
+  _zlog_state[cleanup_registered]=1
+  _zlog_config[exit_hook_method]="TRAPEXIT"
 
   return 0
 }
@@ -5682,10 +5715,10 @@ z::log::register_cleanup() {
 ###
 z::log::get_exit_hook_method() {
   emulate -L zsh
-  setopt local_options no_unset 2>/dev/null || true
+  setopt localoptions no_unset 2>/dev/null || true
 
   if (( ! ${_zlog_state[cleanup_registered]:-0} )); then
-    print "none"
+    print -r -- "none"
     return 0
   fi
 
@@ -5695,7 +5728,7 @@ z::log::get_exit_hook_method() {
     hooks=("${zshexit_functions[@]}")
 
     if (( ${hooks[(I)z::log::cleanup]} )); then
-      print "zshexit"
+      print -r -- "zshexit"
       return 0
     fi
   fi
@@ -5705,13 +5738,13 @@ z::log::get_exit_hook_method() {
     local trapexit_body="${functions[TRAPEXIT]}"
 
     if [[ "$trapexit_body" == *"z::log::cleanup"* ]]; then
-      print "trapexit"
+      print -r -- "trapexit"
       return 0
     fi
   fi
 
   # If registered but not detected, assume trapexit (safest assumption)
-  print "trapexit"
+  print -r -- "trapexit"
   return 0
 }
 
@@ -5720,7 +5753,8 @@ z::log::get_exit_hook_method() {
 # Usage: z::log::unregister_cleanup
 ###
 z::log::unregister_cleanup() {
-  emulate -R zsh
+  emulate -L zsh
+  setopt localoptions no_unset
 
   # Guard: nothing to unregister
   (( ! ${_zlog_state[cleanup_registered]:-0} )) && return 0
@@ -5730,37 +5764,15 @@ z::log::unregister_cleanup() {
     add-zsh-hook -d zshexit z::log::cleanup 2>/dev/null || true
   fi
 
-  # Remove from TRAPEXIT
-  if (( ${+functions[TRAPEXIT]} )); then
-    local trapexit_body="${functions[TRAPEXIT]}"
-
-    # If TRAPEXIT contains our cleanup
-    if [[ "$trapexit_body" == *"z::log::cleanup"* ]]; then
-      # Try to remove just our part
-      local new_body="${trapexit_body//z::log::cleanup/}"
-
-      # Clean up the body
-      new_body="${new_body//
-      /
-}"
-      new_body="${new_body//;;/;}"
-      new_body="${new_body#;}"
-      new_body="${new_body%;}"
-
-      # If something remains, recreate TRAPEXIT
-      if [[ -n "${new_body// /}" ]]; then
-        eval "function TRAPEXIT {
-          ${new_body}
-        }"
-      else
-        # Nothing left, remove TRAPEXIT
+  if (( ${+functions[__zlog_original_TRAPEXIT]} )); then
+    functions[TRAPEXIT]="${functions[__zlog_original_TRAPEXIT]}"
+    unfunction __zlog_original_TRAPEXIT 2>/dev/null || true
+  elif [[ "${_zlog_config[exit_hook_method]:-}" == "TRAPEXIT" ]]; then
         unfunction TRAPEXIT 2>/dev/null || true
       fi
-    fi
-  fi
 
-  # Explicitly set global variable
-  typeset -g _zlog_state[cleanup_registered]=0
+  _zlog_state[cleanup_registered]=0
+  _zlog_config[exit_hook_method]=""
 
   return 0
 }
@@ -5775,15 +5787,18 @@ z::log::unregister_cleanup() {
 ###
 z::log::set_max_size() {
   emulate -L zsh
-  local size="$1"
+  local size="${1-}"
 
-  # Validate it's a number
-  if [[ ! "$size" =~ ^[0-9]+$ ]]; then
-    z::log::error "Invalid max size: $size (must be a positive integer)"
+  __z::log::parse_size "$size"
+  local parse_status=$?
+  local size_bytes="$REPLY"
+
+  if (( parse_status != 0 )) || [[ ! "$size_bytes" =~ '^[0-9]+$' ]] || (( size_bytes < 1 )); then
+    print -r -u2 -- "zlog: Invalid max size: $size"
     return 1
   fi
 
-  _zlog_config[max_size]=$size
+  _zlog_config[rotate_size]=$size_bytes
 
   return 0
 }
@@ -5794,15 +5809,15 @@ z::log::set_max_size() {
 ###
 z::log::set_max_files() {
   emulate -L zsh
-  local count="$1"
+  local count="${1-}"
 
   # Validate it's a number
-  if [[ ! "$count" =~ ^[0-9]+$ ]]; then
-    z::log::error "Invalid max files: $count (must be a positive integer)"
+  if [[ ! "$count" =~ '^[0-9]+$' ]]; then
+    print -r -u2 -- "zlog: Invalid max files: $count (must be a non-negative integer)"
     return 1
   fi
 
-  _zlog_config[max_files]=$count
+  _zlog_config[rotate_keep]=$count
 
   return 0
 }
@@ -5814,14 +5829,14 @@ z::log::set_max_files() {
 ###
 z::log::set_buffer_size() {
   emulate -L zsh
-  local size="$1"
+  local size="${1-}"
 
-  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size < 1 )); then
-    z::log::error "Invalid buffer size: $size (must be >= 1)"
+  if [[ ! "$size" =~ '^[0-9]+$' ]] || (( size < 1 )); then
+    print -r -u2 -- "zlog: Invalid buffer size: $size (must be >= 1)"
     return 1
   fi
 
-  _zlog_config[buffer_size]=$size
+  _zlog_config[buffer_max]=$size
 
   return 0
 }
@@ -5903,34 +5918,35 @@ z::log::show_config() {
   local color_mode="${_zlog_color_cache[mode]}"
   local hook_method="${_zlog_config[exit_hook_method]:-none}"
 
-  print "╔════════════════════════════════════════════════════════════════╗"
-  print "║                    ZLOG Configuration                          ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Console Level:      $(printf '%-40s' "$console_level_name ($console_level)")   ║"
-  print "║ File Level:         $(printf '%-40s' "$file_level_name ($file_level)")   ║"
-  print "║ Format:             $(printf '%-40s' "${_zlog_config[format]:-text}")   ║"
-  print "║ Log File:           $(printf '%-40s' "${_zlog_config[file]:-<none>}")   ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Rotation:           $(printf '%-40s' "$( (( ${_zlog_config[rotate]:-1} )) && echo 'enabled' || echo 'disabled' )")   ║"
-  print "║ Rotation Size:      $(printf '%-40s' "$(z::log::get_max_message_size 2>/dev/null || echo 'N/A')")   ║"
-  print "║ Rotation Keep:      $(printf '%-40s' "${_zlog_config[rotate_keep]:-5} files")   ║"
-  print "║ Lock Timeout:       $(printf '%-40s' "${_zlog_config[rotation_lock_timeout]:-5}s")   ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Buffering:          $(printf '%-40s' "$( (( ${_zlog_config[buffered]:-0} )) && echo 'enabled' || echo 'disabled' )")   ║"
-  print "║ Buffer Max:         $(printf '%-40s' "${_zlog_config[buffer_max]:-50} messages")   ║"
-  print "║ Buffer Current:     $(printf '%-40s' "${#_zlog_buffer} messages")   ║"
-  print "║ Exit Hook:          $(printf '%-40s' "$hook_method")   ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Max Message Size:   $(printf '%-40s' "$( (( ${_zlog_config[max_message_size]:-0} == 0 )) && echo 'unlimited' || echo \"$(z::log::get_max_message_size 2>/dev/null || echo 'N/A')\" )")   ║"
-  print "║ Truncate Marker:    $(printf '%-40s' "${_zlog_config[truncate_marker]}")   ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Color Mode:         $(printf '%-40s' "$color_mode")   ║"
-  print "║ Timestamp Cache:    $(printf '%-40s' "$( (( ${_zlog_config[timestamp_cache_enabled]:-1} )) && echo 'enabled' || echo 'disabled' )")   ║"
-  print "║ Debug Mode:         $(printf '%-40s' "$( (( ${_zlog_config[debug_mode]:-0} )) && echo 'enabled' || echo 'disabled' )")   ║"
-  print "╠════════════════════════════════════════════════════════════════╣"
-  print "║ Active Contexts:    $(printf '%-40s' "${#_zlog_contexts}")   ║"
-  print "║ Active Timers:      $(printf '%-40s' "${#_zlog_benchmark_timers}")   ║"
-  print "╚════════════════════════════════════════════════════════════════╝"
+  print -r -- "╔════════════════════════════════════════════════════════════════╗"
+  print -r -- "║                    ZLOG Configuration                          ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Console Level:      $(printf '%-40s' "$console_level_name ($console_level)")   ║"
+  print -r -- "║ File Level:         $(printf '%-40s' "$file_level_name ($file_level)")   ║"
+  print -r -- "║ Format:             $(printf '%-40s' "${_zlog_config[format]:-text}")   ║"
+  print -r -- "║ Log File:           $(printf '%-40s' "${_zlog_config[file]:-<none>}")   ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Rotation:           $(printf '%-40s' "$( (( ${_zlog_config[rotate]:-1} )) && echo 'enabled' || echo 'disabled' )")   ║"
+  __z::log::format_size "${_zlog_config[rotate_size]:-0}"
+  print -r -- "║ Rotation Size:      $(printf '%-40s' "$REPLY")   ║"
+  print -r -- "║ Rotation Keep:      $(printf '%-40s' "${_zlog_config[rotate_keep]:-5} files")   ║"
+  print -r -- "║ Lock Timeout:       $(printf '%-40s' "${_zlog_config[rotation_lock_timeout]:-5}s")   ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Buffering:          $(printf '%-40s' "$( (( ${_zlog_config[buffered]:-0} )) && echo 'enabled' || echo 'disabled' )")   ║"
+  print -r -- "║ Buffer Max:         $(printf '%-40s' "${_zlog_config[buffer_max]:-50} messages")   ║"
+  print -r -- "║ Buffer Current:     $(printf '%-40s' "${#_zlog_buffer} messages")   ║"
+  print -r -- "║ Exit Hook:          $(printf '%-40s' "$hook_method")   ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Max Message Size:   $(printf '%-40s' "$( (( ${_zlog_config[max_message_size]:-0} == 0 )) && echo 'unlimited' || echo \"$(z::log::get_max_message_size 2>/dev/null || echo 'N/A')\" )")   ║"
+  print -r -- "║ Truncate Marker:    $(printf '%-40s' "${_zlog_config[truncate_marker]}")   ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Color Mode:         $(printf '%-40s' "$color_mode")   ║"
+  print -r -- "║ Timestamp Cache:    $(printf '%-40s' "$( (( ${_zlog_config[timestamp_cache_enabled]:-1} )) && echo 'enabled' || echo 'disabled' )")   ║"
+  print -r -- "║ Debug Mode:         $(printf '%-40s' "$( (( ${_zlog_config[debug_mode]:-0} )) && echo 'enabled' || echo 'disabled' )")   ║"
+  print -r -- "╠════════════════════════════════════════════════════════════════╣"
+  print -r -- "║ Active Contexts:    $(printf '%-40s' "${#_zlog_contexts}")   ║"
+  print -r -- "║ Active Timers:      $(printf '%-40s' "${#_zlog_benchmark_timers}")   ║"
+  print -r -- "╚════════════════════════════════════════════════════════════════╝"
 
   return 0
 }
@@ -5948,7 +5964,7 @@ z::log::set_format() {
 
   # Validate input
   if [[ -z "$format" ]]; then
-    print -u2 "zlog: Format cannot be empty"
+    print -r -u2 -- "zlog: Format cannot be empty"
     return 1
   fi
 
@@ -5962,7 +5978,7 @@ z::log::set_format() {
       return 0
       ;;
     *)
-      print -u2 "zlog: Invalid format: $format (use 'text' or 'json')"
+      print -r -u2 -- "zlog: Invalid format: $format (use 'text' or 'json')"
       return 1
       ;;
   esac
@@ -5981,21 +5997,25 @@ z::log::set_level() {
 
   # Validate input
   if [[ -z "$level_input" ]]; then
-    print -u2 "zlog: Level cannot be empty"
+    print -r -u2 -- "zlog: Level cannot be empty"
     return 1
   fi
 
   # Convert to number
   __z::log::level_number "$level_input"
+  local level_status=$?
   local level_num="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid log level: $level_input (use: error, warn, info, debug)"
+  if (( level_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid log level: $level_input (use: error, warn, info, debug)"
     return 1
   fi
 
   _zlog_config[level]=$level_num
-  __z::log::debug_internal "Console log level set to: $level_num ($(__z::log::level_name $level_num; echo $REPLY))"
+  __z::log::update_fast_flags
+  __z::log::level_name "$level_num"
+  local level_name="$REPLY"
+  __z::log::debug_internal "Console log level set to: $level_num ($level_name)"
 
   return 0
 }
@@ -6013,28 +6033,33 @@ z::log::set_file_level() {
 
   # Validate input
   if [[ -z "$level_input" ]]; then
-    print -u2 "zlog: Level cannot be empty"
+    print -r -u2 -- "zlog: Level cannot be empty"
     return 1
   fi
 
   # Special case: -1 or "console" means follow console level
   if [[ "$level_input" == "-1" ]] || [[ "$level_input" == "console" ]]; then
     _zlog_config[file_level]=-1
+    __z::log::update_fast_flags
     __z::log::debug_internal "File log level set to follow console level"
     return 0
   fi
 
   # Convert to number
   __z::log::level_number "$level_input"
+  local level_status=$?
   local level_num="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid file log level: $level_input"
+  if (( level_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid file log level: $level_input"
     return 1
   fi
 
   _zlog_config[file_level]=$level_num
-  __z::log::debug_internal "File log level set to: $level_num ($(__z::log::level_name $level_num; echo $REPLY))"
+  __z::log::update_fast_flags
+  __z::log::level_name "$level_num"
+  local level_name="$REPLY"
+  __z::log::debug_internal "File log level set to: $level_num ($level_name)"
 
   return 0
 }
@@ -6048,11 +6073,24 @@ z::log::set_file_level() {
 ###
 z::log::set_file() {
   emulate -L zsh
-  local filepath="$1"
+  local filepath="${1-}"
+  local old_file="${_zlog_config[file]}"
 
   # Flush any pending messages to old file
   if [[ -n "${_zlog_config[file]}" ]] && (( ${_zlog_config[buffered]:-0} )); then
-    z::log::flush
+    if ! z::log::flush; then
+      print -r -u2 -- "zlog: Failed to flush buffer before changing log file"
+      return 1
+    fi
+  fi
+
+  # Async workers capture the file path at startup.
+  # Disable async before switching destinations.
+  if [[ "$filepath" != "$old_file" ]] && (( ${+functions[z::log::is_async]} )) && z::log::is_async; then
+    z::log::disable_async || {
+      print -r -u2 -- "zlog: Failed to disable async before changing log file"
+      return 1
+    }
   fi
 
   _zlog_config[file]="$filepath"
@@ -6063,7 +6101,8 @@ z::log::set_file() {
     __z::log::debug_internal "Log file set to: $filepath"
 
     # Reset stat command detection for new file
-    _zlog_config[stat_cmd]=""
+    _zlog_state[stat_cmd]=""
+    _zlog_state[stat_bin]=""
   fi
 
   # Update fast-path flags so file_enabled reflects the new path
@@ -6083,28 +6122,29 @@ z::log::set_file() {
 ###
 z::log::set_rotation() {
   emulate -L zsh
-  local enabled="$1"
+  local enabled="${1-}"
   local max_size="${2:-10MB}"
   local keep_count="${3:-5}"
 
   # Validate enabled flag
   if [[ "$enabled" != "0" ]] && [[ "$enabled" != "1" ]]; then
-    print -u2 "zlog: Invalid rotation flag: $enabled (use 0 or 1)"
+    print -r -u2 -- "zlog: Invalid rotation flag: $enabled (use 0 or 1)"
     return 1
   fi
 
   # Parse max_size (supports human-readable)
   __z::log::parse_size "$max_size"
+  local parse_status=$?
   local size_bytes="$REPLY"
 
-  if (( $? != 0 )); then
-    print -u2 "zlog: Invalid max size: $max_size"
+  if (( parse_status != 0 )); then
+    print -r -u2 -- "zlog: Invalid max size: $max_size"
     return 1
   fi
 
   # Validate keep_count
-  if [[ ! "$keep_count" =~ '^[0-9]+$' ]] || (( keep_count < 1 )); then
-    print -u2 "zlog: Invalid keep count: $keep_count (must be positive integer)"
+  if [[ ! "$keep_count" =~ '^[0-9]+$' ]]; then
+    print -r -u2 -- "zlog: Invalid keep count: $keep_count (must be non-negative integer)"
     return 1
   fi
 
@@ -6130,15 +6170,28 @@ z::log::set_rotation() {
 ###
 z::log::setup() {
   emulate -L zsh
-  local file="$1"
+  local file="${1-}"
   local level="${2:-info}"
   local format="${3:-text}"
 
   # Validate file argument
   if [[ -z "$file" ]]; then
-    print -u2 "zlog: File path required (use '-' for console only)"
+    print -r -u2 -- "zlog: File path required (use '-' for console only)"
     return 1
   fi
+
+  __z::log::level_number "$level" || {
+    print -r -u2 -- "zlog: Invalid setup level: $level"
+    return 1
+  }
+
+  case "${format:l}" in
+    text|json) ;;
+    *)
+      print -r -u2 -- "zlog: Invalid setup format: $format"
+      return 1
+      ;;
+  esac
 
   # Set file (use empty string for console-only)
   if [[ "$file" == "-" ]]; then
@@ -6168,8 +6221,20 @@ z::log::setup() {
 z::log::reset() {
   emulate -L zsh
 
+  # Restore original engine before resetting config.
+  if (( ${_zlog_config[fast_mode]:-0} )) && (( ${+functions[z::log::disable_performance_mode]} )); then
+    z::log::disable_performance_mode
+  fi
+
   # Flush any pending messages
-  z::log::flush
+  if ! z::log::flush; then
+    print -r -u2 -- "zlog: Failed to flush before reset"
+    return 1
+  fi
+
+  if (( ${+functions[z::log::is_async]} )) && z::log::is_async; then
+    z::log::disable_async || return 1
+  fi
 
   # Reset to defaults
   _zlog_config[level]=2
@@ -6191,11 +6256,15 @@ z::log::reset() {
   _zlog_buffer=()
 
   # Clear caches
-  _zlog_config[stat_cmd]=""
+  _zlog_state[stat_cmd]=""
+  _zlog_state[stat_bin]=""
   _zlog_timestamp_cache[epoch]=0
   _zlog_timestamp_cache[formatted]=""
   _zlog_timestamp_cache[iso]=""
   _zlog_timestamp_cache[ms]=""
+  _zlog_state[buffer_count]=0
+
+  __z::log::update_fast_flags
 
   __z::log::debug_internal "Configuration reset to defaults"
 
@@ -6219,7 +6288,7 @@ z::log::enable_async() {
   setopt localoptions no_unset
 
   # Check if already enabled
-  if (( ${+_zlog_config[async_pid]} )) && [[ -n "${_zlog_config[async_pid]}" ]] && kill -0 "${_zlog_config[async_pid]}" 2>/dev/null; then
+  if [[ -n "${_zlog_state[async_pid]:-}" ]] && kill -0 "${_zlog_state[async_pid]}" 2>/dev/null; then
     z::log::warn "Async logging already enabled"
     return 0
   fi
@@ -6230,20 +6299,30 @@ z::log::enable_async() {
     return 1
   fi
 
-  # Create FIFO
-  local fifo_path="/tmp/zlog_fifo_$$_${RANDOM}"
+  # Create FIFO in a private directory under TMPDIR.
+  local fifo_root="${TMPDIR:-/tmp}"
+  fifo_root="${fifo_root%/}"
+  local fifo_dir="${fifo_root}/zlog_fifo_$$_${RANDOM}"
+  local fifo_path="${fifo_dir}/fifo"
 
-  if ! mkfifo "$fifo_path" 2>/dev/null; then
-    z::log::error "Failed to create FIFO for async logging"
+  if ! command mkdir -m 700 "$fifo_dir" 2>/dev/null; then
+    z::log::error "Failed to create private directory for async logging"
     return 1
   fi
 
-  _zlog_config[async_fifo]="$fifo_path"
+  if ! mkfifo "$fifo_path" 2>/dev/null; then
+    z::log::error "Failed to create FIFO for async logging"
+    rmdir "$fifo_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  _zlog_state[async_fifo]="$fifo_path"
 
   # Start background worker
   (
+    emulate -L zsh
     # Worker process - reads from FIFO and writes to file
-    exec <"$fifo_path"
+    exec <"$fifo_path" || exit 1
 
     local log_file="${_zlog_config[file]}"
 
@@ -6256,16 +6335,27 @@ z::log::enable_async() {
     done
 
     # Cleanup
-    rm -f "$fifo_path"
+    rm -f -- "$fifo_path"
+    rmdir -- "$fifo_dir" 2>/dev/null || true
   ) &
 
   local worker_pid=$!
-  _zlog_config[async_pid]=$worker_pid
+  _zlog_state[async_pid]=$worker_pid
 
   # Open FIFO for writing
   local fifo_fd
-  exec {fifo_fd}>"$fifo_path"
-  _zlog_config[async_fd]=$fifo_fd
+  if ! exec {fifo_fd}>"$fifo_path"; then
+    kill "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    rm -f -- "$fifo_path"
+    rmdir -- "$fifo_dir" 2>/dev/null || true
+    _zlog_state[async_pid]=""
+    _zlog_state[async_fd]=-1
+    _zlog_state[async_fifo]=""
+    z::log::error "Failed to open FIFO for async logging"
+    return 1
+  fi
+  _zlog_state[async_fd]=$fifo_fd
 
   z::log::info "Async logging enabled" "worker_pid" "$worker_pid"
 
@@ -6281,36 +6371,40 @@ z::log::disable_async() {
   emulate -L zsh
 
   # Check if async is enabled
-  if ! (( ${+_zlog_config[async_pid]} )) || [[ -z "${_zlog_config[async_pid]}" ]]; then
+  local async_pid="${_zlog_state[async_pid]:-}"
+  if [[ -z "$async_pid" ]]; then
     return 0
   fi
 
   # Send shutdown signal
-  if (( ${+_zlog_config[async_fd]} )) && [[ -n "${_zlog_config[async_fd]}" ]]; then
-    print -u "${_zlog_config[async_fd]}" "__ASYNC_SHUTDOWN__"
-    local _async_fd=${_zlog_config[async_fd]}
-    exec {_async_fd}>&-
+  local async_fd="${_zlog_state[async_fd]:--1}"
+  if [[ "$async_fd" =~ '^[0-9]+$' ]] && (( async_fd >= 0 )); then
+    print -u "$async_fd" -r -- "__ASYNC_SHUTDOWN__" 2>/dev/null || true
+    exec {async_fd}>&- 2>/dev/null || true
   fi
 
   # Wait for worker to finish (with timeout)
   local timeout=5
   local elapsed=0
 
-  while kill -0 "${_zlog_config[async_pid]}" 2>/dev/null; do
+  while kill -0 "$async_pid" 2>/dev/null; do
     sleep 0.1
     elapsed=$(( elapsed + 1 ))
 
     if (( elapsed > timeout * 10 )); then
       # Force kill if timeout
-      kill -9 "${_zlog_config[async_pid]}" 2>/dev/null
+      kill -9 "$async_pid" 2>/dev/null
       break
     fi
   done
 
+  wait "$async_pid" 2>/dev/null || true
+
   # Cleanup
-  _zlog_config[async_pid]=""
-  _zlog_config[async_fd]=""
-  _zlog_config[async_fifo]=""
+  _zlog_state[async_pid]=""
+  _zlog_state[async_fd]=-1
+  [[ -n "${_zlog_state[async_fifo]:-}" ]] && rm -f -- "${_zlog_state[async_fifo]}" 2>/dev/null || true
+  _zlog_state[async_fifo]=""
 
   return 0
 }
@@ -6323,8 +6417,8 @@ z::log::disable_async() {
 z::log::is_async() {
   emulate -L zsh
 
-  [[ -n "${_zlog_config[async_pid]}" ]] && \
-    kill -0 "${_zlog_config[async_pid]}" 2>/dev/null
+  [[ -n "${_zlog_state[async_pid]:-}" ]] && \
+    kill -0 "${_zlog_state[async_pid]}" 2>/dev/null
 }
 
 ###
@@ -6333,13 +6427,15 @@ z::log::is_async() {
 ###
 __z::log::write_async() {
   emulate -L zsh
-  local message="$1"
+  local message="${1-}"
 
-  if [[ -n "${_zlog_config[async_fd]}" ]]; then
-    print -u "${_zlog_config[async_fd]}" -r -- "$message"
+  local async_fd="${_zlog_state[async_fd]:--1}"
+  if [[ "$async_fd" =~ '^[0-9]+$' ]] && (( async_fd >= 0 )); then
+    print -u "$async_fd" -r -- "$message"
+    return $?
   fi
 
-  return 0
+  return 1
 }
 ###############################################################################
 # OPTIMIZED FOR PERFORMANCE AND SPEED ROUTE IMPLEMENTATIONS
@@ -6351,12 +6447,14 @@ __z::log::write_async() {
 ###
 __z::log::fast_write() {
   emulate -L zsh
-  local message="$1"
+  local message="${1-}"
   local logfile="${_zlog_config[file]}"
 
   [[ -z "$logfile" ]] && return 0
 
-  # Direct write without rotation check (for buffered mode)
+  __z::log::ensure_log_dir "$logfile" || return 1
+
+  # Direct write without rotation check in performance mode.
   print -r -- "$message" >> "$logfile" 2>/dev/null
 }
 
@@ -6368,8 +6466,12 @@ __z::log::engine_fast() {
   emulate -L zsh
   setopt localoptions
 
-  local level="$1"
-  local message="$2"
+  if (( $# < 2 )); then
+    return 1
+  fi
+
+  local level="${1-}"
+  local message="${2-}"
   shift 2
 
   # Fast level check (most common case: filtered out)
@@ -6390,12 +6492,13 @@ __z::log::engine_fast() {
     __z::log::format_simple "$level" "$message"
     formatted="$REPLY"
   else
-    formatted=$(__z::log::format "$level" "$message" "$@")
+    __z::log::format "$level" "$message" "$@" || return 1
+    formatted="$REPLY"
   fi
 
   # Output to console if appropriate
   if (( level <= console_level )); then
-    print -u2 -r -- "$formatted"
+    print -r -u2 -- "$formatted"
   fi
 
   # Output to file if appropriate
@@ -6426,8 +6529,11 @@ __z::log::engine_fast() {
 ###
 __z::log::format_simple() {
   emulate -L zsh
-  local level="$1"
-  local message="$2"
+  local level="${1-}"
+  local message="${2-}"
+
+  __z::log::truncate_message "$message"
+  message="$REPLY"
 
   # Update timestamp only if needed
   local current_epoch=${EPOCHSECONDS}
@@ -6442,8 +6548,10 @@ __z::log::format_simple() {
   if [[ "${_zlog_config[format]}" == "text" ]]; then
     # Build without colors if not a TTY (faster)
     if [[ ! -t 2 ]]; then
-      REPLY="${_zlog_timestamp_cache[formatted]} [${level_name}] ($$) ${message}"
+      REPLY="${_zlog_timestamp_cache[formatted]} [${level_name}] (${_zlog_sys_cache[pid]:-$$}) ${message}"
     else
+      (( _zlog_color_cache[initialized] )) || __z::log::init_colors
+
       # With colors
       local level_color
       case "$level" in
@@ -6463,14 +6571,14 @@ __z::log::format_simple() {
         padding="${(r:$((5-level_len)):: :)}"
       fi
 
-      REPLY="${_zlog_colors[dim]}${_zlog_timestamp_cache[formatted]}${_zlog_colors[reset]} [${level_display}${padding}] ${_zlog_colors[dim]}($$)${_zlog_colors[reset]} ${message}"
+      REPLY="${_zlog_colors[dim]}${_zlog_timestamp_cache[formatted]}${_zlog_colors[reset]} [${level_display}${padding}] ${_zlog_colors[dim]}(${_zlog_sys_cache[pid]:-$$})${_zlog_colors[reset]} ${message}"
     fi
   else
     # JSON format
     __z::json::escape "$message"
     local escaped_message="$REPLY"
 
-    REPLY="{\"timestamp\":\"${_zlog_timestamp_cache[iso]}\",\"level\":\"${level_name}\",\"message\":\"${escaped_message}\",\"pid\":$$}"
+    REPLY="{\"timestamp\":\"${_zlog_timestamp_cache[iso]}\",\"level\":\"${level_name}\",\"message\":\"${escaped_message}\",\"pid\":${_zlog_sys_cache[pid]:-$$}}"
   fi
 
   return 0
@@ -6489,12 +6597,17 @@ __z::log::flush_fast() {
 
   if [[ -z "$logfile" ]]; then
     _zlog_buffer=()
+    _zlog_state[buffer_count]=0
     return 0
   fi
+
+  __z::log::ensure_log_dir "$logfile" || return 1
 
   # Bulk write without rotation check
   if printf '%s\n' "${_zlog_buffer[@]}" >> "$logfile" 2>/dev/null; then
     _zlog_buffer=()
+    _zlog_state[buffer_count]=0
+    (( _zlog_stats[buffer_flushes]++ ))
     return 0
   else
     return 1
@@ -6507,8 +6620,14 @@ __z::log::flush_fast() {
 z::log::enable_performance_mode() {
   emulate -L zsh
 
+  if (( ${_zlog_config[fast_mode]:-0} )); then
+    return 0
+  fi
+
   # Replace engine with fast version
+  if (( ! ${+functions[__z::log::engine_original]} )); then
   functions[__z::log::engine_original]="${functions[__z::log::engine]}"
+  fi
   functions[__z::log::engine]="${functions[__z::log::engine_fast]}"
 
   # Disable timestamp cache updates (use stale timestamps for 1 second)
@@ -6531,6 +6650,10 @@ z::log::enable_performance_mode() {
 z::log::disable_performance_mode() {
   emulate -L zsh
 
+  if (( ! ${_zlog_config[fast_mode]:-0} )); then
+    return 0
+  fi
+
   # Restore original engine
   if (( ${+functions[__z::log::engine_original]} )); then
     functions[__z::log::engine]="${functions[__z::log::engine_original]}"
@@ -6549,30 +6672,30 @@ z::log::disable_performance_mode() {
 # INITIALIZATION
 ###############################################################################
 
-# Ensure we're running in Zsh
-if [[ -z "$ZSH_VERSION" ]]; then
-  print "ERROR: This framework requires Zsh" >&2
-  return 1 2>/dev/null || exit 1
+# Initialize the framework (idempotent)
+if (( ! ${+_zlog_finalized} )); then
+  typeset -gi _zlog_finalized=0
 fi
 
-# Initialize the framework (idempotent)
-if (( ! ${+_zlog_initialized} )); then
-  typeset -gi _zlog_initialized=1
+if (( ! _zlog_finalized )); then
   __z::log::validate_globals
-  __z::log::init_colors
   __z::log::update_timestamp
+  __z::log::update_fast_flags
 
   # Initialize cache on first load
-  if [[ -z "$_zlog_sys_cache[hostname]" ]]; then
+  if [[ -z "${_zlog_sys_cache[hostname]}" ]]; then
     _zlog_sys_cache[hostname]="${HOST:-${HOSTNAME:-unknown}}"
   fi
 
-  if [[ -z "$_zlog_sys_cache[username]" ]]; then
+  if [[ -z "${_zlog_sys_cache[username]}" ]]; then
     _zlog_sys_cache[username]="${USER:-${USERNAME:-unknown}}"
   fi
+
   # Set default log level if not already set
   if [[ -z "${_zlog_config[level]}" ]]; then
     _zlog_config[level]=${_ZLOG_LEVEL_INFO}
   fi
+
+  _zlog_finalized=1
 
 fi
