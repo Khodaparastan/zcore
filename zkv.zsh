@@ -1,165 +1,634 @@
+#compdef -
+# =============================================================================
+# zkv — In-memory Zsh key/value store
+#
+# A Redis-inspired, pure-zsh associative-array store supporting strings,
+# lists, sets, sorted sets (zsets), and hashes. Provides transactions,
+# TTL-based expiry, watchers, snapshots, locks, persistence, and a
+# batch command interface.
+#
+# Usage:
+#   source zkv          # after sourcing zlog and zbase
+#   z::kv::open <name> [options]
+#   z::kv::set  <handle> <key> <value> [--ttl <seconds>]
+#   z::kv::get  <handle> <key>
+#   z::kv::del  <handle> <key>
+#   # ... see Public API below
+#
+# Public API:   z::kv::*
+# Private API:  _z::kv::*  /  _zkv_*
+#
+# Requires:
+#   zlog   — must be sourced before zkv (provides z::log::*)
+#   zbase  — must be sourced before zkv (provides z::validate::*, z::probe::*)
+#
+# Constants exported:
+#   ZKV_VERSION                 — module version integer
+#   ZKV_PERSIST_FORMAT_VERSION  — on-disk dump format version
+# =============================================================================
 
-################################################################################
-# KV STORE - Depends ONLY on zsh-log
-################################################################################
 
-# Main key-value storage
-typeset -gA _zcore_kv_store
+# -----------------------------------------------------------------------------
+# RUNTIME DEPENDENCY CHECKS
+# -----------------------------------------------------------------------------
 
-# Metadata storage (TTL, types, etc.)
-typeset -gA _zcore_kv_meta
+# Verify zlog is loaded (required for all logging calls throughout this file).
+if (( ! ${+functions[z::log::info]} )); then
+  print -u2 "zkv: fatal: zlog must be sourced before zkv"
+  return 1
+fi
 
-# TTL expiration times (key -> epoch timestamp)
-typeset -gA _zcore_kv_ttl
+# Verify zbase core validation helpers are present.
+if (( ! ${+functions[z::validate::nonempty]} )); then
+  print -u2 "zkv: fatal: zbase must be sourced before zkv"
+  return 1
+fi
 
-# Watch patterns and handlers
-typeset -gA _zcore_kv_watchers
+# Verify zbase probe helpers — added in a later zbase revision.
+if (( ! ${+functions[z::probe::func]} )); then
+  print -u2 "zkv: fatal: zbase command/function probes missing — zbase too old"
+  return 1
+fi
 
-# Transaction state
-typeset -gA _zcore_kv_transaction
-typeset -gi _zcore_kv_in_transaction=0
-# List storage: key -> pipe-separated values
-typeset -gA _zcore_kv_lists
+# Verify separator constants exported by zbase.
+if (( ! ${+Z_SEP} )); then
+  print -u2 "zkv: fatal: zbase separator constants missing"
+  return 1
+fi
 
-# Set storage: key -> pipe-separated unique values
-typeset -gA _zcore_kv_sets
+# Verify error-code constants exported by zbase.
+if (( ! ${+ZBASE_ERROR_GENERAL} )); then
+  print -u2 "zkv: fatal: zbase error codes missing — zbase too old"
+  return 1
+fi
 
-# Sorted set storage: key -> pipe-separated "score:value" pairs
-typeset -gA _zcore_kv_zsets
 
-# Hash storage: key.field -> value
-typeset -gA _zcore_kv_hashes
+# -----------------------------------------------------------------------------
+# IDEMPOTENT LOAD GUARD
+# -----------------------------------------------------------------------------
 
-# Pub/Sub channels: channel -> subscriber_list
-typeset -gA _zcore_kv_pubsub
+# Prevent double-sourcing; _zkv_loaded is set to 1 on first load.
+if (( ${_zkv_loaded:-0} )); then
+  return 0
+fi
 
-# Locks: lock_name -> owner_id|expire_time
-typeset -gA _zcore_kv_locks
+typeset -gi _zkv_loaded=1
 
-# Snapshot storage
-typeset -gA _zcore_kv_snapshots
-typeset -gi _zcore_kv_snapshot_id=0
-# Statistics
-typeset -gA _zcore_kv_stats=(
-  [reads]=0
-  [writes]=0
-  [deletes]=0
-  [hits]=0
-  [misses]=0
-)
 
-# Configuration
-typeset -gA _zcore_kv_config=(
-  [auto_persist]=false
-  [persist_file]=""
-  [enable_events]=true
-  [enable_ttl]=true
-  [max_key_length]=256
-  [max_value_length]=65536
-)
+# -----------------------------------------------------------------------------
+# MODULE LOAD — zsh/datetime
+# -----------------------------------------------------------------------------
 
-################################################################################
-# INTERNAL HELPERS
-################################################################################
+# zsh/datetime provides $EPOCHSECONDS for cheap epoch reads without forking.
+zmodload zsh/datetime 2>/dev/null
 
-###
-# Validate key format
-# @param 1: string - Key name
-# @private
-# @return 0 if valid, 1 if invalid
-###
-__z::kv::validate_key() {
+# If the module is unavailable, epoch calls fall back to z::log's timestamp.
+if (( ! ${+EPOCHSECONDS} )); then
+  z::log::warn "zkv: zsh/datetime unavailable — epoch timestamps use zlog fallback"
+fi
+
+
+# -----------------------------------------------------------------------------
+# CONSTANTS
+# -----------------------------------------------------------------------------
+
+typeset -gri ZKV_VERSION=4
+typeset -gri ZKV_PERSIST_FORMAT_VERSION=4
+
+# Internal field/record separators and escape sentinel, inherited from zbase.
+typeset -gr _ZKV_SEP="$Z_SEP"
+typeset -gr _ZKV_RECSEP="$Z_RECSEP"
+typeset -gr _ZKV_ESC="$Z_ESC"
+
+# Canonical structure-type strings used in metadata maps.
+typeset -gr _ZKV_STRUCT_STRING="string"
+typeset -gr _ZKV_STRUCT_LIST="list"
+typeset -gr _ZKV_STRUCT_SET="set"
+typeset -gr _ZKV_STRUCT_ZSET="zset"
+typeset -gr _ZKV_STRUCT_HASH="hash"
+
+
+# -----------------------------------------------------------------------------
+# GLOBAL REGISTRIES
+# -----------------------------------------------------------------------------
+
+# _zkv_handles: maps open store names → 1 (existence check).
+typeset -gA _zkv_handles
+
+# _zkv_perf_mode: maps store names → 1 when performance mode is active.
+typeset -gA _zkv_perf_mode
+
+
+# =============================================================================
+# INDIRECTION HELPERS
+#
+# Zsh does not support passing associative arrays by reference, so all
+# per-store maps are accessed by name via (P) expansion and typeset -g.
+# These six helpers centralise that pattern.
+# =============================================================================
+
+# Read one entry from a named associative array.
+_zkv_aget() {
+  local _r="${1}[${2}]"
+  REPLY="${(P)_r}"
+}
+
+# Write one entry to a named associative array.
+_zkv_aset() {
+  typeset -g "${1}[${2}]=${3}"
+}
+
+# Test whether a key exists in a named associative array.
+_zkv_ahas() {
+  [[ -v "${1}[${2}]" ]]
+}
+
+# Delete one entry from a named associative array.
+_zkv_adel() {
+  unset "${1}[${2}]"
+}
+
+# Return the number of keys in a named associative array via REPLY.
+_zkv_alen() {
+  local _n="$1"
+  local -a _keys
+  _keys=( "${(@Pk)_n}" )
+  REPLY="${#_keys}"
+}
+
+# Destroy and re-declare a named associative array (effectively clears it).
+_zkv_aclear() {
+  unset "$1"
+  typeset -gA "$1"
+}
+
+# Deep-copy a named associative array (_src → _dst), replacing _dst entirely.
+_zkv_acopy() {
+  local _dst="$1" _src="$2"
+  _zkv_aclear "$_dst"
+
+  local -a _kv
+  _kv=( "${(@Pkv)_src}" )   # flat key-value list from the source map
+
+  typeset -i _i
+  for (( _i = 1; _i <= ${#_kv}; _i += 2 )); do
+    _zkv_aset "$_dst" "${_kv[_i]}" "${_kv[_i+1]}"
+  done
+}
+
+# Return true (0) when a transaction is active on the given handle.
+_zkv_tx_active() {
+  local _r="_zkv_tx_${1}[active]"
+  (( ${(P)_r} ))
+}
+
+# Return true (0) when the store's dirty flag is set (unsaved changes exist).
+_zkv_state_dirty() {
+  local _r="_zkv_state_${1}[dirty]"
+  (( ${(P)_r} ))
+}
+
+
+# =============================================================================
+# INTERNAL HELPERS — TIME, TYPES, VALIDATION
+# =============================================================================
+
+# _z::kv::epoch
+# Sets REPLY to the current Unix epoch (integer seconds).
+# Prefers $EPOCHSECONDS (no fork); falls back to z::log::get_timestamp.
+_z::kv::epoch() {
   emulate -L zsh
-  local key="$1"
+  setopt typesetsilent
 
-  if [[ -z $key ]]; then
-    z::log::error "KV: Key cannot be empty"
-    return 1
+  REPLY=""
+
+  if (( ${+EPOCHSECONDS} )); then
+    REPLY="$EPOCHSECONDS"
+    return 0
   fi
 
-  if (( ${#key} > ${_zcore_kv_config[max_key_length]} )); then
-    z::log::error "KV: Key too long: ${#key} > ${_zcore_kv_config[max_key_length]}"
-    return 1
-  fi
+  z::log::get_timestamp epoch || {
+    REPLY=""
+    return $ZBASE_ERROR_GENERAL
+  }
 
-  # Allow alphanumeric, dots, underscores, hyphens, AND colons
-  if [[ ! $key =~ '^[a-zA-Z0-9._:-]+$' ]]; then
-    z::log::error "KV: Invalid key format: $key"
-    return 1
+  # Sanity-check: the fallback must return a bare integer.
+  if [[ ! $REPLY == <-> ]]; then
+    z::log::error "zkv: epoch timestamp unavailable" value "$REPLY"
+    REPLY=""
+    return $ZBASE_ERROR_GENERAL
   fi
 
   return 0
 }
 
-###
-# Check and expire TTL keys
-# @param 1: string - Key name
-# @private
-# @return 0 if valid, 1 if expired
-###
-__z::kv::check_ttl() {
-  emulate -L zsh
-  local key="$1"
+# _z::kv::structure_of <type-string>
+# Maps a user-visible type name to one of the five _ZKV_STRUCT_* constants.
+# Anything not explicitly listed is treated as a string.
+_z::kv::structure_of() {
+  case "$1" in
+    list)  REPLY="$_ZKV_STRUCT_LIST"  ;;
+    set)   REPLY="$_ZKV_STRUCT_SET"   ;;
+    zset)  REPLY="$_ZKV_STRUCT_ZSET"  ;;
+    hash)  REPLY="$_ZKV_STRUCT_HASH"  ;;
+    *)     REPLY="$_ZKV_STRUCT_STRING" ;;
+  esac
+}
 
-  if [[ ${_zcore_kv_config[enable_ttl]} != true ]]; then
-    return 0
-  fi
+# _z::kv::require_handle <handle>
+# Errors out if the handle is empty or not registered in _zkv_handles.
+_z::kv::require_handle() {
+  local h="${1:-}"
 
-  if (( ! ${+_zcore_kv_ttl[$key]} )); then
-    return 0  # No TTL set
-  fi
-
-  typeset -i expire_time current_time
-  (( expire_time = ${_zcore_kv_ttl[$key]} ))
-  (( current_time = ${EPOCHSECONDS:-$(date +%s)} ))
-
-  if (( current_time >= expire_time )); then
-    # Key expired
-    z::log::debug "KV: Key expired: $key"
-    unset "_zcore_kv_store[$key]"
-    unset "_zcore_kv_meta[$key]"
-    unset "_zcore_kv_ttl[$key]"
-    return 1
+  if [[ -z $h ]] || (( ! ${+_zkv_handles[$h]} )); then
+    z::log::error "zkv: unknown store handle" handle "${h:-<empty>}"
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
   return 0
 }
 
-###
-# Trigger watch handlers for key pattern
-# @param 1: string - Key that changed
-# @param 2: string - New value
-# @param 3: string - Operation (set|del)
-# @private
-# @return 0 always
-###
-__z::kv::trigger_watchers() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-  local operation="${3:-set}"
+# _z::kv::validate_key <key> <handle>
+# Rejects empty keys, keys exceeding max_key_length, and keys with characters
+# outside the allowed set: a-z A-Z 0-9 . _ : / -
+_z::kv::validate_key() {
+  local _vk_key="${1:-}" _vk_handle="${2:-}"
 
-  if ((_zcore_subsys[bus]==1)); then
+  if [[ -z $_vk_key ]]; then
+    z::log::error "zkv: empty key" handle "$_vk_handle"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  local _vk_cfg="_zkv_cfg_${_vk_handle}"
+  _zkv_aget "$_vk_cfg" max_key_length
+  local _vk_max="$REPLY"
+
+  if (( ${#_vk_key} > _vk_max )); then
+    z::log::error "zkv: key too long" \
+      handle "$_vk_handle" length "${#_vk_key}" max "$_vk_max"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  if [[ ! $_vk_key =~ '^[a-zA-Z0-9._:/-]+$' ]]; then
+    z::log::error "zkv: invalid key format (allowed: a-z A-Z 0-9 . _ : / -)" \
+      handle "$_vk_handle" key "$_vk_key"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  return 0
+}
+
+# _z::kv::require_string_key <handle> <key>
+# Errors out if the key's registered structure is not "string".
+# Used by operations that are only valid on scalar keys.
+_z::kv::require_string_key() {
+  local _handle="$1" _key="$2"
+  local _meta_n="_zkv_meta_${_handle}"
+  local _type _struct
+
+  _zkv_aget "$_meta_n" "$_key"
+  _type="${REPLY:-string}"
+
+  _z::kv::structure_of "$_type"
+  _struct="$REPLY"
+
+  if [[ $_struct != "$_ZKV_STRUCT_STRING" ]]; then
+    z::log::error "zkv: operation only supports string keys" \
+      handle "$_handle" key "$_key" structure "$_struct"
+    return $ZBASE_ERROR_PERMISSION
+  fi
+
+  return 0
+}
+
+
+# =============================================================================
+# ENCODING
+#
+# Values are stored in flat strings delimited by _ZKV_SEP / _ZKV_RECSEP.
+# Any byte that collides with a delimiter must be escaped before storage and
+# unescaped on retrieval.  The escape sentinel itself is escaped first so that
+# the remaining substitutions are unambiguous.
+# =============================================================================
+
+# _z::kv::encode_value <raw>
+# Escapes all delimiter and special bytes in a value; result in REPLY.
+_z::kv::encode_value() {
+  local _ev_v="$1"
+
+  _ev_v="${_ev_v//${_ZKV_ESC}/${_ZKV_ESC}e}"   # escape sentinel → \e  (must be first)
+  _ev_v="${_ev_v//$'\\'/${_ZKV_ESC}b}"           # literal backslash → \b
+  _ev_v="${_ev_v//$'\n'/${_ZKV_ESC}n}"           # newline → \n
+  _ev_v="${_ev_v//|/${_ZKV_ESC}p}"               # pipe → \p
+  _ev_v="${_ev_v//'['/${_ZKV_ESC}l}"             # open bracket → \l
+  _ev_v="${_ev_v//']'/${_ZKV_ESC}r}"             # close bracket → \r
+  _ev_v="${_ev_v//${_ZKV_SEP}/${_ZKV_ESC}1}"    # field separator → \1
+  _ev_v="${_ev_v//${_ZKV_RECSEP}/${_ZKV_ESC}2}" # record separator → \2
+
+  REPLY="$_ev_v"
+}
+
+# _z::kv::decode_value <encoded>
+# Reverses encode_value; result in REPLY.
+# Substitutions are applied in strict reverse order to avoid double-decoding.
+_z::kv::decode_value() {
+  local _dv_v="$1"
+  # Newlines must be inserted via a pre-expanded variable: inline $'\n' in the
+  # replacement half of ${var//pat/repl} is taken literally by zsh, not as an
+  # escape.  Same reasoning applies to the literal backslash replacement below.
+  local _dv_nl=$'\n'
+
+  _dv_v="${_dv_v//${_ZKV_ESC}2/${_ZKV_RECSEP}}"  # \2 → record separator
+  _dv_v="${_dv_v//${_ZKV_ESC}1/${_ZKV_SEP}}"      # \1 → field separator
+  _dv_v="${_dv_v//${_ZKV_ESC}r/]}"                 # \r → ]
+  _dv_v="${_dv_v//${_ZKV_ESC}l/[}"                 # \l → [
+  _dv_v="${_dv_v//${_ZKV_ESC}p/|}"                 # \p → |
+  _dv_v="${_dv_v//${_ZKV_ESC}n/$_dv_nl}"           # \n → newline
+  _dv_v="${_dv_v//${_ZKV_ESC}b/\\}"                # \b → backslash
+  _dv_v="${_dv_v//${_ZKV_ESC}e/${_ZKV_ESC}}"       # \e → escape sentinel (must be last)
+
+  REPLY="$_dv_v"
+}
+
+# _z::kv::join_encoded <item> [<item> ...]
+# Encodes each argument and joins them with _ZKV_SEP; result in REPLY.
+_z::kv::join_encoded() {
+  local -a _encoded
+  local _item
+
+  for _item in "$@"; do
+    _z::kv::encode_value "$_item"
+    _encoded+=( "$REPLY" )
+  done
+
+  # NOTE: $_ZKV_SEP must be unbraced here.  Inside (pj:…:) / (ps:…:) flag
+  # arguments, a braced ${...} is taken literally and NOT expanded — the join
+  # would operate on the text "${_ZKV_SEP}" instead of the actual \x01 byte.
+  # _z::kv::split_decoded uses the same unbraced form so both sides match.
+  REPLY="${(pj:$_ZKV_SEP:)_encoded}"
+}
+
+# _z::kv::split_decoded <encoded-string>
+# Splits on _ZKV_SEP and decodes each field; results in the reply array.
+_z::kv::split_decoded() {
+  local _raw="$1"
+  local -a _encoded
+  local _item
+
+  typeset -ga reply=()
+
+  [[ -z $_raw ]] && return 0
+
+  # Unbraced $_ZKV_SEP — see _z::kv::join_encoded for why braces break this.
+  _encoded=( "${(@ps:$_ZKV_SEP:)_raw}" )
+
+  for _item in "${_encoded[@]}"; do
+    _z::kv::decode_value "$_item"
+    reply+=( "$REPLY" )
+  done
+
+  return 0
+}
+
+
+# =============================================================================
+# TYPE RESERVATION
+#
+# Every key has exactly one structure (string/list/set/zset/hash).  Attempting
+# to use a key with a different structure is a type collision and is rejected.
+# During a transaction the check is performed against the tx-buffer metadata
+# first, then the live metadata.
+# =============================================================================
+
+# _z::kv::reserve_type <handle> <key> <new-type>
+# Registers <new-type> for <key>, or verifies it matches the existing type.
+_z::kv::reserve_type() {
+  local _rt_handle="$1" _rt_key="$2" _rt_new="$3"
+  local _rt_new_struct _rt_old_struct _rt_old
+  local _rt_meta="_zkv_meta_${_rt_handle}"
+  local _rt_tx="_zkv_tx_${_rt_handle}"
+
+  _z::kv::structure_of "$_rt_new"
+  _rt_new_struct="$REPLY"
+
+  if (( ${_rt_tx}[active] )); then
+    local _rt_tx_meta="_zkv_txbuf_meta_${_rt_handle}"
+    local _rt_tx_del="_zkv_txbuf_del_${_rt_handle}"
+
+    # Key was deleted in this transaction — safe to re-register with any type.
+    if _zkv_ahas "$_rt_tx_del" "$_rt_key"; then
+      _zkv_aset "$_rt_tx_meta" "$_rt_key" "$_rt_new"
+      return 0
+    fi
+
+    # Resolve existing type: tx-buffer takes precedence over live metadata.
+    if _zkv_ahas "$_rt_tx_meta" "$_rt_key"; then
+      _zkv_aget "$_rt_tx_meta" "$_rt_key"
+      _rt_old="$REPLY"
+    elif _zkv_ahas "$_rt_meta" "$_rt_key"; then
+      _zkv_aget "$_rt_meta" "$_rt_key"
+      _rt_old="$REPLY"
+    else
+      # Key is new in this transaction — register freely.
+      _zkv_aset "$_rt_tx_meta" "$_rt_key" "$_rt_new"
+      return 0
+    fi
+
+    _z::kv::structure_of "$_rt_old"
+    _rt_old_struct="$REPLY"
+
+    if [[ $_rt_new_struct != $_rt_old_struct ]]; then
+      z::log::error "zkv: type collision" \
+        handle "$_rt_handle" key "$_rt_key" \
+        existing "$_rt_old_struct" requested "$_rt_new_struct"
+      return $ZBASE_ERROR_PERMISSION
+    fi
+
+    _zkv_aset "$_rt_tx_meta" "$_rt_key" "$_rt_new"
     return 0
   fi
-  # Emit generic KV event
-  z::event::emit "kv:${operation}" "$key" "$value" 2>/dev/null || true
 
-  # Check watch patterns
-  local pattern handler_list
-  for pattern in "${(@k)_zcore_kv_watchers}"; do
-    # Match pattern (support wildcards)
-    if [[ $key == ${~pattern} ]]; then
-      handler_list="${_zcore_kv_watchers[$pattern]}"
+  # Non-transactional path: check live metadata only.
+  if _zkv_ahas "$_rt_meta" "$_rt_key"; then
+    _zkv_aget "$_rt_meta" "$_rt_key"
+    _rt_old="$REPLY"
 
-      # Call each handler
-      local -a handlers
-      handlers=(${(s:|:)handler_list})
+    _z::kv::structure_of "$_rt_old"
+    _rt_old_struct="$REPLY"
 
-      local handler
-      for handler in "${handlers[@]}"; do
-        if z::probe::func "$handler" 2>/dev/null; then
-          "$handler" "$key" "$value" "$operation" 2>/dev/null || true
+    if [[ $_rt_new_struct != $_rt_old_struct ]]; then
+      z::log::error "zkv: type collision" \
+        handle "$_rt_handle" key "$_rt_key" \
+        existing "$_rt_old_struct" requested "$_rt_new_struct"
+      return $ZBASE_ERROR_PERMISSION
+    fi
+  fi
+
+  _zkv_aset "$_rt_meta" "$_rt_key" "$_rt_new"
+  return 0
+}
+
+
+# =============================================================================
+# TTL
+# =============================================================================
+
+# _z::kv::check_ttl <handle> <key>
+# Returns 0 if the key is live (no TTL or TTL not yet elapsed).
+# Returns 1 if the key has expired; also reaps the key outside a transaction
+# and increments the expired stat counter.
+_z::kv::check_ttl() {
+  local _ct_handle="$1" _ct_key="$2"
+  local _ct_cfg="_zkv_cfg_${_ct_handle}"
+
+  # Fast-path: TTL feature disabled for this store.
+  (( ! ${_ct_cfg}[enable_ttl] )) && return 0
+
+  local _ct_tx="_zkv_tx_${_ct_handle}"
+  local _ct_ttl="_zkv_ttl_${_ct_handle}"
+  local _ct_expire=""
+
+  # Resolve expiry timestamp: tx-buffer takes precedence over live TTL map.
+  if (( ${_ct_tx}[active] )); then
+    local _ct_tx_ttl="_zkv_txbuf_ttl_${_ct_handle}"
+
+    if _zkv_ahas "$_ct_tx_ttl" "$_ct_key"; then
+      _zkv_aget "$_ct_tx_ttl" "$_ct_key"
+      _ct_expire="$REPLY"
+    elif _zkv_ahas "$_ct_ttl" "$_ct_key"; then
+      _zkv_aget "$_ct_ttl" "$_ct_key"
+      _ct_expire="$REPLY"
+    fi
+  else
+    if _zkv_ahas "$_ct_ttl" "$_ct_key"; then
+      _zkv_aget "$_ct_ttl" "$_ct_key"
+      _ct_expire="$REPLY"
+    fi
+  fi
+
+  # No expiry record → key lives forever.
+  [[ -z $_ct_expire ]] && return 0
+
+  _z::kv::epoch || return $?
+  typeset -i _ct_now="$REPLY"
+
+  # Key is still alive.
+  (( _ct_now < _ct_expire )) && return 0
+
+  # Key has expired — log at a rate-limited debug level to avoid spam.
+  z::log::rate_limit "zkv-expire-${_ct_handle}" 20 60 debug \
+    "zkv: key expired" handle "$_ct_handle" key "$_ct_key"
+
+  # Inside a transaction we cannot reap eagerly; caller treats return 1 as
+  # "not found" for the duration of the transaction.
+  if (( ${_ct_tx}[active] )); then
+    return 1
+  fi
+
+  _z::kv::reap_key "$_ct_handle" "$_ct_key"
+  (( _zkv_stats_${_ct_handle}[expired] += 1 ))
+
+  return 1
+}
+
+# _z::kv::reap_key <handle> <key>
+# Unconditionally removes all storage associated with a key across every
+# structure map, then clears its metadata and TTL entries.
+_z::kv::reap_key() {
+  local _rk_handle="$1" _rk_key="$2"
+  local _rk_meta="_zkv_meta_${_rk_handle}"
+  local _rk_type=""
+
+  if _zkv_ahas "$_rk_meta" "$_rk_key"; then
+    _zkv_aget "$_rk_meta" "$_rk_key"
+    _rk_type="$REPLY"
+  fi
+
+  local _rk_struct
+  _z::kv::structure_of "$_rk_type"
+  _rk_struct="$REPLY"
+
+  case "$_rk_struct" in
+    string)
+      _zkv_adel "_zkv_store_${_rk_handle}" "$_rk_key"
+      ;;
+
+    list)
+      _zkv_adel "_zkv_lists_${_rk_handle}" "$_rk_key"
+      ;;
+
+    set)
+      _zkv_adel "_zkv_sets_${_rk_handle}" "$_rk_key"
+      ;;
+
+    zset)
+      _zkv_adel "_zkv_zsets_${_rk_handle}" "$_rk_key"
+      ;;
+
+    hash)
+      # Hash fields are stored as composite keys: encoded_key + RECSEP + encoded_field.
+      # We must scan and delete all fields belonging to this key.
+      local _hashes_n="_zkv_hashes_${_rk_handle}"
+      local _ekey _prefix _hk
+
+      _z::kv::encode_value "$_rk_key"
+      _ekey="$REPLY"
+      _prefix="${_ekey}${_ZKV_RECSEP}"
+
+      for _hk in "${(@Pk)_hashes_n}"; do
+        [[ $_hk == ${_prefix}* ]] && _zkv_adel "$_hashes_n" "$_hk"
+      done
+      ;;
+  esac
+
+  _zkv_adel "$_rk_meta" "$_rk_key"
+  _zkv_adel "_zkv_ttl_${_rk_handle}" "$_rk_key"
+}
+
+
+# =============================================================================
+# WATCHERS
+# =============================================================================
+
+# _z::kv::trigger_watchers <handle> <key> <value> [<op>]
+# Fires all watcher callbacks whose glob pattern matches <key>.
+# Watchers are skipped entirely while a transaction is active (they fire once
+# at commit time instead).
+_z::kv::trigger_watchers() {
+  local _tw_handle="$1" _tw_key="$2" _tw_value="$3" _tw_op="${4:-set}"
+
+  # Defer watcher dispatch until commit so callbacks see a consistent state.
+  _zkv_tx_active "$_tw_handle" && return 0
+
+  local _tw_wat="_zkv_watchers_${_tw_handle}"
+
+  _zkv_alen "$_tw_wat"
+  (( REPLY == 0 )) && return 0
+
+  local _tw_pattern _tw_hlist _tw_handler _tw_rc
+  local -a _tw_handlers
+
+  for _tw_pattern in "${(@Pk)_tw_wat}"; do
+    if [[ $_tw_key == ${~_tw_pattern} ]]; then
+      _zkv_aget "$_tw_wat" "$_tw_pattern"
+      _tw_hlist="$REPLY"
+      _tw_handlers=( "${(@ps:$_ZKV_SEP:)_tw_hlist}" )
+
+      for _tw_handler in "${_tw_handlers[@]}"; do
+        if z::probe::func "$_tw_handler" 2>/dev/null; then
+          _tw_rc=0
+          "$_tw_handler" "$_tw_handle" "$_tw_key" "$_tw_value" "$_tw_op" 2>/dev/null || _tw_rc=$?
+
+          if (( _tw_rc != 0 )); then
+            z::log::rate_limit "zkv-watcher-fail-${_tw_handler}" 5 60 warn \
+              "zkv: watcher handler returned non-zero" \
+              handler "$_tw_handler" key "$_tw_key" rc "$_tw_rc"
+          fi
+        else
+          # Handler was unset after registration — warn once, not on every key event.
+          z::log::once "zkv-watcher-missing-${_tw_handler}" warn \
+            "zkv: watcher handler no longer defined" \
+            handler "$_tw_handler" pattern "$_tw_pattern"
         fi
       done
     fi
@@ -168,2947 +637,4648 @@ __z::kv::trigger_watchers() {
   return 0
 }
 
-###
-# Auto-persist if enabled
-# @private
-# @return 0 always
-###
-__z::kv::auto_persist() {
-  emulate -L zsh
 
-  if [[ ${_zcore_kv_config[auto_persist]} == true ]] && \
-     [[ -n ${_zcore_kv_config[persist_file]} ]]; then
-    z::kv::save "${_zcore_kv_config[persist_file]}" 2>/dev/null || true
+# =============================================================================
+# AUTO-PERSIST
+# =============================================================================
+
+# _z::kv::auto_persist <handle>
+# Triggers a debounced save to the configured persist_file after a write.
+# No-ops when: inside a transaction, performance mode is active, auto_persist
+# is disabled, no persist_file is set, or the debounce window has not elapsed.
+_z::kv::auto_persist() {
+  local _ap_handle="$1"
+
+  _zkv_tx_active "$_ap_handle" && return 0
+  (( ${+_zkv_perf_mode[$_ap_handle]} )) && return 0
+
+  local _ap_cfg="_zkv_cfg_${_ap_handle}"
+
+  (( ! ${_ap_cfg}[auto_persist] )) && return 0
+
+  _zkv_aget "$_ap_cfg" persist_file
+  local _ap_file="$REPLY"
+
+  [[ -z $_ap_file ]] && return 0
+
+  local _ap_state="_zkv_state_${_ap_handle}"
+  _zkv_aset "$_ap_state" dirty 1
+
+  _z::kv::epoch || return 0
+  typeset -i _ap_now="$REPLY"
+
+  _zkv_aget "$_ap_cfg" persist_debounce
+  typeset -i _ap_debounce="${REPLY:-1}"
+
+  _zkv_aget "$_ap_state" last_persist
+  typeset -i _ap_last="${REPLY:-0}"
+
+  # Debounce: skip the save if we persisted within the debounce window.
+  if (( _ap_now - _ap_last < _ap_debounce )); then
+    return 0
+  fi
+
+  z::kv::save "$_ap_handle" "$_ap_file" 2>/dev/null || return 0
+
+  _zkv_aset "$_ap_state" last_persist "$_ap_now"
+  _zkv_aset "$_ap_state" dirty 0
+
+  return 0
+}
+
+
+# =============================================================================
+# TRANSACTION COLLECTION RESOLVERS
+# =============================================================================
+
+# _z::kv::_commit_collection <src-buf-name> <dst-live-name>
+# Merges a transaction buffer into the live collection map.
+# An empty value in the buffer signals a deletion of that key.
+_z::kv::_commit_collection() {
+  local _src="$1" _dst="$2"
+  local -a _pairs
+
+  _pairs=( "${(@Pkv)_src}" )
+
+  typeset -i _i
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    if [[ -n ${_pairs[_i+1]} ]]; then
+      _zkv_aset "$_dst" "${_pairs[_i]}" "${_pairs[_i+1]}"
+    else
+      _zkv_adel "$_dst" "${_pairs[_i]}"
+    fi
+  done
+}
+
+# _z::kv::tx_resolve_write <handle> <type> <key>
+# Returns (via REPLY) the map name that a write operation should target.
+# Outside a transaction: the live map.
+# Inside a transaction: the tx-buffer, pre-seeded with the live value so that
+# read-modify-write operations within the transaction see the correct baseline.
+_z::kv::tx_resolve_write() {
+  local _h="$1" _t="$2" _k="$3"
+  local _live="_zkv_${_t}_${_h}"
+  local _buf="_zkv_txbuf_${_t}_${_h}"
+
+  if ! _zkv_tx_active "$_h"; then
+    REPLY="$_live"
+    return 0
+  fi
+
+  local _del="_zkv_txbuf_del_${_h}"
+
+  if _zkv_ahas "$_del" "$_k"; then
+    # Key was deleted earlier in this transaction — clear the deletion marker
+    # and start fresh with an empty buffer entry.
+    _zkv_adel "$_del" "$_k"
+    _zkv_aset "$_buf" "$_k" ""
+  elif ! _zkv_ahas "$_buf" "$_k"; then
+    # First write to this key in the transaction — seed the buffer from live.
+    if _zkv_ahas "$_live" "$_k"; then
+      _zkv_aget "$_live" "$_k"
+      _zkv_aset "$_buf" "$_k" "$REPLY"
+    else
+      _zkv_aset "$_buf" "$_k" ""
+    fi
+  fi
+
+  REPLY="$_buf"
+  return 0
+}
+
+# _z::kv::tx_resolve_read <handle> <type> <key>
+# Returns (via REPLY) the map name that a read operation should consult.
+# Outside a transaction: the live map.
+# Inside a transaction: the tx-buffer if the key was written there, otherwise
+# the live map.  Returns ZBASE_ERROR_NOT_FOUND if the key was deleted in-tx.
+_z::kv::tx_resolve_read() {
+  local _h="$1" _t="$2" _k="$3"
+  local _live="_zkv_${_t}_${_h}"
+  local _buf="_zkv_txbuf_${_t}_${_h}"
+
+  if ! _zkv_tx_active "$_h"; then
+    REPLY="$_live"
+    return 0
+  fi
+
+  local _del="_zkv_txbuf_del_${_h}"
+
+  # Key was deleted in this transaction — treat as absent.
+  if _zkv_ahas "$_del" "$_k"; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  if _zkv_ahas "$_buf" "$_k"; then
+    REPLY="$_buf"
+  else
+    REPLY="$_live"
   fi
 
   return 0
 }
 
-################################################################################
-# CORE OPERATIONS
-################################################################################
 
-###
-# Set a key-value pair
+# =============================================================================
+# STORE LIFECYCLE
+# =============================================================================
+
+# z::kv::open <name> [options]
+# Opens (or no-ops if already open) a named store and initialises all
+# associated maps, counters, and configuration.
 #
-# Usage:
-#   z::kv::set "app.name" "MyApp"
-#   z::kv::set "counter" "42" --ttl 3600
-#   z::kv::set "debug" "true" --type bool
-#
-# @param 1: string - Key name
-# @param 2: string - Value
-# @param 3: string - --ttl N (optional, seconds until expiration)
-# @param 4: string - --type TYPE (optional, for metadata)
-# @return 0 on success, 1 on failure
-###
-z::kv::set() {
+# Options:
+#   --max-key-length   <1..1048576>    (default: 256)
+#   --max-value-length <1..1073741824> (default: 65536)
+#   --max-snapshots    <1..1000>       (default: 10)
+#   --enable-ttl       <0|1>           (default: 1)
+#   --persist-debounce <0..86400>      (default: 1)
+#   --auto-persist     <file-path>
+z::kv::open() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key="$1"
-  local value="$2"
-  shift 2
+  local name="${1:-}"
+  shift 2>/dev/null || true
 
-  # Validate key
-  __z::kv::validate_key "$key" || return 1
+  z::validate::nonempty   "$name" "store name" || return $ZBASE_ERROR_INVALID_INPUT
+  z::validate::identifier "$name" "store name" || return $ZBASE_ERROR_INVALID_INPUT
 
-  # Validate value length
-  if (( ${#value} > ${_zcore_kv_config[max_value_length]} )); then
-    z::log::error "KV: Value too long for key '$key': ${#value} > ${_zcore_kv_config[max_value_length]}"
-    return 1
+  REPLY="$name"
+
+  if (( ${+_zkv_handles[$name]} )); then
+    z::log::debug "zkv: store already open" handle "$name"
+    return 0
   fi
 
-  # Parse options
+  # Declare all per-store associative arrays up front.
+  typeset -gA "_zkv_store_${name}"   "_zkv_meta_${name}"   "_zkv_ttl_${name}"
+  typeset -gA "_zkv_lists_${name}"   "_zkv_sets_${name}"   "_zkv_zsets_${name}"
+  typeset -gA "_zkv_hashes_${name}"  "_zkv_watchers_${name}" "_zkv_locks_${name}"
+  typeset -gA "_zkv_snaps_${name}"
+  typeset -gi "_zkv_snap_id_${name}"
+
+  # Transaction state and per-structure write buffers.
+  typeset -gA "_zkv_tx_${name}"
+  typeset -gA "_zkv_txbuf_store_${name}"  "_zkv_txbuf_meta_${name}"  "_zkv_txbuf_ttl_${name}"
+  typeset -gA "_zkv_txbuf_lists_${name}"  "_zkv_txbuf_sets_${name}"
+  typeset -gA "_zkv_txbuf_zsets_${name}"  "_zkv_txbuf_hashes_${name}"
+  typeset -gA "_zkv_txbuf_del_${name}"
+
+  _zkv_aset "_zkv_tx_${name}" active 0
+
+  # Operation counters.
+  typeset -gA "_zkv_stats_${name}"
+  eval "_zkv_stats_${name}=( [reads]=0 [writes]=0 [deletes]=0 [hits]=0 [misses]=0 [expired]=0 )"
+
+  # Persistence state.
+  typeset -gA "_zkv_state_${name}"
+  eval "_zkv_state_${name}=( [dirty]=0 [last_persist]=0 )"
+
+  # Per-store configuration with defaults.
+  typeset -gA "_zkv_cfg_${name}"
+  eval "_zkv_cfg_${name}=(
+    [max_key_length]=256
+    [max_value_length]=65536
+    [max_snapshots]=10
+    [enable_ttl]=1
+    [auto_persist]=0
+    [persist_file]=''
+    [persist_debounce]=1
+  )"
+
+  local _cfg_n="_zkv_cfg_${name}"
+  local auto_persist_file=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --max-key-length)
+        z::validate::integer::range "${2:-}" 1 1048576 "--max-key-length" || return $ZBASE_ERROR_INVALID_INPUT
+        _zkv_aset "$_cfg_n" max_key_length "$2"
+        shift 2
+        ;;
+
+      --max-value-length)
+        z::validate::integer::range "${2:-}" 1 1073741824 "--max-value-length" || return $ZBASE_ERROR_INVALID_INPUT
+        _zkv_aset "$_cfg_n" max_value_length "$2"
+        shift 2
+        ;;
+
+      --max-snapshots)
+        z::validate::integer::range "${2:-}" 1 1000 "--max-snapshots" || return $ZBASE_ERROR_INVALID_INPUT
+        _zkv_aset "$_cfg_n" max_snapshots "$2"
+        shift 2
+        ;;
+
+      --enable-ttl)
+        z::validate::enum "0|1" "${2:-}" "--enable-ttl" || return $ZBASE_ERROR_INVALID_INPUT
+        _zkv_aset "$_cfg_n" enable_ttl "$2"
+        shift 2
+        ;;
+
+      --persist-debounce)
+        z::validate::integer::range "${2:-}" 0 86400 "--persist-debounce" || return $ZBASE_ERROR_INVALID_INPUT
+        _zkv_aset "$_cfg_n" persist_debounce "$2"
+        shift 2
+        ;;
+
+      --auto-persist)
+        auto_persist_file="${2:-}"
+        shift 2
+        ;;
+
+      *)
+        z::log::warn "zkv: unknown open option" option "$1"
+        shift
+        ;;
+    esac
+  done
+
+  _zkv_handles[$name]=1
+
+  z::log::debug "zkv: store opened" handle "$name"
+
+  # Deferred: enable_persist validates the path and sets auto_persist=1.
+  if [[ -n $auto_persist_file ]]; then
+    z::kv::enable_persist "$name" "$auto_persist_file" || return $ZBASE_ERROR_GENERAL
+  fi
+
+  return 0
+}
+
+# z::kv::close <handle>
+# Flushes pending writes (if auto-persist is on), frees all per-store maps,
+# and removes the handle from the global registry.
+z::kv::close() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local _cl_handle="$1"
+
+  _z::kv::require_handle "$_cl_handle" || return $?
+
+  local _cl_cfg="_zkv_cfg_${_cl_handle}"
+
+  if (( ${_cl_cfg}[auto_persist] )); then
+    _zkv_aget "$_cl_cfg" persist_file
+    [[ -n $REPLY ]] && z::kv::flush "$_cl_handle" 2>/dev/null || true
+  fi
+
+  # Collect snapshot IDs so we can free their per-snapshot maps below.
+  local _cl_snaps_n="_zkv_snaps_${_cl_handle}"
+  local -a _cl_snap_ids
+  local _cl_k
+
+  for _cl_k in "${(@Pk)_cl_snaps_n}"; do
+    [[ $_cl_k == snap_*.label ]] && _cl_snap_ids+=( "${_cl_k%.label}" )
+  done
+
+  # Unset all standard per-store maps.
+  local _cl_suffix
+
+  for _cl_suffix in \
+    store meta ttl lists sets zsets hashes \
+    watchers locks snaps state \
+    tx txbuf_store txbuf_meta txbuf_ttl \
+    txbuf_lists txbuf_sets txbuf_zsets txbuf_hashes txbuf_del \
+    stats cfg
+  do
+    unset "_zkv_${_cl_suffix}_${_cl_handle}"
+  done
+
+  unset "_zkv_snap_id_${_cl_handle}"
+
+  # Free per-snapshot data maps.
+  local _cl_id _cl_ss
+
+  for _cl_id in "${_cl_snap_ids[@]}"; do
+    for _cl_ss in store meta ttl lists sets zsets hashes; do
+      unset "_zkv_snap_${_cl_ss}_${_cl_id}_${_cl_handle}"
+    done
+  done
+
+  unset "_zkv_handles[$_cl_handle]"
+  unset "_zkv_perf_mode[$_cl_handle]"
+
+  z::log::debug "zkv: store closed" handle "$_cl_handle"
+  return 0
+}
+
+
+# =============================================================================
+# CORE STRING KV
+# =============================================================================
+
+# z::kv::set <handle> <key> <value> [--ttl <seconds>] [--type <type>]
+# Stores a scalar value.  Validates handle, key, and value length.
+# Inside a transaction the write is buffered; outside it fires watchers and
+# triggers auto-persist.
+z::kv::set() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+  shift 3
+
+  # Performance mode: bypass all validation and write directly to the live map.
+  if (( ${+_zkv_perf_mode[$handle]} )); then
+    _zkv_aset "_zkv_store_${handle}" "$key" "$value"
+    _zkv_aset "_zkv_meta_${handle}" "$key" "string"
+    return 0
+  fi
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  local _cfg_n="_zkv_cfg_${handle}"
+  _zkv_aget "$_cfg_n" max_value_length
+  typeset -i _mvl="$REPLY"
+
+  if (( ${#value} > _mvl )); then
+    z::log::error "zkv: value too long" \
+      handle "$handle" key "$key" length "${#value}" max "$_mvl"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
   typeset -i ttl=0
   local value_type="string"
 
   while (( $# > 0 )); do
     case "$1" in
       --ttl)
-        if [[ ${2:-} == <-> ]]; then
-          (( ttl = 10#${2} ))
-          shift 2
-        else
-          z::log::error "KV: Invalid TTL value: ${2:-}"
-          return 1
-        fi
+        z::validate::integer "${2:-}" "--ttl" || return $ZBASE_ERROR_INVALID_INPUT
+        ttl="${2}"
+        shift 2
         ;;
+
       --type)
         value_type="${2:-string}"
         shift 2
         ;;
+
       *)
-        z::log::warn "KV: Unknown option: $1"
+        z::log::warn "zkv: unknown set option" option "$1"
         shift
         ;;
     esac
   done
 
-  # Store value
-  _zcore_kv_store[$key]="$value"
-  _zcore_kv_meta[$key]="$value_type"
+  # Reject non-string structures — callers must use the typed helpers (lpush, etc.).
+  local _vstruct
+  _z::kv::structure_of "$value_type"
+  _vstruct="$REPLY"
 
-  # Set TTL if specified
-  if (( ttl > 0 )); then
-    typeset -i expire_time
-    (( expire_time = ${EPOCHSECONDS:-$(date +%s)} + ttl ))
-    _zcore_kv_ttl[$key]=$expire_time
-    z::log::debug "KV: Set TTL for '$key': ${ttl}s (expires at $expire_time)"
-  else
-    unset "_zcore_kv_ttl[$key]"
+  if [[ $_vstruct != $_ZKV_STRUCT_STRING ]]; then
+    z::log::error "zkv: z::kv::set only accepts string-category types" \
+      handle "$handle" type "$value_type"
+    return $ZBASE_ERROR_INVALID_INPUT
   fi
 
-  # Update stats
-  (( _zcore_kv_stats[writes] += 1 ))
+  _z::kv::reserve_type "$handle" "$key" "$value_type" || return $?
 
-  # Trigger watchers and events
-  __z::kv::trigger_watchers "$key" "$value" "set"
+  if _zkv_tx_active "$handle"; then
+    _zkv_aset "_zkv_txbuf_store_${handle}" "$key" "$value"
+    _zkv_adel "_zkv_txbuf_del_${handle}" "$key"
 
-  # Auto-persist
-  __z::kv::auto_persist
+    if (( ttl > 0 )); then
+      _z::kv::epoch || return $?
+      (( _zkv_txbuf_ttl_${handle}[$key] = REPLY + ttl ))
+    else
+      _zkv_adel "_zkv_txbuf_ttl_${handle}" "$key"
+    fi
+  else
+    _zkv_aset "_zkv_store_${handle}" "$key" "$value"
 
-  z::log::debug "KV: Set '$key' = '$value' (type: $value_type)"
+    if (( ttl > 0 )); then
+      _z::kv::epoch || return $?
+      (( _zkv_ttl_${handle}[$key] = REPLY + ttl ))
+    else
+      _zkv_adel "_zkv_ttl_${handle}" "$key"
+    fi
 
+    (( _zkv_stats_${handle}[writes] += 1 ))
+
+    _z::kv::trigger_watchers "$handle" "$key" "$value" "set"
+    _z::kv::auto_persist "$handle"
+  fi
+
+  z::log::debug "zkv: set" handle "$handle" key "$key" type "$value_type"
   return 0
 }
 
-###
-# Get a value by key
-#
-# Usage:
-#   value=$(z::kv::get "app.name")
-#   z::kv::get "counter" || echo "Key not found"
-#
-# @param 1: string - Key name
-# @stdout Value if exists
-# @return 0 if found, 1 if not found or expired
-###
+# z::kv::get <handle> <key>
+# Retrieves a scalar value.  Sets REPLY to the value and REPLY2 to the type.
+# Returns ZBASE_ERROR_NOT_FOUND if the key is absent or expired.
 z::kv::get() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key="$1"
+  local handle="$1" key="$2"
 
-  # Validate key
-  __z::kv::validate_key "$key" || return 1
+  REPLY=""
+  REPLY2=""
 
-  # Check TTL
-  if ! __z::kv::check_ttl "$key"; then
-    (( _zcore_kv_stats[misses] += 1 ))
-    return 1
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if _zkv_tx_active "$handle"; then
+    # Key deleted in this transaction.
+    if _zkv_ahas "_zkv_txbuf_del_${handle}" "$key"; then
+      (( _zkv_stats_${handle}[misses] += 1 ))
+      return $ZBASE_ERROR_NOT_FOUND
+    fi
+
+    # Key written in this transaction — check TTL against the buffer.
+    if _zkv_ahas "_zkv_txbuf_store_${handle}" "$key"; then
+      if ! _z::kv::check_ttl "$handle" "$key"; then
+        (( _zkv_stats_${handle}[misses] += 1 ))
+        return $ZBASE_ERROR_NOT_FOUND
+      fi
+
+      _zkv_aget "_zkv_txbuf_store_${handle}" "$key"
+      local _v="$REPLY"
+
+      _zkv_aget "_zkv_txbuf_meta_${handle}" "$key"
+      REPLY2="${REPLY:-string}"
+      REPLY="$_v"
+
+      (( _zkv_stats_${handle}[reads] += 1 ))
+      (( _zkv_stats_${handle}[hits] += 1 ))
+
+      return 0
+    fi
   fi
 
-  # Check existence
-  if (( ! ${+_zcore_kv_store[$key]} )); then
-    (( _zcore_kv_stats[misses] += 1 ))
-    z::log::debug "KV: Key not found: $key"
-    return 1
+  # Live path: check TTL, then look up in the live store.
+  if ! _z::kv::check_ttl "$handle" "$key"; then
+    (( _zkv_stats_${handle}[misses] += 1 ))
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
-  # Update stats
-  (( _zcore_kv_stats[reads] += 1 ))
-  (( _zcore_kv_stats[hits] += 1 ))
+  if ! _zkv_ahas "_zkv_store_${handle}" "$key"; then
+    (( _zkv_stats_${handle}[misses] += 1 ))
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
 
-  # Return value
-  print -r -- "${_zcore_kv_store[$key]}"
+  _zkv_aget "_zkv_store_${handle}" "$key"
+  local _v="$REPLY"
+
+  _zkv_aget "_zkv_meta_${handle}" "$key"
+  REPLY2="${REPLY:-string}"
+  REPLY="$_v"
+
+  (( _zkv_stats_${handle}[reads] += 1 ))
+  (( _zkv_stats_${handle}[hits] += 1 ))
+
   return 0
 }
 
-###
-# Delete a key
-#
-# Usage:
-#   z::kv::del "app.name"
-#
-# @param 1: string - Key name
-# @return 0 on success, 1 if key doesn't exist
-###
+# z::kv::del <handle> <key>
+# Deletes a key and all associated data.  Inside a transaction the deletion is
+# staged; outside it fires watchers and triggers auto-persist.
 z::kv::del() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key="$1"
+  local handle="$1" key="$2"
 
-  # Validate key
-  __z::kv::validate_key "$key" || return 1
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
 
-  # Check existence
-  if (( ! ${+_zcore_kv_store[$key]} )); then
-    z::log::debug "KV: Key not found for deletion: $key"
-    return 1
+  if _zkv_tx_active "$handle"; then
+    # Stage the deletion and clear any buffered writes for this key.
+    _zkv_aset "_zkv_txbuf_del_${handle}" "$key" 1
+
+    local _suf
+    for _suf in store meta ttl lists sets zsets hashes; do
+      _zkv_adel "_zkv_txbuf_${_suf}_${handle}" "$key"
+    done
+
+    return 0
   fi
 
-  local old_value="${_zcore_kv_store[$key]}"
+  if ! _zkv_ahas "_zkv_meta_${handle}" "$key"; then
+    z::log::debug "zkv: del key not found" handle "$handle" key "$key"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
 
-  # Delete
-  unset "_zcore_kv_store[$key]"
-  unset "_zcore_kv_meta[$key]"
-  unset "_zcore_kv_ttl[$key]"
+  local old_value="" struct mtype
 
-  # Update stats
-  (( _zcore_kv_stats[deletes] += 1 ))
+  _zkv_aget "_zkv_meta_${handle}" "$key"
+  mtype="$REPLY"
 
-  # Trigger watchers
-  __z::kv::trigger_watchers "$key" "$old_value" "del"
+  _z::kv::structure_of "$mtype"
+  struct="$REPLY"
 
-  # Auto-persist
-  __z::kv::auto_persist
+  # Capture the old value for the watcher payload (strings only).
+  if [[ $struct == string ]]; then
+    _zkv_aget "_zkv_store_${handle}" "$key"
+    old_value="$REPLY"
+  fi
 
-  z::log::debug "KV: Deleted '$key'"
+  _z::kv::reap_key "$handle" "$key"
 
+  (( _zkv_stats_${handle}[deletes] += 1 ))
+
+  _z::kv::trigger_watchers "$handle" "$key" "$old_value" "del"
+  _z::kv::auto_persist "$handle"
+
+  z::log::debug "zkv: deleted" handle "$handle" key "$key"
   return 0
 }
 
-###
-# Check if key exists
-#
-# Usage:
-#   if z::probe::kv "app.name"; then
-#     echo "Key exists"
-#   fi
-#
-# @param 1: string - Key name
-# @return 0 if exists and not expired, 1 otherwise
-###
-z::probe::kv() {
+# z::kv::exists <handle> <key>
+# Returns 0 if the key exists and has not expired, 1 otherwise.
+z::kv::exists() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key="$1"
+  local handle="$1" key="$2"
 
-  __z::kv::validate_key "$key" || return 1
-  __z::kv::check_ttl "$key" || return 1
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
 
-  (( ${+_zcore_kv_store[$key]} ))
+  if _zkv_tx_active "$handle"; then
+    # Deleted in this transaction.
+    _zkv_ahas "_zkv_txbuf_del_${handle}" "$key" && return 1
+
+    if _zkv_ahas "_zkv_txbuf_meta_${handle}" "$key"; then
+      _z::kv::check_ttl "$handle" "$key" || return 1
+      return 0
+    fi
+  fi
+
+  _z::kv::check_ttl "$handle" "$key" || return 1
+  _zkv_ahas "_zkv_meta_${handle}" "$key"
 }
 
-###
-# List all keys matching pattern
-#
-# Usage:
-#   z::kv::keys              # All keys
-#   z::kv::keys "app.*"      # Keys starting with "app."
-#   z::kv::keys "*.config"   # Keys ending with ".config"
-#
-# @param 1: string - Pattern (optional, default: "*")
-# @stdout List of matching keys (one per line)
-# @return 0 always
-###
+# z::kv::keys <handle> [<glob-pattern>]
+# Populates the reply array with all live (non-expired) keys matching the
+# optional glob pattern (default: *).
 z::kv::keys() {
   emulate -L zsh
-  setopt localoptions no_unset extended_glob
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local pattern="${1:-*}"
+  local handle="$1" pattern="${2:-*}"
+  reply=()
 
+  _z::kv::require_handle "$handle" || return $?
+
+  local _meta_n="_zkv_meta_${handle}"
   local key
-  for key in "${(@k)_zcore_kv_store}"; do
-    # Check TTL
-    __z::kv::check_ttl "$key" || continue
 
-    # Match pattern
-    if [[ $key == ${~pattern} ]]; then
-      print -r -- "$key"
-    fi
+  for key in "${(@Pk)_meta_n}"; do
+    _z::kv::check_ttl "$handle" "$key" || continue
+    [[ $key == ${~pattern} ]] && reply+=( "$key" )
   done
 
   return 0
 }
 
-################################################################################
-# TYPE-SAFE OPERATIONS
-################################################################################
 
-###
-# Set integer value
-# @param 1: string - Key
-# @param 2: integer - Value
-# @return 0 on success, 1 on failure
-###
+# =============================================================================
+# TYPED ACCESSORS
+# =============================================================================
+
+# z::kv::set_int <handle> <key> <value>
+# Validates that <value> is an integer before delegating to z::kv::set.
 z::kv::set_int() {
   emulate -L zsh
-  local key="$1"
-  local value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if [[ $value != <-> && $value != -<-> ]]; then
-    z::log::error "KV: Not an integer: $value"
-    return 1
-  fi
+  local handle="$1" key="$2" value="$3"
 
-  z::kv::set "$key" "$value" --type int
+  z::validate::integer "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::kv::set "$handle" "$key" "$value" --type int
 }
 
-###
-# Get integer value
-# @param 1: string - Key
-# @stdout Integer value
-# @return 0 on success, 1 on failure
-###
+# z::kv::get_int <handle> <key>
+# Retrieves a value and validates it is an integer; result in REPLY.
 z::kv::get_int() {
   emulate -L zsh
-  local value
-  value=$(z::kv::get "$1") || return 1
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if [[ $value != <-> && $value != -<-> ]]; then
-    z::log::error "KV: Not an integer: $value"
-    return 1
-  fi
+  REPLY=""
 
-  print -r -- "$value"
+  z::kv::get "$1" "$2" || return $?
+  z::validate::integer "$REPLY" "stored value" || return $ZBASE_ERROR_INVALID_INPUT
+
   return 0
 }
 
-###
-# Set boolean value
-# @param 1: string - Key
-# @param 2: bool - Value (true/false, 1/0, yes/no)
-# @return 0 on success, 1 on failure
-###
+# z::kv::set_bool <handle> <key> <value>
+# Normalises truthy inputs (true/1/yes/on) to "true", everything else to
+# "false", then stores the canonical form.
 z::kv::set_bool() {
   emulate -L zsh
-  local key="$1"
-  local value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  # Normalize boolean
+  local handle="$1" key="$2" value="$3"
+
+  z::validate::boolean "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+
   case "${value:l}" in
-    true|1|yes|y|on) value="true" ;;
-    false|0|no|n|off) value="false" ;;
-    *)
-      z::log::error "KV: Invalid boolean: $value"
-      return 1
-      ;;
+    true|1|yes|on) value="true"  ;;
+    *)             value="false" ;;
   esac
 
-  z::kv::set "$key" "$value" --type bool
+  z::kv::set "$handle" "$key" "$value" --type bool
 }
 
-###
-# Get boolean value
-# @param 1: string - Key
-# @stdout "true" or "false"
-# @return 0 if true, 1 if false or not found
-###
+# z::kv::get_bool <handle> <key>
+# Retrieves a boolean value and normalises it to "true" or "false" in REPLY.
 z::kv::get_bool() {
   emulate -L zsh
-  local value
-  value=$(z::kv::get "$1") || return 1
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  case "${value:l}" in
-    true|1|yes|y|on)
-      print "true"
-      return 0
-      ;;
-    false|0|no|n|off)
-      print "false"
-      return 1
-      ;;
-    *)
-      z::log::error "KV: Not a boolean: $value"
-      return 1
-      ;;
+  REPLY="false"
+
+  z::kv::get "$1" "$2" || return $?
+  z::validate::boolean "$REPLY" "stored value" || return $ZBASE_ERROR_INVALID_INPUT
+
+  case "${REPLY:l}" in
+    true|1|yes|on) REPLY="true"  ;;
+    *)             REPLY="false" ;;
   esac
-}
 
-###
-# Set array value (pipe-separated internally)
-# @param 1: string - Key
-# @param ...: string - Array elements
-# @return 0 on success
-###
-z::kv::set_array() {
-  emulate -L zsh
-  local key="$1"
-  shift
-
-  local value="${(j:|:)@}"
-  z::kv::set "$key" "$value" --type array
-}
-
-###
-# Get array value
-# @param 1: string - Key
-# @param 2: string - Output array variable name
-# @return 0 on success, 1 on failure
-###
-z::kv::get_array() {
-  emulate -L zsh
-  local key="$1"
-  local output_var="$2"
-
-  local value
-  value=$(z::kv::get "$key") || return 1
-
-  # Split by pipe and assign to array
-  eval "${output_var}=(\"\${(@s:|:)value}\")"
   return 0
 }
 
-################################################################################
-# ATOMIC OPERATIONS
-################################################################################
+# z::kv::set_array <handle> <key> <element> [<element> ...]
+# Encodes the elements as a delimited string and stores them as a scalar.
+z::kv::set_array() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-###
-# Increment integer value
-# @param 1: string - Key
-# @param 2: integer - Amount (optional, default: 1)
-# @return 0 on success, 1 on failure
-###
+  local handle="$1" key="$2"
+  shift 2
+
+  _z::kv::join_encoded "$@"
+  local value="$REPLY"
+
+  z::kv::set "$handle" "$key" "$value" --type array
+}
+
+# z::kv::get_array <handle> <key> <output-var>
+# Decodes the stored delimited string and assigns the resulting array to the
+# caller-supplied variable name <output-var>.
+z::kv::get_array() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" output_var="$3"
+
+  z::validate::varname "$output_var" "output_var" || return $ZBASE_ERROR_INVALID_INPUT
+  z::kv::get "$handle" "$key" || return $?
+
+  local _raw="$REPLY"
+  _z::kv::split_decoded "$_raw"
+
+  set -A "$output_var" "${reply[@]}"
+  return 0
+}
+
+
+# =============================================================================
+# NUMERIC HELPERS
+# =============================================================================
+
+# _z::kv::_ttl_args_for <handle> <key>
+# Populates REPLY_ARGS with "--ttl <remaining>" if the key has an active TTL,
+# or leaves it empty.  Used by incr/decr/append to preserve TTL across rewrites.
+_z::kv::_ttl_args_for() {
+  local _h="$1" _k="$2"
+
+  REPLY_ARGS=()
+
+  z::kv::ttl "$_h" "$_k"
+  local _t="$REPLY"
+
+  (( _t > 0 )) && REPLY_ARGS=( --ttl "$_t" )
+}
+
+# z::kv::incr <handle> <key> [<amount>]
+# Atomically increments a numeric key by <amount> (default: 1).
+# Creates the key at 0 if it does not exist.  Result in REPLY.
 z::kv::incr() {
   emulate -L zsh
-  local key="$1"
-  typeset -i amount
-  (( amount = ${2:-1} ))
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  typeset -i current
-  if z::probe::kv "$key"; then
-    current=$(z::kv::get_int "$key") || current=0
-  else
-    current=0
+  local handle="$1" key="$2" amount_raw="${3:-1}"
+
+  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+
+  typeset -i amount current=0
+  amount="$amount_raw"
+
+  if z::kv::exists "$handle" "$key"; then
+    z::kv::get_int "$handle" "$key" || return $?
+    current="$REPLY"
   fi
 
   (( current += amount ))
-  z::kv::set_int "$key" "$current"
+
+  local -a REPLY_ARGS
+  _z::kv::_ttl_args_for "$handle" "$key"
+
+  z::kv::set "$handle" "$key" "$current" --type int "${REPLY_ARGS[@]}" || return $?
+
+  REPLY="$current"
+  return 0
 }
 
-###
-# Decrement integer value
-# @param 1: string - Key
-# @param 2: integer - Amount (optional, default: 1)
-# @return 0 on success, 1 on failure
-###
+# z::kv::decr <handle> <key> [<amount>]
+# Decrements a numeric key by <amount> (default: 1) by negating and delegating
+# to z::kv::incr.
 z::kv::decr() {
   emulate -L zsh
-  local key="$1"
-  typeset -i amount
-  (( amount = ${2:-1} ))
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  z::kv::incr "$key" $(( -amount ))
+  local handle="$1" key="$2" amount_raw="${3:-1}"
+
+  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+
+  typeset -i amount
+  amount="$amount_raw"
+
+  z::kv::incr "$handle" "$key" "$(( -amount ))"
 }
 
-###
-# Append to string value
-# @param 1: string - Key
-# @param 2: string - Value to append
-# @return 0 on success
-###
+# z::kv::append <handle> <key> <suffix>
+# Appends <suffix> to the current string value of <key>, preserving its TTL.
+# Creates the key if it does not exist.
 z::kv::append() {
   emulate -L zsh
-  local key="$1"
-  local append_value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local current=""
-  if z::probe::kv "$key"; then
-    current=$(z::kv::get "$key")
+  local handle="$1" key="$2" suffix="$3" current=""
+
+  if z::kv::exists "$handle" "$key"; then
+    z::kv::get "$handle" "$key" || return $?
+    current="$REPLY"
   fi
 
-  z::kv::set "$key" "${current}${append_value}"
+  local -a REPLY_ARGS
+  _z::kv::_ttl_args_for "$handle" "$key"
+
+  z::kv::set "$handle" "$key" "${current}${suffix}" "${REPLY_ARGS[@]}"
 }
 
-################################################################################
-# TTL OPERATIONS
-################################################################################
 
-###
-# Get remaining TTL for key
-# @param 1: string - Key
-# @stdout Remaining seconds (-1 if no TTL, -2 if not found)
-# @return 0 always
-###
+# =============================================================================
+# TTL MANAGEMENT
+# =============================================================================
+
+# z::kv::ttl <handle> <key>
+# Returns the remaining TTL in seconds via REPLY.
+# Follows Redis conventions:
+#   -1 → key exists, no expiry
+#   -2 → key does not exist
+#    0 → expired (or expiry is this second)
+#   >0 → seconds remaining
 z::kv::ttl() {
   emulate -L zsh
-  local key="$1"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if ! z::probe::kv "$key"; then
-    print -- "-2"
+  local handle="$1" key="$2"
+
+  # -2 = key absent (Redis convention). Set the sentinel right before each
+  # early return: z::kv::exists / require_handle clobber REPLY internally
+  # (check_ttl, _zkv_ahas), so an up-front assignment would not survive.
+  _z::kv::require_handle "$handle" || { REPLY="-2"; return 0; }
+  z::kv::exists "$handle" "$key"   || { REPLY="-2"; return 0; }
+
+  local expire=""
+
+  # Resolve expiry: tx-buffer takes precedence over live TTL map.
+  if _zkv_tx_active "$handle"; then
+    if _zkv_ahas "_zkv_txbuf_ttl_${handle}" "$key"; then
+      _zkv_aget "_zkv_txbuf_ttl_${handle}" "$key"
+      expire="$REPLY"
+    elif _zkv_ahas "_zkv_ttl_${handle}" "$key"; then
+      _zkv_aget "_zkv_ttl_${handle}" "$key"
+      expire="$REPLY"
+    fi
+  else
+    if _zkv_ahas "_zkv_ttl_${handle}" "$key"; then
+      _zkv_aget "_zkv_ttl_${handle}" "$key"
+      expire="$REPLY"
+    fi
+  fi
+
+  if [[ -z $expire ]]; then
+    REPLY="-1"
     return 0
   fi
 
-  if (( ! ${+_zcore_kv_ttl[$key]} )); then
-    print -- "-1"  # No TTL
-    return 0
-  fi
+  _z::kv::epoch || return $?
+  typeset -i now="$REPLY" remaining
 
-  typeset -i expire_time current_time remaining
-  (( expire_time = ${_zcore_kv_ttl[$key]} ))
-  (( current_time = ${EPOCHSECONDS:-$(date +%s)} ))
-  (( remaining = expire_time - current_time ))
+  (( remaining = expire - now ))
+  (( remaining < 0 )) && remaining=0
 
-  if (( remaining < 0 )); then
-    remaining=0
-  fi
-
-  print -- "$remaining"
+  REPLY="$remaining"
   return 0
 }
 
-###
-# Set TTL for existing key
-# @param 1: string - Key
-# @param 2: integer - TTL in seconds
-# @return 0 on success, 1 if key doesn't exist
-###
+# z::kv::expire <handle> <key> <ttl-seconds>
+# Sets or removes the TTL on an existing key.
+# A TTL of 0 or negative removes the expiry (makes the key persistent).
 z::kv::expire() {
   emulate -L zsh
-  local key="$1"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" ttl_raw="${3:-0}"
+
+  _z::kv::require_handle "$handle"        || return $?
+  z::validate::integer   "$ttl_raw" "ttl" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if ! z::kv::exists "$handle" "$key"; then
+    z::log::error "zkv: cannot set TTL on non-existent key" handle "$handle" key "$key"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
   typeset -i ttl
-  (( ttl = ${2:-0} ))
+  ttl="$ttl_raw"
 
-  if ! z::probe::kv "$key"; then
-    z::log::error "KV: Cannot set TTL on non-existent key: $key"
-    return 1
-  fi
-
-  if (( ttl <= 0 )); then
-    unset "_zcore_kv_ttl[$key]"
-    z::log::debug "KV: Removed TTL from '$key'"
+  if _zkv_tx_active "$handle"; then
+    if (( ttl <= 0 )); then
+      _zkv_adel "_zkv_txbuf_ttl_${handle}" "$key"
+    else
+      _z::kv::epoch || return $?
+      (( _zkv_txbuf_ttl_${handle}[$key] = REPLY + ttl ))
+    fi
   else
-    typeset -i expire_time
-    (( expire_time = ${EPOCHSECONDS:-$(date +%s)} + ttl ))
-    _zcore_kv_ttl[$key]=$expire_time
-    z::log::debug "KV: Set TTL for '$key': ${ttl}s"
+    if (( ttl <= 0 )); then
+      _zkv_adel "_zkv_ttl_${handle}" "$key"
+    else
+      _z::kv::epoch || return $?
+      (( _zkv_ttl_${handle}[$key] = REPLY + ttl ))
+    fi
+
+    _z::kv::auto_persist "$handle"
   fi
 
+  z::log::debug "zkv: TTL set" handle "$handle" key "$key" ttl "${ttl}s"
   return 0
 }
 
-###
-# Remove TTL from key (make it persistent)
-# @param 1: string - Key
-# @return 0 on success
-###
+# z::kv::persist <handle> <key>
+# Removes the TTL from a key, making it permanent.
+# Thin wrapper around z::kv::expire with ttl=0.
 z::kv::persist() {
   emulate -L zsh
-  local key="$1"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  unset "_zcore_kv_ttl[$key]"
-  z::log::debug "KV: Made key persistent: $key"
-  return 0
+  local handle="$1" key="$2"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if ! z::kv::exists "$handle" "$key"; then
+    z::log::error "zkv: cannot persist non-existent key" handle "$handle" key "$key"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  z::kv::expire "$handle" "$key" 0
 }
 
-################################################################################
-# PERSISTENCE
-################################################################################
 
-###
-# Save KV store to file
-#
-# Usage:
-#   z::kv::save "/tmp/app.db"
-#
-# @param 1: string - File path
-# @return 0 on success, 1 on failure
-###
-z::kv::save() {
-  emulate -L zsh
-  setopt localoptions no_unset
+# =============================================================================
+# MULTI-KEY OPS
+# =============================================================================
 
-  local file="$1"
-
-  if [[ -z $file ]]; then
-    z::log::error "KV: No file specified for save"
-    return 1
-  fi
-
-  z::log::info "KV: Saving to $file"
-
-  {
-    print "# ZCORE KV Store Dump"
-    print "# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-    print "# Version: 1.0"
-    print ""
-
-    local key value value_type
-    typeset -i ttl_remaining
-
-    for key in "${(@k)_zcore_kv_store}"; do
-      # Skip expired keys
-      __z::kv::check_ttl "$key" || continue
-
-      value="${_zcore_kv_store[$key]}"
-      value_type="${_zcore_kv_meta[$key]:-string}"
-
-      # Escape special characters
-      value="${value//\\/\\\\}"
-      value="${value//$'\n'/\\n}"
-      value="${value//|/\\|}"
-
-      # Get TTL
-      ttl_remaining=$(z::kv::ttl "$key")
-
-      # Format: key|type|ttl|value
-      print "${key}|${value_type}|${ttl_remaining}|${value}"
-    done
-  } > "$file"
-
-  z::log::info "KV: Saved ${#_zcore_kv_store} keys to $file"
-  return 0
-}
-
-###
-# Load KV store from file
-#
-# Usage:
-#   z::kv::load "/tmp/app.db"
-#
-# @param 1: string - File path
-# @return 0 on success, 1 on failure
-###
-z::kv::load() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local file="$1"
-
-  if [[ -z $file ]]; then
-    z::log::error "KV: No file specified for load"
-    return 1
-  fi
-
-  if [[ ! -f $file || ! -r $file ]]; then
-    z::log::error "KV: Cannot read file: $file"
-    return 1
-  fi
-
-  z::log::info "KV: Loading from $file"
-
-  typeset -i loaded=0
-  local line key value_type ttl_val value
-
-  while IFS= read -r line; do
-    # Skip comments and empty lines
-    [[ $line =~ '^[[:space:]]*(#.*)?$' ]] && continue
-
-    # Parse: key|type|ttl|value
-    key="${line%%|*}"
-    local rest="${line#*|}"
-    value_type="${rest%%|*}"
-    rest="${rest#*|}"
-    ttl_val="${rest%%|*}"
-    value="${rest#*|}"
-
-    # Unescape special characters
-    value="${value//\\n/$'\n'}"
-    value="${value//\\\\/\\}"
-    value="${value//\\|/|}"
-
-    # Set value
-    if [[ $ttl_val == <-> ]] && (( ttl_val > 0 )); then
-      z::kv::set "$key" "$value" --type "$value_type" --ttl "$ttl_val"
-    else
-      z::kv::set "$key" "$value" --type "$value_type"
-    fi
-
-    (( loaded += 1 ))
-  done < "$file"
-
-  z::log::info "KV: Loaded $loaded keys from $file"
-  return 0
-}
-
-################################################################################
-# WATCH PATTERNS
-################################################################################
-
-###
-# Watch keys matching pattern
-#
-# Usage:
-#   z::kv::watch "config.*" my_handler
-#   my_handler() {
-#     local key="$1" value="$2" operation="$3"
-#     echo "Changed: $key = $value ($operation)"
-#   }
-#
-# @param 1: string - Key pattern (supports wildcards)
-# @param 2: string - Handler function name
-# @return 0 on success
-###
-z::kv::watch() {
-  emulate -L zsh
-  local pattern="$1"
-  local handler="$2"
-
-  if [[ -z $pattern || -z $handler ]]; then
-    z::log::error "KV: watch requires pattern and handler"
-    return 1
-  fi
-
-  if ! z::probe::func "$handler"; then
-    z::log::error "KV: Handler function not found: $handler"
-    return 1
-  fi
-
-  # Add handler to pattern
-  local existing="${_zcore_kv_watchers[$pattern]:-}"
-  if [[ -n $existing ]]; then
-    _zcore_kv_watchers[$pattern]="${existing}|${handler}"
-  else
-    _zcore_kv_watchers[$pattern]="$handler"
-  fi
-
-  z::log::debug "KV: Watching pattern '$pattern' with handler '$handler'"
-  return 0
-}
-
-###
-# Stop watching pattern
-# @param 1: string - Key pattern
-# @param 2: string - Handler function name (optional, removes all if omitted)
-# @return 0 on success
-###
-z::kv::unwatch() {
-  emulate -L zsh
-  local pattern="$1"
-  local handler="${2:-}"
-
-  if [[ -z $pattern ]]; then
-    z::log::error "KV: unwatch requires pattern"
-    return 1
-  fi
-
-  if [[ -z $handler ]]; then
-    # Remove all handlers for pattern
-    unset "_zcore_kv_watchers[$pattern]"
-    z::log::debug "KV: Removed all watchers for pattern '$pattern'"
-  else
-    # Remove specific handler
-    local existing="${_zcore_kv_watchers[$pattern]:-}"
-    if [[ -n $existing ]]; then
-      local -a handlers
-      handlers=(${(s:|:)existing})
-      handlers=(${(@)handlers:#$handler})
-
-      if (( ${#handlers} > 0 )); then
-        _zcore_kv_watchers[$pattern]="${(j:|:)handlers}"
-      else
-        unset "_zcore_kv_watchers[$pattern]"
-      fi
-
-      z::log::debug "KV: Removed watcher '$handler' from pattern '$pattern'"
-    fi
-  fi
-
-  return 0
-}
-
-################################################################################
-# BULK OPERATIONS
-################################################################################
-
-###
-# Set multiple key-value pairs
-# @param ...: string - Alternating keys and values
-# @return 0 on success
-###
+# z::kv::mset <handle> <key> <value> [<key> <value> ...]
+# Sets multiple key-value pairs atomically (requires an even argument count).
 z::kv::mset() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+  shift
+
+  _z::kv::require_handle "$handle" || return $?
 
   if (( $# % 2 != 0 )); then
-    z::log::error "KV: mset requires even number of arguments (key value pairs)"
-    return 1
+    z::log::error "zkv: mset requires even number of key-value arguments" received "$#"
+    return $ZBASE_ERROR_INVALID_INPUT
   fi
 
   while (( $# >= 2 )); do
-    z::kv::set "$1" "$2" || return 1
+    z::kv::set "$handle" "$1" "$2" || return $?
     shift 2
   done
 
   return 0
 }
 
-###
-# Get multiple values
-# @param ...: string - Keys
-# @stdout Values (one per line, empty line if not found)
-# @return 0 always
-###
+# z::kv::mget <handle> <key> [<key> ...]
+# Retrieves multiple keys; populates reply with values in order.
+# Missing or expired keys produce an empty string in the corresponding slot.
 z::kv::mget() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key value
+  local handle="$1"
+  shift
+
+  reply=()
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local key
+
   for key in "$@"; do
-    if value=$(z::kv::get "$key" 2>/dev/null); then
-      print -r -- "$value"
+    if z::kv::get "$handle" "$key"; then
+      reply+=( "$REPLY" )
     else
-      print ""
+      reply+=( "" )
     fi
   done
 
   return 0
 }
 
-###
-# Clear all keys matching pattern
-# @param 1: string - Pattern (optional, default: "*" = all keys)
-# @return 0 always
-###
+# z::kv::clear <handle> [<glob-pattern>]
+# Deletes all keys matching the optional glob pattern (default: *).
 z::kv::clear() {
   emulate -L zsh
-  local pattern="${1:-*}"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local -a keys_to_delete
-  keys_to_delete=($(z::kv::keys "$pattern"))
+  local handle="$1" pattern="${2:-*}"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _meta_n="_zkv_meta_${handle}"
+  local -a to_delete
+  local key
+
+  for key in "${(@Pk)_meta_n}"; do
+    [[ $key == ${~pattern} ]] && to_delete+=( "$key" )
+  done
 
   typeset -i deleted=0
-  local key
-  for key in "${keys_to_delete[@]}"; do
-    z::kv::del "$key" && (( deleted += 1 ))
+
+  for key in "${to_delete[@]}"; do
+    z::kv::del "$handle" "$key" && (( deleted += 1 ))
   done
 
-  z::log::debug "KV: Cleared $deleted keys matching '$pattern'"
-  return 0
-}
-
-################################################################################
-# TRANSACTIONS
-################################################################################
-
-###
-# Begin transaction
-# @return 0 on success, 1 if already in transaction
-###
-z::kv::begin() {
-  emulate -L zsh
-
-  if (( _zcore_kv_in_transaction )); then
-    z::log::error "KV: Already in transaction"
-    return 1
-  fi
-
-  # Backup current state using a better format
-  local -a store_backup meta_backup ttl_backup
-
-  local key value
-  for key value in "${(@kv)_zcore_kv_store}"; do
-    store_backup+=("$key")
-    store_backup+=("$value")
-  done
-
-  for key value in "${(@kv)_zcore_kv_meta}"; do
-    meta_backup+=("$key")
-    meta_backup+=("$value")
-  done
-
-  for key value in "${(@kv)_zcore_kv_ttl}"; do
-    ttl_backup+=("$key")
-    ttl_backup+=("$value")
-  done
-
-  _zcore_kv_transaction[store]="${(F)store_backup}"
-  _zcore_kv_transaction[meta]="${(F)meta_backup}"
-  _zcore_kv_transaction[ttl]="${(F)ttl_backup}"
-
-  (( _zcore_kv_in_transaction = 1 ))
-  z::log::debug "KV: Transaction started"
-  return 0
-}
-
-###
-# Commit transaction
-# @return 0 on success
-###
-z::kv::commit() {
-  emulate -L zsh
-
-  if (( ! _zcore_kv_in_transaction )); then
-    z::log::warn "KV: Not in transaction"
-    return 0
-  fi
-
-  # Clear backup
-  _zcore_kv_transaction=()
-  (( _zcore_kv_in_transaction = 0 ))
-
-  z::log::debug "KV: Transaction committed"
-  return 0
-}
-
-###
-# Rollback transaction
-# @return 0 on success
-###
-z::kv::rollback() {
-  emulate -L zsh
-
-  if (( ! _zcore_kv_in_transaction )); then
-    z::log::warn "KV: Not in transaction"
-    return 0
-  fi
-
-  # Parse and restore backup
-  local backup_store="${_zcore_kv_transaction[store]}"
-  local backup_meta="${_zcore_kv_transaction[meta]}"
-  local backup_ttl="${_zcore_kv_transaction[ttl]}"
-
-  # Clear current state
-  _zcore_kv_store=()
-  _zcore_kv_meta=()
-  _zcore_kv_ttl=()
-
-  # Restore store
-  if [[ -n $backup_store ]]; then
-    local -a lines
-    lines=("${(@f)backup_store}")
-
-    typeset -i i
-    for (( i = 1; i <= ${#lines}; i += 2 )); do
-      local key="${lines[i]}"
-      local value="${lines[i+1]}"
-      [[ -n $key ]] && _zcore_kv_store[$key]="$value"
-    done
-  fi
-
-  # Restore meta
-  if [[ -n $backup_meta ]]; then
-    local -a lines
-    lines=("${(@f)backup_meta}")
-
-    typeset -i i
-    for (( i = 1; i <= ${#lines}; i += 2 )); do
-      local key="${lines[i]}"
-      local value="${lines[i+1]}"
-      [[ -n $key ]] && _zcore_kv_meta[$key]="$value"
-    done
-  fi
-
-  # Restore TTL
-  if [[ -n $backup_ttl ]]; then
-    local -a lines
-    lines=("${(@f)backup_ttl}")
-
-    typeset -i i
-    for (( i = 1; i <= ${#lines}; i += 2 )); do
-      local key="${lines[i]}"
-      local value="${lines[i+1]}"
-      [[ -n $key ]] && _zcore_kv_ttl[$key]="$value"
-    done
-  fi
-
-  _zcore_kv_transaction=()
-  (( _zcore_kv_in_transaction = 0 ))
-
-  z::log::debug "KV: Transaction rolled back"
-  return 0
-}
-################################################################################
-# INTROSPECTION & STATISTICS
-################################################################################
-
-###
-# Get KV store statistics
-# @return 0 always
-###
-z::kv::stats() {
-  emulate -L zsh
-
-  print "\nKV Store Statistics:"
-  print "===================="
-
-  typeset -i total_keys active_keys expired_keys
-  (( total_keys = ${#_zcore_kv_store} ))
-
-  # Count active keys (non-expired)
-  active_keys=0
-  expired_keys=0
-  local key
-  for key in "${(@k)_zcore_kv_store}"; do
-    if __z::kv::check_ttl "$key"; then
-      (( active_keys += 1 ))
-    else
-      (( expired_keys += 1 ))
-    fi
-  done
-
-  print "Total Keys:     $total_keys"
-  print "Active Keys:    $active_keys"
-  print "Expired Keys:   $expired_keys"
-  print ""
-  print "Operations:"
-  print "  Reads:        ${_zcore_kv_stats[reads]}"
-  print "  Writes:       ${_zcore_kv_stats[writes]}"
-  print "  Deletes:      ${_zcore_kv_stats[deletes]}"
-  print "  Cache Hits:   ${_zcore_kv_stats[hits]}"
-  print "  Cache Misses: ${_zcore_kv_stats[misses]}"
-
-  if (( _zcore_kv_stats[reads] > 0 )); then
-    typeset -F hit_rate
-    (( hit_rate = (_zcore_kv_stats[hits] * 100.0) / _zcore_kv_stats[reads] ))
-    print "  Hit Rate:     ${hit_rate}%"
-  fi
-
-  print ""
-  print "Watchers:       ${#_zcore_kv_watchers}"
-  print "Auto-persist:   ${_zcore_kv_config[auto_persist]}"
-
-  if [[ -n ${_zcore_kv_config[persist_file]} ]]; then
-    print "Persist File:   ${_zcore_kv_config[persist_file]}"
-  fi
-
-  print ""
-  return 0
-}
-
-###
-# Get total number of keys
-# @stdout Number of keys
-# @return 0 always
-###
-z::kv::size() {
-  emulate -L zsh
-  print -- "${#_zcore_kv_store}"
-  return 0
-}
-
-###
-# Export all data in human-readable format
-# @stdout All key-value pairs
-# @return 0 always
-###
-z::kv::export() {
-  emulate -L zsh
-
-  print "# ZCORE KV Store Export"
-  print "# $(date '+%Y-%m-%d %H:%M:%S')"
-  print ""
-
-  local key value value_type
-  for key in "${(@k)_zcore_kv_store}"; do
-    __z::kv::check_ttl "$key" || continue
-
-    value="${_zcore_kv_store[$key]}"
-    value_type="${_zcore_kv_meta[$key]:-string}"
-
-    print "${key} (${value_type}) = ${value}"
-  done
-
-  return 0
-}
-
-###
-# Configure KV store
-# @param 1: string - Config key
-# @param 2: string - Config value
-# @return 0 on success
-###
-z::kv::config() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  if (( ! ${+_zcore_kv_config[$key]} )); then
-    z::log::error "KV: Unknown config key: $key"
-    return 1
-  fi
-
-  _zcore_kv_config[$key]="$value"
-  z::log::debug "KV: Config updated: $key = $value"
-  return 0
-}
-
-###
-# Enable auto-persistence
-# @param 1: string - File path
-# @return 0 on success
-###
-z::kv::enable_persist() {
-  emulate -L zsh
-  local file="$1"
-
-  if [[ -z $file ]]; then
-    z::log::error "KV: Persist file path required"
-    return 1
-  fi
-
-  _zcore_kv_config[auto_persist]=true
-  _zcore_kv_config[persist_file]="$file"
-
-  z::log::info "KV: Auto-persistence enabled: $file"
-  return 0
-}
-
-###
-# Disable auto-persistence
-# @return 0 always
-###
-z::kv::disable_persist() {
-  emulate -L zsh
-
-  _zcore_kv_config[auto_persist]=false
-  z::log::info "KV: Auto-persistence disabled"
+  z::log::debug "zkv: cleared" handle "$handle" pattern "$pattern" count "$deleted"
   return 0
 }
 
 
-################################################################################
-# LIST OPERATIONS (Like Redis Lists)
-################################################################################
-
-###
-# Push value to left (head) of list
-#
-# Usage:
-#   z::kv::lpush "mylist" "item1"
-#   z::kv::lpush "mylist" "item2"  # List is now: item2, item1
-#
-# @param 1: string - List key
-# @param 2: string - Value to push
-# @return 0 on success
-###
-z::kv::lpush() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -n $existing ]]; then
-    _zcore_kv_lists[$key]="${value}|${existing}"
-  else
-    _zcore_kv_lists[$key]="$value"
-  fi
-
-  z::log::debug "KV: LPUSH '$key' <- '$value'"
-  __z::kv::trigger_watchers "$key" "$value" "lpush"
-
-  return 0
-}
-
-###
-# Push value to right (tail) of list
-#
-# Usage:
-#   z::kv::rpush "mylist" "item1"
-#   z::kv::rpush "mylist" "item2"  # List is now: item1, item2
-#
-# @param 1: string - List key
-# @param 2: string - Value to push
-# @return 0 on success
-###
-z::kv::rpush() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -n $existing ]]; then
-    _zcore_kv_lists[$key]="${existing}|${value}"
-  else
-    _zcore_kv_lists[$key]="$value"
-  fi
-
-  z::log::debug "KV: RPUSH '$key' <- '$value'"
-  __z::kv::trigger_watchers "$key" "$value" "rpush"
-
-  return 0
-}
-
-###
-# Pop value from left (head) of list
-#
-# Usage:
-#   value=$(z::kv::lpop "mylist")
-#
-# @param 1: string - List key
-# @stdout Popped value
-# @return 0 on success, 1 if list empty or not found
-###
-z::kv::lpop() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local key="$1"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    z::log::debug "KV: LPOP '$key' - list empty or not found"
-    return 1
-  fi
-
-  # Split into array
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  if (( ${#items} == 0 )); then
-    z::log::debug "KV: LPOP '$key' - list empty"
-    return 1
-  fi
-
-  # Get first item
-  local popped="${items[1]}"
-
-  # Remove first item and rebuild list
-  if (( ${#items} > 1 )); then
-    items=("${(@)items[2,-1]}")
-    _zcore_kv_lists[$key]="${(j:|:)items}"
-  else
-    # List is now empty
-    unset "_zcore_kv_lists[$key]"
-  fi
-
-  z::log::debug "KV: LPOP '$key' -> '$popped' (${#items} remaining)"
-  print -r -- "$popped"
-
-  return 0
-}
-###
-# Pop value from right (tail) of list
-#
-# Usage:
-#   value=$(z::kv::rpop "mylist")
-#
-# @param 1: string - List key
-# @stdout Popped value
-# @return 0 on success, 1 if list empty or not found
-###
-z::kv::rpop() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local key="$1"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    z::log::debug "KV: RPOP '$key' - list empty or not found"
-    return 1
-  fi
-
-  # Split into array
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  if (( ${#items} == 0 )); then
-    z::log::debug "KV: RPOP '$key' - list empty"
-    return 1
-  fi
-
-  # Get last item
-  local popped="${items[-1]}"
-
-  # Remove last item and rebuild list
-  if (( ${#items} > 1 )); then
-    items=("${(@)items[1,-2]}")
-    _zcore_kv_lists[$key]="${(j:|:)items}"
-  else
-    # List is now empty
-    unset "_zcore_kv_lists[$key]"
-  fi
-
-  z::log::debug "KV: RPOP '$key' -> '$popped' (${#items} remaining)"
-  print -r -- "$popped"
-
-  return 0
-}
-###
-# Get range of list elements
-#
-# Usage:
-#   z::kv::lrange "mylist" 0 -1     # All elements
-#   z::kv::lrange "mylist" 0 2      # First 3 elements
-#   z::kv::lrange "mylist" -3 -1    # Last 3 elements
-#
-# @param 1: string - List key
-# @param 2: integer - Start index (0-based, negative from end)
-# @param 3: integer - Stop index (inclusive)
-# @stdout List elements (one per line)
-# @return 0 on success
-###
-z::kv::lrange() {
-  emulate -L zsh
-  local key="$1"
-  typeset -i start stop
-  (( start = ${2:-0} ))
-  (( stop = ${3:--1} ))
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 0
-  fi
-
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  # Handle negative indices
-  if (( start < 0 )); then
-    (( start = ${#items} + start + 1 ))
-  else
-    (( start += 1 ))  # Convert to 1-based
-  fi
-
-  if (( stop < 0 )); then
-    (( stop = ${#items} + stop + 1 ))
-  else
-    (( stop += 1 ))  # Convert to 1-based
-  fi
-
-  # Bounds checking
-  (( start < 1 )) && (( start = 1 ))
-  (( stop > ${#items} )) && (( stop = ${#items} ))
-
-  if (( start <= stop )); then
-    print -l -- "${(@)items[start,stop]}"
-  fi
-
-  return 0
-}
-
-###
-# Get list length
-#
-# Usage:
-#   length=$(z::kv::llen "mylist")
-#
-# @param 1: string - List key
-# @stdout List length
-# @return 0 always
-###
-z::kv::llen() {
-  emulate -L zsh
-  local key="$1"
-
-  local existing="${_zcore_kv_lists[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    print "0"
-    return 0
-  fi
-
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  print "${#items}"
-  return 0
-}
-
-################################################################################
-# SET OPERATIONS (Unique Values)
-################################################################################
-
-###
-# Add member to set
-#
-# Usage:
-#   z::kv::sadd "myset" "value1"
-#   z::kv::sadd "myset" "value2"
-#   z::kv::sadd "myset" "value1"  # Ignored (already exists)
-#
-# @param 1: string - Set key
-# @param 2: string - Value to add
-# @return 0 if added, 1 if already exists
-###
-z::kv::sadd() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_sets[$key]:-}"
-
-  # Check if already exists
-  if [[ -n $existing ]]; then
-    local -a members
-    members=("${(@s:|:)existing}")
-
-    if (( ${members[(Ie)$value]} )); then
-      z::log::debug "KV: SADD '$key' - '$value' already exists"
-      return 1
-    fi
-
-    _zcore_kv_sets[$key]="${existing}|${value}"
-  else
-    _zcore_kv_sets[$key]="$value"
-  fi
-
-  z::log::debug "KV: SADD '$key' <- '$value'"
-  __z::kv::trigger_watchers "$key" "$value" "sadd"
-
-  return 0
-}
-
-###
-# Remove member from set
-#
-# Usage:
-#   z::kv::srem "myset" "value1"
-#
-# @param 1: string - Set key
-# @param 2: string - Value to remove
-# @return 0 if removed, 1 if not found
-###
-z::kv::srem() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_sets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 1
-  fi
-
-  local -a members
-  members=("${(@s:|:)existing}")
-
-  # Remove value
-  members=("${(@)members:#$value}")
-
-  if (( ${#members} > 0 )); then
-    _zcore_kv_sets[$key]="${(j:|:)members}"
-  else
-    unset "_zcore_kv_sets[$key]"
-  fi
-
-  z::log::debug "KV: SREM '$key' <- '$value'"
-
-  return 0
-}
-
-###
-# Check if member exists in set
-#
-# Usage:
-#   if z::kv::sismember "myset" "value1"; then
-#     echo "Value exists"
-#   fi
-#
-# @param 1: string - Set key
-# @param 2: string - Value to check
-# @return 0 if exists, 1 if not
-###
-z::kv::sismember() {
-  emulate -L zsh
-  local key="$1"
-  local value="$2"
-
-  local existing="${_zcore_kv_sets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 1
-  fi
-
-  local -a members
-  members=("${(@s:|:)existing}")
-
-  (( ${members[(Ie)$value]} ))
-}
-
-###
-# Get all set members
-#
-# Usage:
-#   z::kv::smembers "myset"
-#
-# @param 1: string - Set key
-# @stdout Set members (one per line)
-# @return 0 always
-###
-z::kv::smembers() {
-  emulate -L zsh
-  local key="$1"
-
-  local existing="${_zcore_kv_sets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 0
-  fi
-
-  local -a members
-  members=("${(@s:|:)existing}")
-
-  print -l -- "${members[@]}"
-  return 0
-}
-
-###
-# Get set cardinality (size)
-#
-# Usage:
-#   size=$(z::kv::scard "myset")
-#
-# @param 1: string - Set key
-# @stdout Set size
-# @return 0 always
-###
-z::kv::scard() {
-  emulate -L zsh
-  local key="$1"
-
-  local existing="${_zcore_kv_sets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    print "0"
-    return 0
-  fi
-
-  local -a members
-  members=("${(@s:|:)existing}")
-
-  print "${#members}"
-  return 0
-}
-
-################################################################################
-# SORTED SET OPERATIONS (Score-based ordering)
-################################################################################
-
-###
-# Add member to sorted set with score
-#
-# Usage:
-#   z::kv::zadd "leaderboard" 100 "player1"
-#   z::kv::zadd "leaderboard" 200 "player2"
-#
-# @param 1: string - Sorted set key
-# @param 2: number - Score
-# @param 3: string - Member
-# @return 0 on success
-###
-z::kv::zadd() {
-  emulate -L zsh
-  local key="$1"
-  typeset -F score
-  (( score = ${2} ))
-  local member="$3"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_zsets[$key]:-}"
-  local -a items
-
-  if [[ -n $existing ]]; then
-    items=("${(@s:|:)existing}")
-
-    # Remove existing member if present
-    local -a filtered
-    local item
-    for item in "${items[@]}"; do
-      local item_member="${item#*:}"
-      if [[ $item_member != $member ]]; then
-        filtered+=("$item")
-      fi
-    done
-    items=("${filtered[@]}")
-  fi
-
-  # Add new scored member
-  items+=("${score}:${member}")
-
-  _zcore_kv_zsets[$key]="${(j:|:)items}"
-
-  z::log::debug "KV: ZADD '$key' <- $score:$member"
-  __z::kv::trigger_watchers "$key" "$member" "zadd"
-
-  return 0
-}
-
-###
-# Get score of member in sorted set
-#
-# Usage:
-#   score=$(z::kv::zscore "leaderboard" "player1")
-#
-# @param 1: string - Sorted set key
-# @param 2: string - Member
-# @stdout Score
-# @return 0 if found, 1 if not found
-###
-z::kv::zscore() {
-  emulate -L zsh
-  local key="$1"
-  local member="$2"
-
-  local existing="${_zcore_kv_zsets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 1
-  fi
-
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  local item
-  for item in "${items[@]}"; do
-    local item_score="${item%%:*}"
-    local item_member="${item#*:}"
-
-    if [[ $item_member == $member ]]; then
-      print -r -- "$item_score"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-###
-# Get range of sorted set members by rank
-#
-# Usage:
-#   z::kv::zrange "leaderboard" 0 9           # Top 10
-#   z::kv::zrange "leaderboard" 0 -1          # All members
-#   z::kv::zrange "leaderboard" 0 2 --rev     # Top 3 (highest scores)
-#
-# @param 1: string - Sorted set key
-# @param 2: integer - Start rank
-# @param 3: integer - Stop rank
-# @param 4: string - --rev (reverse order, highest first)
-# @stdout Members (one per line)
-# @return 0 always
-###
-z::kv::zrange() {
-  emulate -L zsh
-  local key="$1"
-  typeset -i start stop
-  (( start = ${2:-0} ))
-  (( stop = ${3:--1} ))
-  local reverse=false
-
-  [[ ${4:-} == --rev ]] && reverse=true
-
-  local existing="${_zcore_kv_zsets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 0
-  fi
-
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  # Sort by score
-  local -a sorted_items
-  sorted_items=("${(@n)items}")  # Numeric sort
-
-  # Reverse if requested
-  if [[ $reverse == true ]]; then
-    sorted_items=("${(@Oa)sorted_items}")
-  fi
-
-  # Handle negative indices
-  typeset -i actual_start actual_stop
-  if (( start < 0 )); then
-    (( actual_start = ${#sorted_items} + start + 1 ))
-  else
-    (( actual_start = start + 1 ))
-  fi
-
-  if (( stop < 0 )); then
-    (( actual_stop = ${#sorted_items} + stop + 1 ))
-  else
-    (( actual_stop = stop + 1 ))
-  fi
-
-  # Bounds checking
-  (( actual_start < 1 )) && (( actual_start = 1 ))
-  (( actual_stop > ${#sorted_items} )) && (( actual_stop = ${#sorted_items} ))
-
-  # Output members (without scores)
-  if (( actual_start <= actual_stop )); then
-    local item
-    for item in "${(@)sorted_items[actual_start,actual_stop]}"; do
-      print -r -- "${item#*:}"
-    done
-  fi
-
-  return 0
-}
-
-###
-# Get range with scores
-#
-# Usage:
-#   z::kv::zrange_withscores "leaderboard" 0 9
-#
-# @param 1: string - Sorted set key
-# @param 2: integer - Start rank
-# @param 3: integer - Stop rank
-# @stdout "member score" pairs (one per line)
-# @return 0 always
-###
-z::kv::zrange_withscores() {
-  emulate -L zsh
-  local key="$1"
-  typeset -i start stop
-  (( start = ${2:-0} ))
-  (( stop = ${3:--1} ))
-
-  local existing="${_zcore_kv_zsets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 0
-  fi
-
-  local -a items
-  items=("${(@s:|:)existing}")
-
-  # Sort by score (descending)
-  local -a sorted_items
-  sorted_items=("${(@On)items}")
-
-  # Handle indices
-  typeset -i actual_start actual_stop
-  if (( start < 0 )); then
-    (( actual_start = ${#sorted_items} + start + 1 ))
-  else
-    (( actual_start = start + 1 ))
-  fi
-
-  if (( stop < 0 )); then
-    (( actual_stop = ${#sorted_items} + stop + 1 ))
-  else
-    (( actual_stop = stop + 1 ))
-  fi
-
-  (( actual_start < 1 )) && (( actual_start = 1 ))
-  (( actual_stop > ${#sorted_items} )) && (( actual_stop = ${#sorted_items} ))
-
-  if (( actual_start <= actual_stop )); then
-    local item
-    for item in "${(@)sorted_items[actual_start,actual_stop]}"; do
-      local item_score="${item%%:*}"
-      local item_member="${item#*:}"
-      print "${item_member} ${item_score}"
-    done
-  fi
-
-  return 0
-}
-
-###
-# Remove member from sorted set
-#
-# Usage:
-#   z::kv::zrem "leaderboard" "player1"
-#
-# @param 1: string - Sorted set key
-# @param 2: string - Member to remove
-# @return 0 if removed, 1 if not found
-###
-z::kv::zrem() {
-  emulate -L zsh
-  local key="$1"
-  local member="$2"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local existing="${_zcore_kv_zsets[$key]:-}"
-
-  if [[ -z $existing ]]; then
-    return 1
-  fi
-
-  local -a items filtered
-  items=("${(@s:|:)existing}")
-
-  local item
-  for item in "${items[@]}"; do
-    local item_member="${item#*:}"
-    if [[ $item_member != $member ]]; then
-      filtered+=("$item")
-    fi
-  done
-
-  if (( ${#filtered} > 0 )); then
-    _zcore_kv_zsets[$key]="${(j:|:)filtered}"
-  else
-    unset "_zcore_kv_zsets[$key]"
-  fi
-
-  z::log::debug "KV: ZREM '$key' <- '$member'"
-
-  return 0
-}
-
-################################################################################
-# HASH OPERATIONS (Field-Value pairs)
-################################################################################
-
-###
-# Set hash field
-#
-# Usage:
-#   z::kv::hset "user:1000" "name" "John"
-#   z::kv::hset "user:1000" "email" "john@example.com"
-#
-# @param 1: string - Hash key
-# @param 2: string - Field name
-# @param 3: string - Value
-# @return 0 on success
-###
-z::kv::hset() {
-  emulate -L zsh
-  local key="$1"
-  local field="$2"
-  local value="$3"
-
-  __z::kv::validate_key "$key" || return 1
-
-  local hash_key="${key}.${field}"
-  _zcore_kv_hashes[$hash_key]="$value"
-
-  z::log::debug "KV: HSET '$key' '$field' = '$value'"
-  __z::kv::trigger_watchers "$key" "$field:$value" "hset"
-
-  return 0
-}
-
-###
-# Get hash field value
-#
-# Usage:
-#   name=$(z::kv::hget "user:1000" "name")
-#
-# @param 1: string - Hash key
-# @param 2: string - Field name
-# @stdout Field value
-# @return 0 if found, 1 if not found
-###
-z::kv::hget() {
-  emulate -L zsh
-  local key="$1"
-  local field="$2"
-
-  local hash_key="${key}.${field}"
-
-  if (( ! ${+_zcore_kv_hashes[$hash_key]} )); then
-    return 1
-  fi
-
-  print -r -- "${_zcore_kv_hashes[$hash_key]}"
-  return 0
-}
-
-###
-# Get all hash fields and values
-#
-# Usage:
-#   z::kv::hgetall "user:1000"
-#
-# @param 1: string - Hash key
-# @stdout "field value" pairs (one per line)
-# @return 0 always
-###
-z::kv::hgetall() {
-  emulate -L zsh
-  local key="$1"
-
-  local hash_key field value
-  for hash_key in "${(@k)_zcore_kv_hashes}"; do
-    if [[ $hash_key == ${key}.* ]]; then
-      field="${hash_key#${key}.}"
-      value="${_zcore_kv_hashes[$hash_key]}"
-      print "${field} ${value}"
-    fi
-  done
-
-  return 0
-}
-
-###
-# Delete hash field
-#
-# Usage:
-#   z::kv::hdel "user:1000" "email"
-#
-# @param 1: string - Hash key
-# @param 2: string - Field name
-# @return 0 if deleted, 1 if not found
-###
-z::kv::hdel() {
-  emulate -L zsh
-  local key="$1"
-  local field="$2"
-
-  local hash_key="${key}.${field}"
-
-  if (( ! ${+_zcore_kv_hashes[$hash_key]} )); then
-    return 1
-  fi
-
-  unset "_zcore_kv_hashes[$hash_key]"
-  z::log::debug "KV: HDEL '$key' '$field'"
-
-  return 0
-}
-
-###
-# Check if hash field exists
-#
-# Usage:
-#   if z::kv::hexists "user:1000" "email"; then
-#     echo "Field exists"
-#   fi
-#
-# @param 1: string - Hash key
-# @param 2: string - Field name
-# @return 0 if exists, 1 if not
-###
-z::kv::hexists() {
-  emulate -L zsh
-  local key="$1"
-  local field="$2"
-
-  local hash_key="${key}.${field}"
-  (( ${+_zcore_kv_hashes[$hash_key]} ))
-}
-
-###
-# Get all hash field names
-#
-# Usage:
-#   z::kv::hkeys "user:1000"
-#
-# @param 1: string - Hash key
-# @stdout Field names (one per line)
-# @return 0 always
-###
-z::kv::hkeys() {
-  emulate -L zsh
-  local key="$1"
-
-  local hash_key field
-  for hash_key in "${(@k)_zcore_kv_hashes}"; do
-    if [[ $hash_key == ${key}.* ]]; then
-      field="${hash_key#${key}.}"
-      print -r -- "$field"
-    fi
-  done
-
-  return 0
-}
-
-###
-# Get all hash values
-#
-# Usage:
-#   z::kv::hvals "user:1000"
-#
-# @param 1: string - Hash key
-# @stdout Values (one per line)
-# @return 0 always
-###
-z::kv::hvals() {
-  emulate -L zsh
-  local key="$1"
-
-  local hash_key
-  for hash_key in "${(@k)_zcore_kv_hashes}"; do
-    if [[ $hash_key == ${key}.* ]]; then
-      print -r -- "${_zcore_kv_hashes[$hash_key]}"
-    fi
-  done
-
-  return 0
-}
-
-################################################################################
-# ATOMIC OPERATIONS
-################################################################################
-
-###
-# Set value and return old value (atomic)
-#
-# Usage:
-#   old_value=$(z::kv::getset "counter" "10")
-#
-# @param 1: string - Key
-# @param 2: string - New value
-# @stdout Old value (empty if key didn't exist)
-# @return 0 always
-###
+# =============================================================================
+# CONDITIONAL OPS
+# =============================================================================
+
+# z::kv::getset <handle> <key> <new-value>
+# Atomically replaces the value of <key> with <new-value>.
+# Returns the old value (or empty string) via REPLY.  Preserves TTL.
 z::kv::getset() {
   emulate -L zsh
-  local key="$1"
-  local new_value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local old_value=""
-  if z::probe::kv "$key"; then
-    old_value=$(z::kv::get "$key")
+  local handle="$1" key="$2" new="$3" old=""
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if z::kv::exists "$handle" "$key"; then
+    z::kv::get "$handle" "$key" || return $?
+    old="$REPLY"
   fi
 
-  z::kv::set "$key" "$new_value"
+  local -a REPLY_ARGS
+  _z::kv::_ttl_args_for "$handle" "$key"
 
-  print -r -- "$old_value"
+  z::kv::set "$handle" "$key" "$new" "${REPLY_ARGS[@]}" || return $?
+
+  REPLY="$old"
   return 0
 }
 
-###
-# Set value only if key doesn't exist (SET if Not eXists)
-#
-# Usage:
-#   if z::kv::setnx "lock" "owner_id"; then
-#     echo "Lock acquired"
-#   fi
-#
-# @param 1: string - Key
-# @param 2: string - Value
-# @return 0 if set, 1 if key already exists
-###
+# z::kv::setnx <handle> <key> <value>
+# Sets <key> only if it does not already exist (SET if Not eXists).
+# Returns ZBASE_ERROR_PERMISSION if the key is already present.
 z::kv::setnx() {
   emulate -L zsh
-  local key="$1"
-  local value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if z::probe::kv "$key"; then
-    z::log::debug "KV: SETNX '$key' - already exists"
-    return 1
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if z::kv::exists "$handle" "$key"; then
+    z::log::debug "zkv: setnx key exists" handle "$handle" key "$key"
+    return $ZBASE_ERROR_PERMISSION
   fi
 
-  z::kv::set "$key" "$value"
-  return 0
+  z::kv::set "$handle" "$key" "$value"
 }
 
-###
-# Set value only if key exists
-#
-# Usage:
-#   if z::kv::setxx "existing_key" "new_value"; then
-#     echo "Value updated"
-#   fi
-#
-# @param 1: string - Key
-# @param 2: string - Value
-# @return 0 if set, 1 if key doesn't exist
-###
+# z::kv::setxx <handle> <key> <value>
+# Sets <key> only if it already exists (SET if eXists).
+# Returns ZBASE_ERROR_NOT_FOUND if the key is absent.
 z::kv::setxx() {
   emulate -L zsh
-  local key="$1"
-  local value="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if ! z::probe::kv "$key"; then
-    z::log::debug "KV: SETXX '$key' - key doesn't exist"
-    return 1
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if ! z::kv::exists "$handle" "$key"; then
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
-  z::kv::set "$key" "$value"
-  return 0
+  z::kv::set "$handle" "$key" "$value"
 }
 
-################################################################################
-# DISTRIBUTED LOCKING
-################################################################################
-
-###
-# Acquire distributed lock
-#
-# Usage:
-#   if z::kv::lock "resource_name" 30; then
-#     # Critical section
-#     z::kv::unlock "resource_name"
-#   fi
-#
-# @param 1: string - Lock name
-# @param 2: integer - TTL in seconds (optional, default: 10)
-# @param 3: string - Owner ID (optional, default: $$)
-# @return 0 if acquired, 1 if already locked
-###
-z::kv::lock() {
-  emulate -L zsh
-  local lock_name="$1"
-  typeset -i ttl
-  (( ttl = ${2:-10} ))
-  local owner="${3:-$$}"
-
-  __z::kv::validate_key "$lock_name" || return 1
-
-  # Check if lock exists and is still valid
-  if (( ${+_zcore_kv_locks[$lock_name]} )); then
-    local lock_data="${_zcore_kv_locks[$lock_name]}"
-    local lock_owner="${lock_data%%|*}"
-    typeset -i lock_expire
-    (( lock_expire = ${lock_data#*|} ))
-
-    typeset -i current_time
-    (( current_time = ${EPOCHSECONDS:-$(date +%s)} ))
-
-    if (( current_time < lock_expire )); then
-      z::log::debug "KV: Lock '$lock_name' already held by $lock_owner"
-      return 1
-    fi
-  fi
-
-  # Acquire lock
-  typeset -i expire_time
-  (( expire_time = ${EPOCHSECONDS:-$(date +%s)} + ttl ))
-
-  _zcore_kv_locks[$lock_name]="${owner}|${expire_time}"
-
-  z::log::debug "KV: Lock acquired: '$lock_name' by $owner (TTL: ${ttl}s)"
-  z::event::emit "kv:lock:acquired" "$lock_name" "$owner" 2>/dev/null || true
-
-  return 0
-}
-
-###
-# Release distributed lock
-#
-# Usage:
-#   z::kv::unlock "resource_name"
-#
-# @param 1: string - Lock name
-# @param 2: string - Owner ID (optional, default: $$, must match acquirer)
-# @return 0 if released, 1 if not held or wrong owner
-###
-z::kv::unlock() {
-  emulate -L zsh
-  local lock_name="$1"
-  local owner="${2:-$$}"
-
-  if (( ! ${+_zcore_kv_locks[$lock_name]} )); then
-    z::log::debug "KV: Lock '$lock_name' not held"
-    return 1
-  fi
-
-  local lock_data="${_zcore_kv_locks[$lock_name]}"
-  local lock_owner="${lock_data%%|*}"
-
-  if [[ $lock_owner != $owner ]]; then
-    z::log::error "KV: Cannot unlock '$lock_name' - owned by $lock_owner, not $owner"
-    return 1
-  fi
-
-  unset "_zcore_kv_locks[$lock_name]"
-
-  z::log::debug "KV: Lock released: '$lock_name' by $owner"
-  z::event::emit "kv:lock:released" "$lock_name" "$owner" 2>/dev/null || true
-
-  return 0
-}
-
-###
-# Try to acquire lock with retry
-#
-# Usage:
-#   z::kv::lock_wait "resource" 30 5 0.5  # 30s TTL, 5 retries, 0.5s interval
-#
-# @param 1: string - Lock name
-# @param 2: integer - TTL in seconds
-# @param 3: integer - Max retries (default: 3)
-# @param 4: float - Retry interval in seconds (default: 1)
-# @return 0 if acquired, 1 if failed after retries
-###
-z::kv::lock_wait() {
-  emulate -L zsh
-  local lock_name="$1"
-  typeset -i ttl retries
-  (( ttl = ${2:-10} ))
-  (( retries = ${3:-3} ))
-  typeset -F interval
-  (( interval = ${4:-1} ))
-
-  typeset -i attempt
-  for (( attempt = 0; attempt <= retries; attempt++ )); do
-    if z::kv::lock "$lock_name" "$ttl"; then
-      return 0
-    fi
-
-    if (( attempt < retries )); then
-      z::log::debug "KV: Lock attempt $((attempt + 1)) failed, retrying in ${interval}s..."
-      sleep "$interval"
-    fi
-  done
-
-  z::log::error "KV: Failed to acquire lock '$lock_name' after $retries retries"
-  return 1
-}
-
-################################################################################
-# PUB/SUB CHANNELS
-################################################################################
-
-###
-# Subscribe to channel
-#
-# Usage:
-#   z::kv::subscribe "notifications" my_handler
-#   my_handler() {
-#     local channel="$1" message="$2"
-#     echo "Received on $channel: $message"
-#   }
-#
-# @param 1: string - Channel name
-# @param 2: string - Handler function
-# @return 0 on success
-###
-z::kv::subscribe() {
-  emulate -L zsh
-  local channel="$1"
-  local handler="$2"
-
-  if [[ -z $channel || -z $handler ]]; then
-    z::log::error "KV: subscribe requires channel and handler"
-    return 1
-  fi
-
-  if ! z::probe::func "$handler"; then
-    z::log::error "KV: Handler function not found: $handler"
-    return 1
-  fi
-
-  local existing="${_zcore_kv_pubsub[$channel]:-}"
-
-  if [[ -n $existing ]]; then
-    _zcore_kv_pubsub[$channel]="${existing}|${handler}"
-  else
-    _zcore_kv_pubsub[$channel]="$handler"
-  fi
-
-  z::log::debug "KV: Subscribed '$handler' to channel '$channel'"
-  return 0
-}
-
-###
-# Unsubscribe from channel
-#
-# Usage:
-#   z::kv::unsubscribe "notifications" my_handler
-#   z::kv::unsubscribe "notifications"  # Remove all
-#
-# @param 1: string - Channel name
-# @param 2: string - Handler function (optional)
-# @return 0 on success
-###
-z::kv::unsubscribe() {
-  emulate -L zsh
-  local channel="$1"
-  local handler="${2:-}"
-
-  if [[ -z $handler ]]; then
-    unset "_zcore_kv_pubsub[$channel]"
-    z::log::debug "KV: Unsubscribed all from channel '$channel'"
-  else
-    local existing="${_zcore_kv_pubsub[$channel]:-}"
-    if [[ -n $existing ]]; then
-      local -a handlers
-      handlers=("${(@s:|:)existing}")
-      handlers=("${(@)handlers:#$handler}")
-
-      if (( ${#handlers} > 0 )); then
-        _zcore_kv_pubsub[$channel]="${(j:|:)handlers}"
-      else
-        unset "_zcore_kv_pubsub[$channel]"
-      fi
-
-      z::log::debug "KV: Unsubscribed '$handler' from channel '$channel'"
-    fi
-  fi
-
-  return 0
-}
-
-###
-# Publish message to channel
-#
-# Usage:
-#   z::kv::publish "notifications" "New message arrived"
-#
-# @param 1: string - Channel name
-# @param 2: string - Message
-# @return 0 always
-###
-z::kv::publish() {
-  emulate -L zsh
-  local channel="$1"
-  local message="$2"
-
-  z::log::debug "KV: Publishing to channel '$channel': $message"
-
-  local handler_list="${_zcore_kv_pubsub[$channel]:-}"
-
-  if [[ -z $handler_list ]]; then
-    z::log::debug "KV: No subscribers for channel '$channel'"
-    return 0
-  fi
-
-  local -a handlers
-  handlers=("${(@s:|:)handler_list}")
-
-  local handler
-  for handler in "${handlers[@]}"; do
-    if z::probe::func "$handler"; then
-      "$handler" "$channel" "$message" 2>/dev/null || true
-    fi
-  done
-
-  return 0
-}
-
-################################################################################
-# SNAPSHOTS
-################################################################################
-
-###
-# Create snapshot of current KV state
-#
-# Usage:
-#   snapshot_id=$(z::kv::snapshot_create "before_upgrade")
-#
-# @param 1: string - Snapshot name/label
-# @stdout Snapshot ID
-# @return 0 on success
-###
-z::kv::snapshot_create() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local label="${1:-snapshot}"
-
-  # Generate ID without using command substitution that might reset counter
-  typeset -gi _zcore_kv_snapshot_id
-  (( _zcore_kv_snapshot_id += 1 ))
-  local snapshot_id="snap_${_zcore_kv_snapshot_id}"
-
-  # Serialize all data structures using (F) for newline joining
-  local -a store_data meta_data lists_data sets_data zsets_data hashes_data
-
-  local k v
-  for k v in "${(@kv)_zcore_kv_store}"; do
-    store_data+=("$k")
-    store_data+=("$v")
-  done
-
-  for k v in "${(@kv)_zcore_kv_meta}"; do
-    meta_data+=("$k")
-    meta_data+=("$v")
-  done
-
-  for k v in "${(@kv)_zcore_kv_lists}"; do
-    lists_data+=("$k")
-    lists_data+=("$v")
-  done
-
-  for k v in "${(@kv)_zcore_kv_sets}"; do
-    sets_data+=("$k")
-    sets_data+=("$v")
-  done
-
-  for k v in "${(@kv)_zcore_kv_zsets}"; do
-    zsets_data+=("$k")
-    zsets_data+=("$v")
-  done
-
-  for k v in "${(@kv)_zcore_kv_hashes}"; do
-    hashes_data+=("$k")
-    hashes_data+=("$v")
-  done
-
-  _zcore_kv_snapshots[${snapshot_id}.label]="$label"
-  _zcore_kv_snapshots[${snapshot_id}.timestamp]="${EPOCHSECONDS:-$(date +%s)}"
-  _zcore_kv_snapshots[${snapshot_id}.store]="${(F)store_data}"
-  _zcore_kv_snapshots[${snapshot_id}.meta]="${(F)meta_data}"
-  _zcore_kv_snapshots[${snapshot_id}.lists]="${(F)lists_data}"
-  _zcore_kv_snapshots[${snapshot_id}.sets]="${(F)sets_data}"
-  _zcore_kv_snapshots[${snapshot_id}.zsets]="${(F)zsets_data}"
-  _zcore_kv_snapshots[${snapshot_id}.hashes]="${(F)hashes_data}"
-
-  z::log::info "KV: Snapshot created: $snapshot_id ($label)"
-  print -r -- "$snapshot_id"
-
-  return 0
-}
-###
-# Restore from snapshot
-#
-# Usage:
-#   z::kv::snapshot_restore "snap_1"
-#
-# @param 1: string - Snapshot ID
-# @return 0 on success, 1 if not found
-###
-z::kv::snapshot_restore() {
-  emulate -L zsh
-  local snapshot_id="$1"
-
-  if [[ -z ${_zcore_kv_snapshots[${snapshot_id}.label]:-} ]]; then
-    z::log::error "KV: Snapshot not found: $snapshot_id"
-    return 1
-  fi
-
-  local label="${_zcore_kv_snapshots[${snapshot_id}.label]}"
-  z::log::info "KV: Restoring snapshot: $snapshot_id ($label)"
-
-  # Clear current state
-  _zcore_kv_store=()
-  _zcore_kv_meta=()
-  _zcore_kv_lists=()
-  _zcore_kv_sets=()
-  _zcore_kv_zsets=()
-  _zcore_kv_hashes=()
-
-  # Restore each data structure
-  local -a lines
-  local key value
-  typeset -i i
-
-  # Restore store
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.store]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_store[$key]="$value"
-  done
-
-  # Restore meta
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.meta]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_meta[$key]="$value"
-  done
-
-  # Restore lists
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.lists]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_lists[$key]="$value"
-  done
-
-  # Restore sets
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.sets]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_sets[$key]="$value"
-  done
-
-  # Restore zsets
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.zsets]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_zsets[$key]="$value"
-  done
-
-  # Restore hashes
-  lines=("${(@f)_zcore_kv_snapshots[${snapshot_id}.hashes]}")
-  for (( i = 1; i <= ${#lines}; i += 2 )); do
-    key="${lines[i]}"
-    value="${lines[i+1]}"
-    [[ -n $key ]] && _zcore_kv_hashes[$key]="$value"
-  done
-
-  z::log::info "KV: Snapshot restored: $snapshot_id"
-  z::event::emit "kv:snapshot:restored" "$snapshot_id" 2>/dev/null || true
-
-  return 0
-}
-
-###
-# List all snapshots
-#
-# Usage:
-#   z::kv::snapshot_list
-#
-# @return 0 always
-###
-z::kv::snapshot_list() {
-  emulate -L zsh
-
-  print "\nKV Snapshots:"
-  print "============="
-
-  local -a snapshot_ids
-  local key
-  for key in "${(@k)_zcore_kv_snapshots}"; do
-    if [[ $key == snap_*.label ]]; then
-      snapshot_ids+=("${key%.label}")
-    fi
-  done
-
-  if (( ${#snapshot_ids} == 0 )); then
-    print "No snapshots available.\n"
-    return 0
-  fi
-
-  # Sort by ID
-  snapshot_ids=("${(@n)snapshot_ids}")
-
-  local snap_id label timestamp time_str
-  for snap_id in "${snapshot_ids[@]}"; do
-    label="${_zcore_kv_snapshots[${snap_id}.label]}"
-    timestamp="${_zcore_kv_snapshots[${snap_id}.timestamp]}"
-
-    time_str=$(date -r "$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp")
-
-    print "  $snap_id: $label [$time_str]"
-  done
-
-  print ""
-  return 0
-}
-
-###
-# Delete snapshot
-#
-# Usage:
-#   z::kv::snapshot_delete "snap_1"
-#
-# @param 1: string - Snapshot ID
-# @return 0 on success
-###
-z::kv::snapshot_delete() {
-  emulate -L zsh
-  local snapshot_id="$1"
-
-  local key
-  for key in "${(@k)_zcore_kv_snapshots}"; do
-    if [[ $key == ${snapshot_id}.* ]]; then
-      unset "_zcore_kv_snapshots[$key]"
-    fi
-  done
-
-  z::log::info "KV: Snapshot deleted: $snapshot_id"
-  return 0
-}
-
-################################################################################
-# CONDITIONAL OPERATIONS
-################################################################################
-
-###
-# Set value if current value matches expected
-#
-# Usage:
-#   if z::kv::cas "counter" "10" "11"; then
-#     echo "Updated from 10 to 11"
-#   fi
-#
-# @param 1: string - Key
-# @param 2: string - Expected current value
-# @param 3: string - New value
-# @return 0 if updated, 1 if value doesn't match
-###
+# z::kv::cas <handle> <key> <expected> <new-value>
+# Compare-And-Swap: sets <key> to <new-value> only when the current value
+# equals <expected>.  Returns ZBASE_ERROR_PERMISSION on mismatch.
 z::kv::cas() {
   emulate -L zsh
-  local key="$1"
-  local expected="$2"
-  local new_value="$3"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local current=""
-  if z::probe::kv "$key"; then
-    current=$(z::kv::get "$key")
+  local handle="$1" key="$2" expected="$3" new="$4" current=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if z::kv::exists "$handle" "$key"; then
+    z::kv::get "$handle" "$key" || return $?
+    current="$REPLY"
   fi
 
   if [[ $current != $expected ]]; then
-    z::log::debug "KV: CAS failed for '$key' - expected '$expected', got '$current'"
-    return 1
+    z::log::debug "zkv: CAS failed" handle "$handle" key "$key"
+    return $ZBASE_ERROR_PERMISSION
   fi
 
-  z::kv::set "$key" "$new_value"
-  z::log::debug "KV: CAS succeeded for '$key': '$expected' -> '$new_value'"
+  z::kv::set "$handle" "$key" "$new"
+}
+
+
+# =============================================================================
+# TRANSACTIONS
+# =============================================================================
+
+# z::kv::begin <handle>
+# Opens a transaction.  All subsequent writes are buffered until commit or
+# rollback.  Nested transactions are not supported.
+z::kv::begin() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  if _zkv_tx_active "$handle"; then
+    z::log::error "zkv: already in transaction" handle "$handle"
+    return $ZBASE_ERROR_PERMISSION
+  fi
+
+  # Clear all write buffers before starting a fresh transaction.
+  local _suf
+
+  for _suf in store meta ttl lists sets zsets hashes del; do
+    _zkv_aclear "_zkv_txbuf_${_suf}_${handle}"
+  done
+
+  _zkv_aset "_zkv_tx_${handle}" active 1
+
+  z::log::debug "zkv: transaction started" handle "$handle"
+  return 0
+}
+
+# z::kv::commit <handle>
+# Applies all buffered writes to the live store, fires watchers for every
+# changed key, and triggers auto-persist.
+z::kv::commit() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  if ! _zkv_tx_active "$handle"; then
+    z::log::warn "zkv: commit called outside transaction" handle "$handle"
+    return 0
+  fi
+
+  # Convenience locals for tx-buffer and live map names.
+  local _txs="_zkv_txbuf_store_${handle}"
+  local _txm="_zkv_txbuf_meta_${handle}"
+  local _txt="_zkv_txbuf_ttl_${handle}"
+  local _txl="_zkv_txbuf_lists_${handle}"
+  local _txset="_zkv_txbuf_sets_${handle}"
+  local _txz="_zkv_txbuf_zsets_${handle}"
+  local _txh="_zkv_txbuf_hashes_${handle}"
+  local _txdel="_zkv_txbuf_del_${handle}"
+
+  local _meta="_zkv_meta_${handle}"
+  local _store="_zkv_store_${handle}"
+  local _ttl="_zkv_ttl_${handle}"
+  local _lists="_zkv_lists_${handle}"
+  local _sets="_zkv_sets_${handle}"
+  local _zsets="_zkv_zsets_${handle}"
+  local _hashes="_zkv_hashes_${handle}"
+
+  # Accumulate watcher payloads; fired after the active flag is cleared so
+  # that watcher callbacks see a fully committed, non-transactional store.
+  local _k _v
+  local -a _wkeys _wvals _wops
+
+  # 1. Apply staged deletions.
+  for _k in "${(@Pk)_txdel}"; do
+    if _zkv_ahas "$_meta" "$_k"; then
+      _z::kv::reap_key "$handle" "$_k"
+      (( _zkv_stats_${handle}[deletes] += 1 ))
+      _wkeys+=( "$_k" )
+      _wvals+=( "" )
+      _wops+=( "del" )
+    fi
+  done
+
+  # 2. Apply metadata updates.
+  local -a _pairs
+  typeset -i _i
+
+  _pairs=( "${(@Pkv)_txm}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    _zkv_aset "$_meta" "${_pairs[_i]}" "${_pairs[_i+1]}"
+  done
+
+  # 3. Apply string store writes.
+  _pairs=( "${(@Pkv)_txs}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    _k="${_pairs[_i]}"
+    _v="${_pairs[_i+1]}"
+
+    _zkv_aset "$_store" "$_k" "$_v"
+
+    (( _zkv_stats_${handle}[writes] += 1 ))
+
+    _wkeys+=( "$_k" )
+    _wvals+=( "$_v" )
+    _wops+=( "set" )
+  done
+
+  # 4. Apply TTL updates; remove TTL for keys written without one.
+  _pairs=( "${(@Pkv)_txt}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    _zkv_aset "$_ttl" "${_pairs[_i]}" "${_pairs[_i+1]}"
+  done
+
+  for _k in "${(@Pk)_txs}"; do
+    _zkv_ahas "$_txt" "$_k" || _zkv_adel "$_ttl" "$_k"
+  done
+
+  # 5. Apply collection (list/set/zset/hash) updates.
+  _z::kv::_commit_collection "$_txl"   "$_lists"
+  _z::kv::_commit_collection "$_txset" "$_sets"
+  _z::kv::_commit_collection "$_txz"   "$_zsets"
+  _z::kv::_commit_collection "$_txh"   "$_hashes"
+
+  # 6. Collect one watcher event per modified collection key.
+  local -A _seen_collection_watch
+  local _parent_enc _parent_key
+
+  for _k in "${(@Pk)_txl}"; do
+    if (( ! ${+_seen_collection_watch[$_k]} )); then
+      _seen_collection_watch[$_k]=1
+      _wkeys+=( "$_k" )
+      _wvals+=( "" )
+      _wops+=( "lupdate" )
+    fi
+  done
+
+  for _k in "${(@Pk)_txset}"; do
+    if (( ! ${+_seen_collection_watch[$_k]} )); then
+      _seen_collection_watch[$_k]=1
+      _wkeys+=( "$_k" )
+      _wvals+=( "" )
+      _wops+=( "supdate" )
+    fi
+  done
+
+  for _k in "${(@Pk)_txz}"; do
+    if (( ! ${+_seen_collection_watch[$_k]} )); then
+      _seen_collection_watch[$_k]=1
+      _wkeys+=( "$_k" )
+      _wvals+=( "" )
+      _wops+=( "zupdate" )
+    fi
+  done
+
+  for _k in "${(@Pk)_txh}"; do
+    # Hash buffer keys are composite (encoded_key + RECSEP + encoded_field);
+    # extract the parent key for the watcher event.
+    _parent_enc="${_k%%${_ZKV_RECSEP}*}"
+    _z::kv::decode_value "$_parent_enc"
+    _parent_key="$REPLY"
+
+    if (( ! ${+_seen_collection_watch[$_parent_key]} )); then
+      _seen_collection_watch[$_parent_key]=1
+      _wkeys+=( "$_parent_key" )
+      _wvals+=( "" )
+      _wops+=( "hupdate" )
+    fi
+  done
+
+  # 7. Clear all tx buffers and mark the transaction as inactive.
+  local _suf
+
+  for _suf in store meta ttl lists sets zsets hashes del; do
+    _zkv_aclear "_zkv_txbuf_${_suf}_${handle}"
+  done
+
+  _zkv_aset "_zkv_tx_${handle}" active 0
+
+  # 8. Fire accumulated watcher events now that the store is consistent.
+  for (( _i = 1; _i <= ${#_wkeys}; _i++ )); do
+    _z::kv::trigger_watchers "$handle" "${_wkeys[_i]}" "${_wvals[_i]}" "${_wops[_i]}"
+  done
+
+  _z::kv::auto_persist "$handle"
+
+  z::log::debug "zkv: transaction committed" handle "$handle" writes "${#_wkeys}"
+  return 0
+}
+
+# z::kv::rollback <handle>
+# Discards all buffered writes and closes the transaction without applying
+# any changes to the live store.
+z::kv::rollback() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  if ! _zkv_tx_active "$handle"; then
+    z::log::warn "zkv: rollback called outside transaction" handle "$handle"
+    return 0
+  fi
+
+  local _suf
+
+  for _suf in store meta ttl lists sets zsets hashes del; do
+    _zkv_aclear "_zkv_txbuf_${_suf}_${handle}"
+  done
+
+  _zkv_aset "_zkv_tx_${handle}" active 0
+
+  z::log::debug "zkv: transaction rolled back" handle "$handle"
+  return 0
+}
+
+# z::kv::tx <handle> <callback> [<args> ...]
+# Convenience wrapper: begins a transaction, calls <callback> with the handle
+# and any extra args, then commits on success or rolls back on non-zero return.
+z::kv::tx() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" cb="$2"
+  shift 2
+
+  _z::kv::require_handle "$handle" || return $?
+  z::validate::nonempty "$cb" "callback" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if ! z::probe::func "$cb"; then
+    z::log::error "zkv: tx callback not defined" callback "$cb"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  z::kv::begin "$handle" || return $?
+
+  typeset -i rc=0
+
+  "$cb" "$handle" "$@" || rc=$?
+
+  if (( rc != 0 )); then
+    z::kv::rollback "$handle"
+    z::log::warn "zkv: tx rolled back" handle "$handle" callback "$cb" rc "$rc"
+    return $rc
+  fi
+
+  z::kv::commit "$handle"
+  return $?
+}
+
+
+# =============================================================================
+# PERSISTENCE
+# =============================================================================
+
+# z::kv::save <handle> <file>
+# Serialises the entire store to <file> using an atomic write (temp file +
+# rename).  Expired keys are skipped.  Format version is written in the header.
+z::kv::save() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" file="$2"
+
+  _z::kv::require_handle   "$handle"                       || return $?
+  z::validate::nonempty    "$file" "file"                  || return $ZBASE_ERROR_INVALID_INPUT
+  z::probe::path::writable "${file:h}" "persist directory" || return $ZBASE_ERROR_PERMISSION
+
+  # Temp file includes PID and epoch to avoid collisions across concurrent saves.
+  _z::kv::epoch || return $?
+  local tmp="${file}.zkv.tmp.${$}.${REPLY}"
+
+  z::log::get_timestamp "human"
+  local ts="$REPLY"
+
+  local _store_n="_zkv_store_${handle}"
+  local _meta_n="_zkv_meta_${handle}"
+  local _lists_n="_zkv_lists_${handle}"
+  local _sets_n="_zkv_sets_${handle}"
+  local _zsets_n="_zkv_zsets_${handle}"
+  local _hashes_n="_zkv_hashes_${handle}"
+
+  {
+    print "# zkv store dump"
+    print "# handle:  ${handle}"
+    print "# created: ${ts}"
+    print "# version: ${ZKV_PERSIST_FORMAT_VERSION}"
+    print ""
+
+    local key value vtype encoded ekey
+    typeset -i ttl_remaining
+    local -a _pairs
+    typeset -i _i
+
+    # M records: metadata (type + TTL) for every live key.
+    for key in "${(@Pk)_meta_n}"; do
+      _z::kv::check_ttl "$handle" "$key" || continue
+
+      _zkv_aget "$_meta_n" "$key"
+      vtype="${REPLY:-string}"
+
+      z::kv::ttl "$handle" "$key"
+      (( ttl_remaining = REPLY < 0 ? 0 : REPLY ))
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      print "M|${ekey}|${vtype}|${ttl_remaining}"
+    done
+
+    # S records: scalar string values.
+    for key in "${(@Pk)_store_n}"; do
+      _z::kv::check_ttl "$handle" "$key" || continue
+
+      _zkv_aget "$_store_n" "$key"
+      value="$REPLY"
+
+      _zkv_aget "$_meta_n" "$key"
+      vtype="${REPLY:-string}"
+
+      z::kv::ttl "$handle" "$key"
+      (( ttl_remaining = REPLY < 0 ? 0 : REPLY ))
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      _z::kv::encode_value "$value"
+      encoded="$REPLY"
+
+      print "S|${ekey}|${vtype}|${ttl_remaining}|${encoded}"
+    done
+
+    # L records: list values (stored as encoded delimited strings).
+    _pairs=( "${(@Pkv)_lists_n}" )
+    for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+      key="${_pairs[_i]}"
+      value="${_pairs[_i+1]}"
+
+      [[ -z $value ]] && continue
+
+      _z::kv::check_ttl "$handle" "$key" || continue
+      z::kv::ttl "$handle" "$key"
+      (( ttl_remaining = REPLY < 0 ? 0 : REPLY ))
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      _z::kv::encode_value "$value"
+      encoded="$REPLY"
+
+      print "L|${ekey}|${ttl_remaining}|${encoded}"
+    done
+
+    # T records: set values.
+    _pairs=( "${(@Pkv)_sets_n}" )
+    for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+      key="${_pairs[_i]}"
+      value="${_pairs[_i+1]}"
+
+      [[ -z $value ]] && continue
+
+      _z::kv::check_ttl "$handle" "$key" || continue
+      z::kv::ttl "$handle" "$key"
+      (( ttl_remaining = REPLY < 0 ? 0 : REPLY ))
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      _z::kv::encode_value "$value"
+      encoded="$REPLY"
+
+      print "T|${ekey}|${ttl_remaining}|${encoded}"
+    done
+
+    # Z records: sorted set values.
+    _pairs=( "${(@Pkv)_zsets_n}" )
+    for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+      key="${_pairs[_i]}"
+      value="${_pairs[_i+1]}"
+
+      [[ -z $value ]] && continue
+
+      _z::kv::check_ttl "$handle" "$key" || continue
+      z::kv::ttl "$handle" "$key"
+      (( ttl_remaining = REPLY < 0 ? 0 : REPLY ))
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      _z::kv::encode_value "$value"
+      encoded="$REPLY"
+
+      print "Z|${ekey}|${ttl_remaining}|${encoded}"
+    done
+
+    # H records: hash fields (composite key already encoded; value is raw).
+    _pairs=( "${(@Pkv)_hashes_n}" )
+    for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+      key="${_pairs[_i]}"
+      value="${_pairs[_i+1]}"
+
+      _z::kv::encode_value "$key"
+      ekey="$REPLY"
+
+      _z::kv::encode_value "$value"
+      encoded="$REPLY"
+
+      print "H|${ekey}|${encoded}"
+    done
+  } > "$tmp" || {
+    z::log::error "zkv: failed to write temp file" handle "$handle" file "$tmp"
+    command rm -f "$tmp" 2>/dev/null
+    return $ZBASE_ERROR_GENERAL
+  }
+
+  # Atomic rename — avoids partial reads by other processes.
+  command mv -f "$tmp" "$file" || {
+    z::log::error "zkv: atomic rename failed" handle "$handle" src "$tmp" dst "$file"
+    command rm -f "$tmp" 2>/dev/null
+    return $ZBASE_ERROR_GENERAL
+  }
+
+  _z::kv::epoch || return $?
+  _zkv_aset "_zkv_state_${handle}" last_persist "$REPLY"
+  _zkv_aset "_zkv_state_${handle}" dirty 0
+
+  _zkv_alen "$_store_n"
+  z::log::info "zkv: store saved" handle "$handle" file "$file" string_keys "$REPLY"
 
   return 0
 }
 
-################################################################################
-# BATCH OPERATIONS
-################################################################################
+# z::kv::flush <handle>
+# Saves the store to its configured persist_file only if the dirty flag is set.
+# No-ops when auto-persist is unconfigured or the store is clean.
+z::kv::flush() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-###
-# Execute multiple operations atomically
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _cfg_n="_zkv_cfg_${handle}"
+  _zkv_aget "$_cfg_n" persist_file
+
+  local file="$REPLY"
+
+  [[ -z $file ]] && return 0
+
+  if ! _zkv_state_dirty "$handle"; then
+    z::log::debug "zkv: flush no-op (clean)" handle "$handle"
+    return 0
+  fi
+
+  z::kv::save "$handle" "$file"
+}
+
+# z::kv::load <handle> <file> [--clear]
+# Loads a dump file into an open store.  Reads the header to verify the format
+# version, then replays M/S/L/T/Z/H records.  Pass --clear to wipe the store
+# before loading.  auto_persist is suppressed during the load to avoid
+# triggering a save for every key restored.
+z::kv::load() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" file="$2"
+  local clear=0
+
+  [[ ${3:-} == "--clear" ]] && clear=1
+
+  _z::kv::require_handle   "$handle"      || return $?
+  z::validate::nonempty    "$file" "file" || return $ZBASE_ERROR_INVALID_INPUT
+  z::probe::path::readable "$file" "file" || return $ZBASE_ERROR_NOT_FOUND
+
+  # Parse the comment header to extract the format version.
+  local header_line file_version=0
+
+  while IFS= read -r header_line; do
+    if [[ $header_line == "# version: "* ]]; then
+      file_version="${header_line#\# version: }"
+    fi
+
+    [[ $header_line =~ '^[[:space:]]*$' ]] && break
+    [[ $header_line == "#"* ]] || break
+  done < "$file"
+
+  if [[ ! $file_version =~ '^[0-9]+$' ]]; then
+    z::log::error "zkv: dump version unreadable" file "$file"
+    return $ZBASE_ERROR_GENERAL
+  fi
+
+  if (( file_version > ZKV_PERSIST_FORMAT_VERSION )); then
+    z::log::error "zkv: dump format too new" \
+      file "$file" file_version "$file_version" supported "$ZKV_PERSIST_FORMAT_VERSION"
+    return $ZBASE_ERROR_GENERAL
+  fi
+
+  (( clear )) && z::kv::clear "$handle"
+
+  # Suppress auto-persist during bulk load to avoid repeated disk writes.
+  local _cfg_n="_zkv_cfg_${handle}"
+  _zkv_aget "$_cfg_n" auto_persist
+  local saved_auto="$REPLY"
+
+  _zkv_aset "$_cfg_n" auto_persist 0
+
+  z::log::info "zkv: loading store" handle "$handle" file "$file" format_version "$file_version"
+
+  local _store_n="_zkv_store_${handle}"
+  local _lists_n="_zkv_lists_${handle}"
+  local _sets_n="_zkv_sets_${handle}"
+  local _zsets_n="_zkv_zsets_${handle}"
+  local _hashes_n="_zkv_hashes_${handle}"
+  local _meta_n="_zkv_meta_${handle}"
+  local _ttl_n="_zkv_ttl_${handle}"
+
+  typeset -i loaded=0 now_epoch
+  local line rtype rest ekey evalue key value vtype ttlval
+
+  # First pass: restore metadata (M records) so type info is available for
+  # the second pass even if S/L/T/Z records appear before their M record.
+  while IFS= read -r line; do
+    [[ $line =~ '^[[:space:]]*(#.*)?$' ]] && continue
+    [[ $line == M\|* ]] || continue
+
+    rest="${line#M|}"
+
+    ekey="${rest%%|*}"
+    rest="${rest#*|}"
+
+    vtype="${rest%%|*}"
+    ttlval="${rest#*|}"
+
+    _z::kv::decode_value "$ekey"
+    key="$REPLY"
+
+    _zkv_aset "$_meta_n" "$key" "$vtype"
+
+    if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+      _z::kv::epoch || return $?
+      now_epoch="$REPLY"
+      _zkv_aset "$_ttl_n" "$key" "$(( now_epoch + ttlval ))"
+    fi
+
+    (( loaded += 1 ))
+  done < "$file"
+
+  # Second pass: restore data records (S/L/T/Z/H).
+  while IFS= read -r line; do
+    [[ $line =~ '^[[:space:]]*(#.*)?$' ]] && continue
+
+    rtype="${line%%|*}"
+    rest="${line#*|}"
+
+    case "$rtype" in
+      M)
+        # Already handled in the first pass.
+        ;;
+
+      S)
+        ekey="${rest%%|*}"
+        rest="${rest#*|}"
+
+        vtype="${rest%%|*}"
+        rest="${rest#*|}"
+
+        ttlval="${rest%%|*}"
+        evalue="${rest#*|}"
+
+        _z::kv::decode_value "$ekey"
+        key="$REPLY"
+
+        _z::kv::decode_value "$evalue"
+        value="$REPLY"
+
+        if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+          z::kv::set "$handle" "$key" "$value" --type "$vtype" --ttl "$ttlval"
+        else
+          z::kv::set "$handle" "$key" "$value" --type "$vtype"
+        fi
+
+        (( loaded += 1 ))
+        ;;
+
+      L|T|Z)
+        ekey="${rest%%|*}"
+        rest="${rest#*|}"
+
+        ttlval="${rest%%|*}"
+        evalue="${rest#*|}"
+
+        _z::kv::decode_value "$ekey"
+        key="$REPLY"
+
+        _z::kv::decode_value "$evalue"
+        value="$REPLY"
+
+        case "$rtype" in
+          L)
+            _zkv_aset "$_lists_n" "$key" "$value"
+            _zkv_aset "$_meta_n" "$key" "list"
+            ;;
+
+          T)
+            _zkv_aset "$_sets_n" "$key" "$value"
+            _zkv_aset "$_meta_n" "$key" "set"
+            ;;
+
+          Z)
+            _zkv_aset "$_zsets_n" "$key" "$value"
+            _zkv_aset "$_meta_n" "$key" "zset"
+            ;;
+        esac
+
+        if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+          _z::kv::epoch || return $?
+          now_epoch="$REPLY"
+          _zkv_aset "$_ttl_n" "$key" "$(( now_epoch + ttlval ))"
+        fi
+
+        (( loaded += 1 ))
+        ;;
+
+      H)
+        ekey="${rest%%|*}"
+        evalue="${rest#*|}"
+
+        _z::kv::decode_value "$ekey"
+        key="$REPLY"
+
+        _z::kv::decode_value "$evalue"
+        value="$REPLY"
+
+        _zkv_aset "$_hashes_n" "$key" "$value"
+
+        # Ensure the parent key has a metadata entry even if its M record was absent.
+        local parent_enc="${key%%${_ZKV_RECSEP}*}"
+        _z::kv::decode_value "$parent_enc"
+        local parent_key="$REPLY"
+
+        _zkv_ahas "$_meta_n" "$parent_key" || _zkv_aset "$_meta_n" "$parent_key" "hash"
+
+        (( loaded += 1 ))
+        ;;
+
+      *)
+        z::log::warn "zkv: unknown record type in dump" \
+          handle "$handle" file "$file" type "$rtype"
+        ;;
+    esac
+  done < "$file"
+
+  _zkv_aset "$_cfg_n" auto_persist "$saved_auto"
+  _zkv_aset "_zkv_state_${handle}" dirty 0
+
+  z::log::info "zkv: store loaded" handle "$handle" file "$file" records "$loaded"
+  return 0
+}
+
+# z::kv::enable_persist <handle> <file>
+# Configures auto-persistence to <file> and sets auto_persist=1.
+z::kv::enable_persist() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" file="$2"
+
+  _z::kv::require_handle   "$handle"      || return $?
+  z::validate::nonempty    "$file" "file" || return $ZBASE_ERROR_INVALID_INPUT
+  z::probe::path::writable "$file" "file" || return $ZBASE_ERROR_PERMISSION
+
+  local _cfg_n="_zkv_cfg_${handle}"
+
+  _zkv_aset "$_cfg_n" auto_persist 1
+  _zkv_aset "$_cfg_n" persist_file "$file"
+
+  _zkv_aget "$_cfg_n" persist_debounce
+  z::log::info "zkv: auto-persistence enabled" handle "$handle" file "$file" debounce "${REPLY}s"
+
+  return 0
+}
+
+# z::kv::disable_persist <handle>
+# Disables auto-persistence (does not delete the persist file).
+z::kv::disable_persist() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  _zkv_aset "_zkv_cfg_${handle}" auto_persist 0
+
+  z::log::info "zkv: auto-persistence disabled" handle "$handle"
+  return 0
+}
+
+
+# =============================================================================
+# LOCKS
+# =============================================================================
+
+# z::kv::lock <handle> <lock-name> [<ttl>] [<owner>]
+# Acquires a named lock with an expiry of <ttl> seconds (default: 10).
+# Returns ZBASE_ERROR_PERMISSION if the lock is held and not yet expired.
+# Expired locks are silently taken over.
+z::kv::lock() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" lock_name="$2" ttl_raw="${3:-10}" owner="${4:-}"
+
+  _z::kv::require_handle "$handle"              || return $?
+  _z::kv::validate_key   "$lock_name" "$handle" || return $?
+  z::validate::integer   "$ttl_raw" "ttl"       || return $ZBASE_ERROR_INVALID_INPUT
+
+  typeset -i ttl
+  ttl="$ttl_raw"
+
+  local _locks_n="_zkv_locks_${handle}"
+
+  if _zkv_ahas "$_locks_n" "$lock_name"; then
+    _zkv_aget "$_locks_n" "$lock_name"
+    local data="$REPLY"
+    local prev_owner prev_expire_str
+
+    # Lock record format: owner + RECSEP + expiry-epoch.
+    if [[ $data == *${_ZKV_RECSEP}* ]]; then
+      prev_owner="${data%%${_ZKV_RECSEP}*}"
+      prev_expire_str="${data#*${_ZKV_RECSEP}}"
+    else
+      prev_owner=""
+      prev_expire_str=0
+    fi
+
+    typeset -i prev_expire=0
+    [[ $prev_expire_str == <-> ]] && prev_expire="$prev_expire_str"
+
+    _z::kv::epoch || return $?
+
+    if (( REPLY < prev_expire )); then
+      z::log::debug "zkv: lock held" handle "$handle" lock "$lock_name" owner "$prev_owner"
+      return $ZBASE_ERROR_PERMISSION
+    fi
+
+    z::log::debug "zkv: lock expired, taking over" handle "$handle" lock "$lock_name"
+  fi
+
+  _z::kv::epoch || return $?
+  typeset -i expire="$(( REPLY + ttl ))"
+
+  _zkv_aset "$_locks_n" "$lock_name" "${owner}${_ZKV_RECSEP}${expire}"
+
+  z::log::debug "zkv: lock acquired" handle "$handle" lock "$lock_name" owner "$owner" ttl "${ttl}s"
+  return 0
+}
+
+# z::kv::unlock <handle> <lock-name> [<owner>]
+# Releases a named lock.  Fails with ZBASE_ERROR_PERMISSION if the caller's
+# <owner> does not match the recorded owner.
+z::kv::unlock() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" lock_name="$2" owner="${3:-}"
+
+  _z::kv::require_handle "$handle"              || return $?
+  _z::kv::validate_key   "$lock_name" "$handle" || return $?
+
+  local _locks_n="_zkv_locks_${handle}"
+
+  if ! _zkv_ahas "$_locks_n" "$lock_name"; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  _zkv_aget "$_locks_n" "$lock_name"
+  local data="$REPLY"
+  local prev_owner="${data%%${_ZKV_RECSEP}*}"
+
+  if [[ $prev_owner != $owner ]]; then
+    z::log::error "zkv: unlock owner mismatch" handle "$handle" lock "$lock_name" \
+      expected "$prev_owner" got "$owner"
+    return $ZBASE_ERROR_PERMISSION
+  fi
+
+  _zkv_adel "$_locks_n" "$lock_name"
+
+  z::log::debug "zkv: lock released" handle "$handle" lock "$lock_name"
+  return 0
+}
+
+# z::kv::lock_wait <handle> <lock-name> [<ttl>] [<attempts>] [<interval>] [<owner>]
+# Retries z::kv::lock up to <attempts> times (default: 3) with <interval>
+# seconds between attempts (default: 1).  Uses zselect for sub-second sleep
+# when zsh/zselect is available; falls back to the external sleep command.
+z::kv::lock_wait() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" lock_name="$2" ttl_raw="${3:-10}" attempts_raw="${4:-3}" interval_raw="${5:-1}" owner="${6:-}"
+
+  _z::kv::require_handle "$handle"                  || return $?
+  _z::kv::validate_key   "$lock_name" "$handle"     || return $?
+  z::validate::integer   "$ttl_raw" "ttl"           || return $ZBASE_ERROR_INVALID_INPUT
+  z::validate::integer   "$attempts_raw" "attempts" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if [[ ! $interval_raw == (<->|<->.<->) ]]; then
+    z::log::error "zkv: invalid interval" interval "$interval_raw"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  zmodload -F zsh/zselect b:zselect 2>/dev/null
+
+  typeset -i ttl attempts attempt centi
+  ttl="$ttl_raw"
+  attempts="$attempts_raw"
+
+  # zselect -t takes centiseconds; clamp to at least 1 to avoid a busy loop.
+  (( centi = int(interval_raw * 100) ))
+  (( centi < 1 )) && centi=1
+
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    z::kv::lock "$handle" "$lock_name" "$ttl" "$owner" && return 0
+
+    if (( attempt < attempts )); then
+      if (( ${+builtins[zselect]} )); then
+        zselect -t "$centi" 2>/dev/null
+      else
+        sleep "$interval_raw"
+      fi
+    fi
+  done
+
+  return $ZBASE_ERROR_PERMISSION
+}
+
+
+# =============================================================================
+# WATCHERS
+# =============================================================================
+
+# z::kv::watch <handle> <glob-pattern> <handler-function>
+# Registers <handler-function> to be called whenever a key matching
+# <glob-pattern> is written or deleted.  Multiple handlers per pattern are
+# stored as a separator-delimited list.
+z::kv::watch() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" pattern="$2" handler="$3"
+
+  _z::kv::require_handle "$handle"            || return $?
+  z::validate::nonempty  "$pattern" "pattern" || return $ZBASE_ERROR_INVALID_INPUT
+  z::validate::nonempty  "$handler" "handler" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if ! z::probe::func "$handler"; then
+    z::log::error "zkv: watcher handler not found" handle "$handle" handler "$handler"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  local _wat_n="_zkv_watchers_${handle}"
+  local existing=""
+
+  if _zkv_ahas "$_wat_n" "$pattern"; then
+    _zkv_aget "$_wat_n" "$pattern"
+    existing="$REPLY"
+  fi
+
+  if [[ -n $existing ]]; then
+    _zkv_aset "$_wat_n" "$pattern" "${existing}${_ZKV_SEP}${handler}"
+  else
+    _zkv_aset "$_wat_n" "$pattern" "$handler"
+  fi
+
+  return 0
+}
+
+# z::kv::unwatch <handle> <glob-pattern> [<handler-function>]
+# Removes a specific handler from a pattern, or all handlers if no handler
+# is specified.
+z::kv::unwatch() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" pattern="$2" handler="${3:-}"
+
+  _z::kv::require_handle "$handle"            || return $?
+  z::validate::nonempty  "$pattern" "pattern" || return $ZBASE_ERROR_INVALID_INPUT
+
+  local _wat_n="_zkv_watchers_${handle}"
+
+  if [[ -z $handler ]]; then
+    _zkv_adel "$_wat_n" "$pattern"
+    return 0
+  fi
+
+  if ! _zkv_ahas "$_wat_n" "$pattern"; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  _zkv_aget "$_wat_n" "$pattern"
+  local existing="$REPLY"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a handlers
+  handlers=( "${(@ps:$_ZKV_SEP:)existing}" )
+  handlers=( "${(@)handlers:#$handler}" )   # remove the target handler
+
+  if (( ${#handlers} > 0 )); then
+    _zkv_aset "$_wat_n" "$pattern" "${(pj:$_ZKV_SEP:)handlers}"
+  else
+    _zkv_adel "$_wat_n" "$pattern"
+  fi
+
+  return 0
+}
+
+
+# =============================================================================
+# LISTS
+# =============================================================================
+
+# z::kv::lpush <handle> <key> <value>
+# Prepends <value> to the list at <key>.
+z::kv::lpush() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"             || return $?
+  _z::kv::validate_key   "$key" "$handle"      || return $?
+  z::validate::nonempty  "$value" "value"      || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::reserve_type   "$handle" "$key" list || return $?
+
+  _z::kv::tx_resolve_write "$handle" lists "$key"
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  local -a items
+  _z::kv::split_decoded "$existing"
+  items=( "$value" "${reply[@]}" )   # prepend
+
+  _z::kv::join_encoded "${items[@]}"
+  _zkv_aset "$_map_n" "$key" "$REPLY"
+
+  _z::kv::trigger_watchers "$handle" "$key" "$value" "lpush"
+  _z::kv::auto_persist "$handle"
+
+  return 0
+}
+
+# z::kv::rpush <handle> <key> <value>
+# Appends <value> to the list at <key>.
+z::kv::rpush() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"             || return $?
+  _z::kv::validate_key   "$key" "$handle"      || return $?
+  z::validate::nonempty  "$value" "value"      || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::reserve_type   "$handle" "$key" list || return $?
+
+  _z::kv::tx_resolve_write "$handle" lists "$key"
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  local -a items
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" "$value" )   # append
+
+  _z::kv::join_encoded "${items[@]}"
+  _zkv_aset "$_map_n" "$key" "$REPLY"
+
+  _z::kv::trigger_watchers "$handle" "$key" "$value" "rpush"
+  _z::kv::auto_persist "$handle"
+
+  return 0
+}
+
+# z::kv::lpop <handle> <key>
+# Removes and returns the first element of the list; result in REPLY.
+z::kv::lpop() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_write "$handle" lists "$key"
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items rest
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  (( ${#items} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+
+  REPLY="${items[1]}"
+
+  if (( ${#items} > 1 )); then
+    rest=( "${(@)items[2,-1]}" )
+    _z::kv::join_encoded "${rest[@]}"
+    _zkv_aset "$_map_n" "$key" "$REPLY"
+  else
+    _zkv_adel "$_map_n" "$key"
+  fi
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+# z::kv::rpop <handle> <key>
+# Removes and returns the last element of the list; result in REPLY.
+z::kv::rpop() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_write "$handle" lists "$key"
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items rest
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  (( ${#items} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+
+  REPLY="${items[-1]}"
+
+  if (( ${#items} > 1 )); then
+    rest=( "${(@)items[1,-2]}" )
+    _z::kv::join_encoded "${rest[@]}"
+    _zkv_aset "$_map_n" "$key" "$REPLY"
+  else
+    _zkv_adel "$_map_n" "$key"
+  fi
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+# z::kv::lrange <handle> <key> [<start>] [<stop>]
+# Returns a slice of the list (0-based, negative indices count from the end).
+# Results in the reply array.
+z::kv::lrange() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  typeset -i start="${3:-0}" stop="${4:--1}"
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" lists "$key" || return $?
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  local -a items
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+  reply=()
+
+  typeset -i n="${#items}" zs ze
+
+  # Convert 0-based (possibly negative) indices to 1-based zsh array indices.
+  (( zs = start < 0 ? n + start + 1 : start + 1 ))
+  (( ze = stop  < 0 ? n + stop  + 1 : stop  + 1 ))
+
+  (( zs < 1 )) && zs=1
+  (( ze > n )) && ze="$n"
+
+  (( zs <= ze )) && reply=( "${(@)items[zs,ze]}" )
+
+  return 0
+}
+
+# z::kv::llen <handle> <key>
+# Returns the number of elements in the list via REPLY.
+z::kv::llen() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=0
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" lists "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  _z::kv::split_decoded "$existing"
+  REPLY="${#reply}"
+
+  return 0
+}
+
+# z::kv::lindex <handle> <key> [<index>]
+# Returns the element at 0-based <index> (negative counts from end) via REPLY.
+z::kv::lindex() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  typeset -i idx="${3:-0}"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" lists "$key" || return $?
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  typeset -i n="${#items}" zi
+
+  # Convert 0-based index to 1-based.
+  (( zi = idx < 0 ? n + idx + 1 : idx + 1 ))
+
+  if (( zi < 1 || zi > n )); then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  REPLY="${items[zi]}"
+  return 0
+}
+
+# z::kv::lset <handle> <key> <index> <value>
+# Replaces the element at 0-based <index> with <value>.
+z::kv::lset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  typeset -i idx="${3:-0}"
+  local value="$4"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_write "$handle" lists "$key"
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  typeset -i n="${#items}" zi
+
+  (( zi = idx < 0 ? n + idx + 1 : idx + 1 ))
+
+  if (( zi < 1 || zi > n )); then
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  items[zi]="$value"
+
+  _z::kv::join_encoded "${items[@]}"
+  _zkv_aset "$_map_n" "$key" "$REPLY"
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+
+# =============================================================================
+# SETS
+# =============================================================================
+
+# z::kv::sadd <handle> <key> <value>
+# Adds <value> to the set at <key>.
+# Returns ZBASE_ERROR_PERMISSION if <value> is already a member.
+z::kv::sadd() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"            || return $?
+  _z::kv::validate_key   "$key" "$handle"     || return $?
+  z::validate::nonempty  "$value" "value"     || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::reserve_type   "$handle" "$key" set || return $?
+
+  _z::kv::tx_resolve_write "$handle" sets "$key"
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  local -a members
+  _z::kv::split_decoded "$existing"
+  members=( "${reply[@]}" )
+
+  # (Ie) flag: case-sensitive exact-match index; non-zero means already present.
+  (( ${members[(Ie)$value]} )) && return $ZBASE_ERROR_PERMISSION
+
+  members+=( "$value" )
+
+  _z::kv::join_encoded "${members[@]}"
+  _zkv_aset "$_map_n" "$key" "$REPLY"
+
+  _z::kv::trigger_watchers "$handle" "$key" "$value" "sadd"
+  _z::kv::auto_persist "$handle"
+
+  return 0
+}
+
+# z::kv::srem <handle> <key> <value>
+# Removes <value> from the set at <key>.
+z::kv::srem() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_write "$handle" sets "$key"
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a members filtered
+  local member found=0
+
+  _z::kv::split_decoded "$existing"
+  members=( "${reply[@]}" )
+
+  for member in "${members[@]}"; do
+    if [[ $member == "$value" ]]; then
+      found=1
+    else
+      filtered+=( "$member" )
+    fi
+  done
+
+  (( found )) || return $ZBASE_ERROR_NOT_FOUND
+
+  if (( ${#filtered} > 0 )); then
+    _z::kv::join_encoded "${filtered[@]}"
+    _zkv_aset "$_map_n" "$key" "$REPLY"
+  else
+    _zkv_adel "$_map_n" "$key"
+  fi
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+# z::kv::sismember <handle> <key> <value>
+# Returns 0 if <value> is a member of the set, 1 otherwise.
+z::kv::sismember() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_read "$handle" sets "$key" || return 1
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 1
+
+  _z::kv::split_decoded "$existing"
+  (( ${reply[(Ie)$value]} ))
+}
+
+# z::kv::smembers <handle> <key>
+# Populates the reply array with all members of the set.
+z::kv::smembers() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" sets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  _z::kv::split_decoded "$existing"
+  return 0
+}
+
+# z::kv::scard <handle> <key>
+# Returns the number of members in the set via REPLY.
+z::kv::scard() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=0
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" sets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  _z::kv::split_decoded "$existing"
+  REPLY="${#reply}"
+
+  return 0
+}
+
+# z::kv::sunion <handle> <key> [<key> ...]
+# Returns the union of all specified sets in the reply array.
+z::kv::sunion() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+  shift
+
+  reply=()
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local -A seen
+  local key member existing _map_n _ref
+  local -a members
+
+  for key in "$@"; do
+    _z::kv::tx_resolve_read "$handle" sets "$key" || continue
+
+    _map_n="$REPLY"
+    _ref="${_map_n}[${key}]"
+    existing="${(P)_ref}"
+
+    [[ -z $existing ]] && continue
+
+    _z::kv::split_decoded "$existing"
+    members=( "${reply[@]}" )
+    reply=()
+
+    for member in "${members[@]}"; do
+      if (( ! ${+seen[$member]} )); then
+        seen[$member]=1
+        reply+=( "$member" )
+      fi
+    done
+  done
+
+  return 0
+}
+
+# z::kv::sinter <handle> <key> [<key> ...]
+# Returns the intersection of all specified sets in the reply array.
+z::kv::sinter() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+  shift
+
+  reply=()
+
+  _z::kv::require_handle "$handle" || return $?
+  (( $# == 0 )) && return 0
+
+  _z::kv::tx_resolve_read "$handle" sets "$1" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${1}]"
+  local first_existing="${(P)_ref}"
+
+  [[ -z $first_existing ]] && return 0
+
+  # Seed candidates from the first set; filter against all remaining sets.
+  local -a candidates result rest_keys members
+  _z::kv::split_decoded "$first_existing"
+  candidates=( "${reply[@]}" )
+  reply=()
+
+  shift
+  rest_keys=( "$@" )
+
+  local member key existing
+  local in_all
+
+  for member in "${candidates[@]}"; do
+    in_all=1
+
+    for key in "${rest_keys[@]}"; do
+      _z::kv::tx_resolve_read "$handle" sets "$key" || {
+        in_all=0
+        break
+      }
+
+      _map_n="$REPLY"
+      _ref="${_map_n}[${key}]"
+      existing="${(P)_ref}"
+
+      if [[ -z $existing ]]; then
+        in_all=0
+        break
+      fi
+
+      _z::kv::split_decoded "$existing"
+      members=( "${reply[@]}" )
+      reply=()
+
+      if (( ! ${members[(Ie)$member]} )); then
+        in_all=0
+        break
+      fi
+    done
+
+    (( in_all )) && result+=( "$member" )
+  done
+
+  reply=( "${result[@]}" )
+  return 0
+}
+
+# z::kv::sdiff <handle> <key> [<key> ...]
+# Returns members of the first set that are absent from all subsequent sets.
+z::kv::sdiff() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+  shift
+
+  reply=()
+
+  _z::kv::require_handle "$handle" || return $?
+  (( $# == 0 )) && return 0
+
+  _z::kv::tx_resolve_read "$handle" sets "$1" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${1}]"
+  local first_existing="${(P)_ref}"
+
+  [[ -z $first_existing ]] && return 0
+
+  local -a base others members
+  _z::kv::split_decoded "$first_existing"
+  base=( "${reply[@]}" )
+  reply=()
+
+  shift
+  others=( "$@" )
+
+  local member key existing
+  local found
+
+  for member in "${base[@]}"; do
+    found=0
+
+    for key in "${others[@]}"; do
+      _z::kv::tx_resolve_read "$handle" sets "$key" || continue
+
+      _map_n="$REPLY"
+      _ref="${_map_n}[${key}]"
+      existing="${(P)_ref}"
+
+      [[ -z $existing ]] && continue
+
+      _z::kv::split_decoded "$existing"
+      members=( "${reply[@]}" )
+      reply=()
+
+      if (( ${members[(Ie)$member]} )); then
+        found=1
+        break
+      fi
+    done
+
+    (( ! found )) && reply+=( "$member" )
+  done
+
+  return 0
+}
+
+
+# =============================================================================
+# SORTED SETS (ZSETS)
 #
-# Usage:
-#   z::kv::batch <<EOF
-#     set key1 value1
-#     set key2 value2
-#     incr counter
-#     del old_key
-#   EOF
+# Members are stored as packed entries: a zero-padded 19-digit integer sort key
+# (derived from the float score shifted into unsigned space) followed by the
+# canonical float string and the member name, all separated by _ZKV_RECSEP.
+# Lexicographic sort of the packed entries produces score order.
+# =============================================================================
+
+# _z::kv::zscore_pack <score>
+# Converts a float score to a 19-digit zero-padded sort key (REPLY) and a
+# canonical 6-decimal-place float string (REPLY2).
+# Score range: -999999999999.999999 .. +999999999999.999999
+_z::kv::zscore_pack() {
+  emulate -L zsh
+  setopt typesetsilent
+
+  local raw="$1"
+  local canon
+
+  LC_NUMERIC=C printf -v canon "%.6f" "$raw" 2>/dev/null || {
+    REPLY=""
+    REPLY2=""
+    return $ZBASE_ERROR_INVALID_INPUT
+  }
+
+  typeset -F f
+  f="$canon"
+
+  if (( f < -999999999999.999999 || f > 999999999999.999999 )); then
+    REPLY=""
+    REPLY2=""
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  # Shift into unsigned space (add 2e18 microseconds) so lexicographic order
+  # matches numeric order for both positive and negative scores.
+  typeset -i micro
+  (( micro = int(f * 1000000) + 2000000000000000000 ))
+
+  LC_NUMERIC=C printf -v REPLY "%019d" "$micro"
+  REPLY2="$canon"
+
+  return 0
+}
+
+# _z::kv::zentry_pack <score> <member>
+# Builds a full packed entry string: sort-key + RECSEP + canon-score + RECSEP + member.
+_z::kv::zentry_pack() {
+  local score_raw="$1" member="$2"
+
+  _z::kv::zscore_pack "$score_raw" || return $?
+  local packed="$REPLY" canon="$REPLY2"
+
+  REPLY="${packed}${_ZKV_RECSEP}${canon}${_ZKV_RECSEP}${member}"
+  return 0
+}
+
+# _z::kv::zentry_member <entry>
+# Extracts the member name from a packed entry; result in REPLY.
+_z::kv::zentry_member() {
+  local entry="$1"
+  local rest="${entry#*${_ZKV_RECSEP}}"
+  REPLY="${rest#*${_ZKV_RECSEP}}"
+}
+
+# _z::kv::zentry_score <entry>
+# Extracts the canonical float score from a packed entry; result in REPLY.
+_z::kv::zentry_score() {
+  local entry="$1"
+  local rest="${entry#*${_ZKV_RECSEP}}"
+  REPLY="${rest%%${_ZKV_RECSEP}*}"
+}
+
+# _z::kv::zentry_packkey <entry>
+# Extracts the 19-digit sort key from a packed entry; result in REPLY.
+_z::kv::zentry_packkey() {
+  local entry="$1"
+  REPLY="${entry%%${_ZKV_RECSEP}*}"
+}
+
+# z::kv::zadd <handle> <key> <score> <member>
+# Adds or updates <member> with <score> in the sorted set at <key>.
+z::kv::zadd() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" score_raw="$3" member="$4"
+
+  _z::kv::require_handle "$handle"              || return $?
+  _z::kv::validate_key   "$key" "$handle"       || return $?
+  z::validate::nonempty  "$member" "member"     || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::reserve_type   "$handle" "$key" zset  || return $?
+
+  _z::kv::zentry_pack "$score_raw" "$member" || {
+    z::log::error "zkv: invalid score" handle "$handle" key "$key" score "$score_raw"
+    return $ZBASE_ERROR_INVALID_INPUT
+  }
+
+  local new_entry="$REPLY"
+
+  _z::kv::tx_resolve_write "$handle" zsets "$key"
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  local -a items filtered
+  local item existing_member
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  # Remove any existing entry for this member (score update).
+  for item in "${items[@]}"; do
+    _z::kv::zentry_member "$item"
+    existing_member="$REPLY"
+
+    [[ $existing_member != "$member" ]] && filtered+=( "$item" )
+  done
+
+  filtered+=( "$new_entry" )
+
+  _z::kv::join_encoded "${filtered[@]}"
+  _zkv_aset "$_map_n" "$key" "$REPLY"
+
+  _z::kv::trigger_watchers "$handle" "$key" "$member" "zadd"
+  _z::kv::auto_persist "$handle"
+
+  return 0
+}
+
+# z::kv::zscore <handle> <key> <member>
+# Returns the score of <member> in the sorted set via REPLY.
+z::kv::zscore() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" member="$3"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"          || return $?
+  _z::kv::validate_key   "$key" "$handle"   || return $?
+  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return $?
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items
+  local item entry_member
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  for item in "${items[@]}"; do
+    _z::kv::zentry_member "$item"
+    entry_member="$REPLY"
+
+    if [[ $entry_member == "$member" ]]; then
+      _z::kv::zentry_score "$item"
+      return 0
+    fi
+  done
+
+  return $ZBASE_ERROR_NOT_FOUND
+}
+
+# z::kv::zrank <handle> <key> <member> [<reverse>]
+# Returns the 0-based rank of <member> in score order via REPLY.
+# Pass reverse=1 for descending order.
+z::kv::zrank() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" member="$3" reverse="${4:-0}"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"          || return $?
+  _z::kv::validate_key   "$key" "$handle"   || return $?
+  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return $?
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items sorted
+  local item entry_member
+  typeset -i rank=0
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  # (@o) = ascending lexicographic sort of packed entries → ascending score order.
+  sorted=( "${(@o)items}" )
+  (( reverse )) && sorted=( "${(@O)sorted}" )
+
+  for item in "${sorted[@]}"; do
+    _z::kv::zentry_member "$item"
+    entry_member="$REPLY"
+
+    if [[ $entry_member == "$member" ]]; then
+      REPLY="$rank"
+      return 0
+    fi
+
+    (( rank += 1 ))
+  done
+
+  return $ZBASE_ERROR_NOT_FOUND
+}
+
+# z::kv::zrange <handle> <key> [<start>] [<stop>] [--rev]
+# Returns member names for the given rank range in the reply array.
+z::kv::zrange() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  typeset -i start="${3:-0}" stop="${4:--1}"
+  local reverse=0
+
+  [[ ${5:-} == "--rev" ]] && reverse=1
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  local -a items sorted
+  local item
+  typeset -i n zs ze
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+  reply=()
+
+  sorted=( "${(@o)items}" )
+  (( reverse )) && sorted=( "${(@O)sorted}" )
+
+  n="${#sorted}"
+
+  (( zs = start < 0 ? n + start + 1 : start + 1 ))
+  (( ze = stop  < 0 ? n + stop  + 1 : stop  + 1 ))
+
+  (( zs < 1 )) && zs=1
+  (( ze > n )) && ze="$n"
+
+  if (( zs <= ze )); then
+    for item in "${(@)sorted[zs,ze]}"; do
+      _z::kv::zentry_member "$item"
+      reply+=( "$REPLY" )
+    done
+  fi
+
+  return 0
+}
+
+# z::kv::zrange_withscores <handle> <key> [<start>] [<stop>] [--rev]
+# Like z::kv::zrange but interleaves member and score in the reply array:
+# reply = ( member1 score1 member2 score2 ... )
+z::kv::zrange_withscores() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  typeset -i start="${3:-0}" stop="${4:--1}"
+  local reverse=0
+
+  [[ ${5:-} == "--rev" ]] && reverse=1
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  local -a items sorted
+  local item score member
+  typeset -i n zs ze
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+  reply=()
+
+  sorted=( "${(@o)items}" )
+  (( reverse )) && sorted=( "${(@O)sorted}" )
+
+  n="${#sorted}"
+
+  (( zs = start < 0 ? n + start + 1 : start + 1 ))
+  (( ze = stop  < 0 ? n + stop  + 1 : stop  + 1 ))
+
+  (( zs < 1 )) && zs=1
+  (( ze > n )) && ze="$n"
+
+  if (( zs <= ze )); then
+    for item in "${(@)sorted[zs,ze]}"; do
+      _z::kv::zentry_member "$item"
+      member="$REPLY"
+
+      _z::kv::zentry_score "$item"
+      score="$REPLY"
+
+      reply+=( "$member" "$score" )
+    done
+  fi
+
+  return 0
+}
+
+# z::kv::zrangebyscore <handle> <key> <min> <max>
+# Returns members whose scores fall within [min, max] (inclusive) in the reply array.
+z::kv::zrangebyscore() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" min_raw="$3" max_raw="$4"
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::zscore_pack "$min_raw" || return $ZBASE_ERROR_INVALID_INPUT
+  local min_pack="$REPLY"
+
+  _z::kv::zscore_pack "$max_raw" || return $ZBASE_ERROR_INVALID_INPUT
+  local max_pack="$REPLY"
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  local -a items sorted
+  local item pack member
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+  reply=()
+
+  sorted=( "${(@o)items}" )
+
+  for item in "${sorted[@]}"; do
+    _z::kv::zentry_packkey "$item"
+    pack="$REPLY"
+
+    # Lexicographic comparison of zero-padded sort keys is equivalent to
+    # numeric comparison of the underlying scores.
+    if [[ $pack > $min_pack || $pack == "$min_pack" ]] && \
+       [[ $pack < $max_pack || $pack == "$max_pack" ]]; then
+      _z::kv::zentry_member "$item"
+      member="$REPLY"
+      reply+=( "$member" )
+    fi
+  done
+
+  return 0
+}
+
+# z::kv::zrem <handle> <key> <member>
+# Removes <member> from the sorted set at <key>.
+z::kv::zrem() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" member="$3"
+
+  _z::kv::require_handle "$handle"          || return $?
+  _z::kv::validate_key   "$key" "$handle"   || return $?
+  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::tx_resolve_write "$handle" zsets "$key"
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+
+  local -a items filtered
+  local item entry_member found=0
+
+  _z::kv::split_decoded "$existing"
+  items=( "${reply[@]}" )
+
+  for item in "${items[@]}"; do
+    _z::kv::zentry_member "$item"
+    entry_member="$REPLY"
+
+    if [[ $entry_member == "$member" ]]; then
+      found=1
+    else
+      filtered+=( "$item" )
+    fi
+  done
+
+  (( found )) || return $ZBASE_ERROR_NOT_FOUND
+
+  if (( ${#filtered} > 0 )); then
+    _z::kv::join_encoded "${filtered[@]}"
+    _zkv_aset "$_map_n" "$key" "$REPLY"
+  else
+    _zkv_adel "$_map_n" "$key"
+  fi
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+# z::kv::zcard <handle> <key>
+# Returns the number of members in the sorted set via REPLY.
+z::kv::zcard() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=0
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
+
+  local _map_n="$REPLY"
+  local _ref="${_map_n}[${key}]"
+  local existing="${(P)_ref}"
+
+  [[ -z $existing ]] && return 0
+
+  _z::kv::split_decoded "$existing"
+  REPLY="${#reply}"
+
+  return 0
+}
+
+
+# =============================================================================
+# HASHES
+# =============================================================================
+
+# _z::kv::hash_compose <key> <field>
+# Builds the composite hash-map key: encoded_key + RECSEP + encoded_field.
+# This allows all fields of a hash to be stored in a single flat associative
+# array with a scannable prefix.
+_z::kv::hash_compose() {
+  local k="$1" f="$2"
+
+  _z::kv::encode_value "$k"
+  local ek="$REPLY"
+
+  _z::kv::encode_value "$f"
+  local ef="$REPLY"
+
+  REPLY="${ek}${_ZKV_RECSEP}${ef}"
+}
+
+# z::kv::hset <handle> <key> <field> <value>
+# Sets a single field in the hash at <key>.
+z::kv::hset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" field="$3" value="$4"
+
+  _z::kv::require_handle "$handle"           || return $?
+  _z::kv::validate_key   "$key" "$handle"    || return $?
+  z::validate::nonempty  "$field" "field"    || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::reserve_type   "$handle" "$key" hash || return $?
+
+  _z::kv::hash_compose "$key" "$field"
+  local hk="$REPLY"
+
+  _z::kv::tx_resolve_write "$handle" hashes "$hk"
+
+  local _map_n="$REPLY"
+
+  _zkv_aset "$_map_n" "$hk" "$value"
+
+  _z::kv::trigger_watchers "$handle" "$key" "${field}${_ZKV_RECSEP}${value}" "hset"
+  _z::kv::auto_persist "$handle"
+
+  return 0
+}
+
+# z::kv::hmset <handle> <key> <field> <value> [<field> <value> ...]
+# Sets multiple fields in the hash at <key> (requires an even field-value count).
+z::kv::hmset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+  shift 2
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  if (( $# % 2 != 0 )); then
+    z::log::error "zkv: hmset requires even field-value count" \
+      handle "$handle" key "$key" received "$#"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
+
+  while (( $# >= 2 )); do
+    z::kv::hset "$handle" "$key" "$1" "$2" || return $?
+    shift 2
+  done
+
+  return 0
+}
+
+# z::kv::hget <handle> <key> <field>
+# Returns the value of <field> in the hash via REPLY.
+z::kv::hget() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" field="$3"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::hash_compose "$key" "$field"
+  local hk="$REPLY"
+
+  _z::kv::tx_resolve_read "$handle" hashes "$hk" || return $?
+
+  local _map_n="$REPLY"
+
+  if ! _zkv_ahas "$_map_n" "$hk"; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  _zkv_aget "$_map_n" "$hk"
+  return 0
+}
+
+# z::kv::hgetall <handle> <key>
+# Populates the reply array with interleaved field-value pairs for all fields
+# in the hash: reply = ( field1 val1 field2 val2 ... ), sorted by field name.
+# Merges the live map and the tx-buffer when inside a transaction.
+z::kv::hgetall() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  reply=()
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  _z::kv::encode_value "$key"
+  local ekey="$REPLY"
+  local prefix="${ekey}${_ZKV_RECSEP}"
+
+  # Build a merged view: live fields first, then overlay tx-buffer changes.
+  local -A view
+  local _live_n="_zkv_hashes_${handle}"
+  local hk
+
+  for hk in "${(@Pko)_live_n}"; do
+    if [[ $hk == ${prefix}* ]]; then
+      _zkv_aget "$_live_n" "$hk"
+      view[$hk]="$REPLY"
+    fi
+  done
+
+  if _zkv_tx_active "$handle"; then
+    local _txbuf_n="_zkv_txbuf_hashes_${handle}"
+
+    # If the entire key was deleted in this transaction, wipe the view.
+    if _zkv_ahas "_zkv_txbuf_del_${handle}" "$key"; then
+      view=()
+    fi
+
+    for hk in "${(@Pk)_txbuf_n}"; do
+      if [[ $hk == ${prefix}* ]]; then
+        _zkv_aget "$_txbuf_n" "$hk"
+        view[$hk]="$REPLY"
+      fi
+    done
+  fi
+
+  local field_enc field val
+
+  for hk in "${(@ko)view}"; do
+    field_enc="${hk#${prefix}}"
+
+    _z::kv::decode_value "$field_enc"
+    field="$REPLY"
+
+    val="${view[$hk]}"
+
+    reply+=( "$field" "$val" )
+  done
+
+  return 0
+}
+
+# z::kv::hdel <handle> <key> <field>
+# Deletes a single field from the hash at <key>.
+z::kv::hdel() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" field="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::hash_compose "$key" "$field"
+  local hk="$REPLY"
+
+  if _zkv_tx_active "$handle"; then
+    local _txh_n="_zkv_txbuf_hashes_${handle}"
+    local _live_n="_zkv_hashes_${handle}"
+
+    if _zkv_ahas "$_txh_n" "$hk"; then
+      _zkv_adel "$_txh_n" "$hk"
+      return 0
+    elif _zkv_ahas "$_live_n" "$hk"; then
+      # Copy all sibling fields into the tx-buffer so the commit sees the full
+      # hash minus the deleted field, rather than only the deleted entry.
+      local prefix="${hk%${_ZKV_RECSEP}*}${_ZKV_RECSEP}"
+      local k
+
+      for k in "${(@Pk)_live_n}"; do
+        if [[ $k == ${prefix}* ]] && ! _zkv_ahas "$_txh_n" "$k"; then
+          _zkv_aget "$_live_n" "$k"
+          _zkv_aset "$_txh_n" "$k" "$REPLY"
+        fi
+      done
+
+      _zkv_adel "$_txh_n" "$hk"
+      return 0
+    fi
+
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  local _live_n="_zkv_hashes_${handle}"
+
+  if ! _zkv_ahas "$_live_n" "$hk"; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  _zkv_adel "$_live_n" "$hk"
+
+  _z::kv::auto_persist "$handle"
+  return 0
+}
+
+# z::kv::hexists <handle> <key> <field>
+# Returns 0 if <field> exists in the hash, 1 otherwise.
+z::kv::hexists() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" field="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+
+  _z::kv::hash_compose "$key" "$field"
+  local hk="$REPLY"
+
+  _z::kv::tx_resolve_read "$handle" hashes "$hk" || return 1
+  _zkv_ahas "$REPLY" "$hk"
+}
+
+# z::kv::hkeys <handle> <key>
+# Populates the reply array with all field names of the hash.
+z::kv::hkeys() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  reply=()
+
+  z::kv::hgetall "$handle" "$key" || return $?
+
+  local -a out
+  out=( "${reply[@]}" )
+  reply=()
+
+  typeset -i i
+  for (( i = 1; i <= ${#out}; i += 2 )); do
+    reply+=( "${out[i]}" )
+  done
+
+  return 0
+}
+
+# z::kv::hvals <handle> <key>
+# Populates the reply array with all field values of the hash.
+z::kv::hvals() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  reply=()
+
+  z::kv::hgetall "$handle" "$key" || return $?
+
+  local -a out
+  out=( "${reply[@]}" )
+  reply=()
+
+  typeset -i i
+  for (( i = 2; i <= ${#out}; i += 2 )); do
+    reply+=( "${out[i]}" )
+  done
+
+  return 0
+}
+
+# z::kv::hlen <handle> <key>
+# Returns the number of fields in the hash via REPLY.
+z::kv::hlen() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  REPLY=0
+
+  z::kv::hkeys "$handle" "$key" || return $?
+  REPLY="${#reply}"
+
+  return 0
+}
+
+# z::kv::hincrby <handle> <key> <field> [<amount>]
+# Increments the integer value of <field> by <amount> (default: 1).
+# Creates the field at 0 if it does not exist.  Result in REPLY.
+z::kv::hincrby() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" field="$3" amount_raw="${4:-1}"
+
+  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+
+  typeset -i amount current=0
+  amount="$amount_raw"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if z::kv::hexists "$handle" "$key" "$field"; then
+    z::kv::hget "$handle" "$key" "$field" || return $?
+    z::validate::integer "$REPLY" "field value" || return $ZBASE_ERROR_INVALID_INPUT
+    current="$REPLY"
+  fi
+
+  (( current += amount ))
+
+  z::kv::hset "$handle" "$key" "$field" "$current" || return $?
+
+  REPLY="$current"
+  return 0
+}
+
+
+# =============================================================================
+# SNAPSHOTS
+# =============================================================================
+
+# z::kv::snapshot_create <handle> [<label>]
+# Creates a named point-in-time snapshot of the entire store.
+# If the snapshot cap (max_snapshots) is reached, the oldest snapshot is
+# evicted automatically.  Returns the snapshot ID via REPLY.
+z::kv::snapshot_create() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" label="${2:-snapshot}"
+
+  REPLY=""
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _snaps_n="_zkv_snaps_${handle}"
+  local _cfg_n="_zkv_cfg_${handle}"
+
+  local -a existing_ids
+  local k
+
+  for k in "${(@Pk)_snaps_n}"; do
+    [[ $k == snap_*.label ]] && existing_ids+=( "${k%.label}" )
+  done
+
+  _zkv_aget "$_cfg_n" max_snapshots
+  typeset -i _max_snaps="$REPLY"
+
+  if (( ${#existing_ids} >= _max_snaps )); then
+    # Evict the snapshot with the smallest timestamp (oldest).
+    local oldest="" cand
+    typeset -i oldest_ts=99999999999 cand_ts
+
+    for cand in "${existing_ids[@]}"; do
+      _zkv_aget "$_snaps_n" "${cand}.timestamp"
+      cand_ts="${REPLY:-99999999999}"
+
+      if (( cand_ts < oldest_ts )); then
+        oldest="$cand"
+        oldest_ts="$cand_ts"
+      fi
+    done
+
+    z::log::warn "zkv: snapshot cap reached, evicting oldest" \
+      handle "$handle" id "$oldest" cap "$_max_snaps"
+
+    z::kv::snapshot_delete "$handle" "$oldest"
+  fi
+
+  (( _zkv_snap_id_${handle} += 1 ))
+
+  local _snap_id_ref="_zkv_snap_id_${handle}"
+  local snap_id="snap_${(P)_snap_id_ref}"
+
+  _z::kv::epoch || return $?
+
+  _zkv_aset "$_snaps_n" "${snap_id}.label" "$label"
+  _zkv_aset "$_snaps_n" "${snap_id}.timestamp" "$REPLY"
+
+  # Deep-copy all structure maps into per-snapshot maps.
+  local suffix
+
+  for suffix in store meta ttl lists sets zsets hashes; do
+    typeset -gA "_zkv_snap_${suffix}_${snap_id}_${handle}"
+    _zkv_acopy "_zkv_snap_${suffix}_${snap_id}_${handle}" "_zkv_${suffix}_${handle}"
+  done
+
+  REPLY="$snap_id"
+
+  z::log::info "zkv: snapshot created" handle "$handle" id "$snap_id" label "$label"
+  return 0
+}
+
+# z::kv::snapshot_restore <handle> <snapshot-id>
+# Replaces the live store contents with the data from the specified snapshot.
+z::kv::snapshot_restore() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" snap_id="$2"
+
+  _z::kv::require_handle "$handle"                || return $?
+  z::validate::nonempty  "$snap_id" "snapshot_id" || return $ZBASE_ERROR_INVALID_INPUT
+
+  local _snaps_n="_zkv_snaps_${handle}"
+
+  _zkv_aget "$_snaps_n" "${snap_id}.label"
+
+  if [[ -z $REPLY ]]; then
+    z::log::error "zkv: snapshot not found" handle "$handle" id "$snap_id"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  local suffix
+
+  for suffix in store meta ttl lists sets zsets hashes; do
+    _zkv_aclear "_zkv_${suffix}_${handle}"
+    _zkv_acopy  "_zkv_${suffix}_${handle}" "_zkv_snap_${suffix}_${snap_id}_${handle}"
+  done
+
+  z::log::info "zkv: snapshot restored" handle "$handle" id "$snap_id"
+  return 0
+}
+
+# z::kv::snapshot_list <handle>
+# Prints a formatted table of all snapshots sorted by creation time.
+z::kv::snapshot_list() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _snaps_n="_zkv_snaps_${handle}"
+  local -a ids
+  local k
+
+  for k in "${(@Pk)_snaps_n}"; do
+    [[ $k == snap_*.label ]] && ids+=( "${k%.label}" )
+  done
+
+  print "\nKV Snapshots [${handle}]:"
+  print "========================="
+
+  if (( ${#ids} == 0 )); then
+    print "  No snapshots.\n"
+    return 0
+  fi
+
+  # Sort by timestamp by building a timestamp-keyed map.
+  local -A by_ts
+
+  for k in "${ids[@]}"; do
+    _zkv_aget "$_snaps_n" "${k}.timestamp"
+    by_ts["${REPLY}_${k}"]="$k"
+  done
+
+  local sk snap_id label ts ts_str
+
+  for sk in "${(@ko)by_ts}"; do
+    snap_id="${by_ts[$sk]}"
+
+    _zkv_aget "$_snaps_n" "${snap_id}.label"
+    label="$REPLY"
+
+    _zkv_aget "$_snaps_n" "${snap_id}.timestamp"
+    ts="$REPLY"
+
+    z::log::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
+    ts_str="$REPLY"
+
+    print "  ${snap_id}: ${label} [${ts_str}]"
+  done
+
+  print ""
+  return 0
+}
+
+# z::kv::snapshot_delete <handle> <snapshot-id>
+# Deletes a snapshot and frees all associated per-snapshot maps.
+z::kv::snapshot_delete() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" snap_id="$2"
+
+  _z::kv::require_handle "$handle"                || return $?
+  z::validate::nonempty  "$snap_id" "snapshot_id" || return $ZBASE_ERROR_INVALID_INPUT
+
+  local _snaps_n="_zkv_snaps_${handle}"
+
+  _zkv_aget "$_snaps_n" "${snap_id}.label"
+
+  if [[ -z $REPLY ]]; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  local k
+
+  for k in "${(@Pk)_snaps_n}"; do
+    [[ $k == ${snap_id}.* ]] && _zkv_adel "$_snaps_n" "$k"
+  done
+
+  local suffix
+
+  for suffix in store meta ttl lists sets zsets hashes; do
+    unset "_zkv_snap_${suffix}_${snap_id}_${handle}"
+  done
+
+  z::log::info "zkv: snapshot deleted" handle "$handle" id "$snap_id"
+  return 0
+}
+
+
+# =============================================================================
+# BATCH
+# =============================================================================
+
+# z::kv::batch <handle>
+# Reads a command script from stdin and executes each line as a store
+# operation inside a single transaction.  Rolls back on any failure.
 #
-# @stdin Batch commands (one per line)
-# @return 0 on success, 1 if any command failed
-###
+# Supported commands (one per line, shell-quoted):
+#   set    <key> <value>
+#   del    <key>
+#   incr   <key> [<amount>]
+#   decr   <key> [<amount>]
+#   expire <key> [<ttl>]
+#   persist <key>
+#   hset   <key> <field> <value>
+#   hdel   <key> <field>
+#   lpush  <key> <value>
+#   rpush  <key> <value>
+#   sadd   <key> <value>
+#   srem   <key> <value>
+#   zadd   <key> <score> <member>
+#   zrem   <key> <member>
 z::kv::batch() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  z::kv::begin || return 1
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  z::kv::begin "$handle" || return $?
 
   typeset -i failed=0
   local line cmd
+  local -a parts
 
   while IFS= read -r line; do
-    # Skip empty lines and comments
     [[ $line =~ '^[[:space:]]*(#.*)?$' ]] && continue
 
-    # Parse command
-    local -a parts
-    parts=("${(@s: :)line}")
+    # (z) splits on shell word boundaries; (Q) strips one level of quoting.
+    parts=( ${(z)line} )
+    parts=( "${(@Q)parts}" )
+
+    (( ${#parts} == 0 )) && continue
 
     cmd="${parts[1]}"
 
     case "$cmd" in
       set)
-        z::kv::set "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch set requires key and value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::set "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
         ;;
-      get)
-        z::kv::get "${parts[2]}" || (( failed += 1 ))
-        ;;
+
       del)
-        z::kv::del "${parts[2]}" || (( failed += 1 ))
+        if (( ${#parts} < 2 )); then
+          z::log::warn "zkv: batch del requires key" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::del "$handle" "${parts[2]}" || (( failed += 1 ))
+        fi
         ;;
+
       incr)
-        z::kv::incr "${parts[2]}" || (( failed += 1 ))
+        if (( ${#parts} < 2 )); then
+          z::log::warn "zkv: batch incr requires key" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::incr "$handle" "${parts[2]}" "${parts[3]:-1}" || (( failed += 1 ))
+        fi
         ;;
+
       decr)
-        z::kv::decr "${parts[2]}" || (( failed += 1 ))
+        if (( ${#parts} < 2 )); then
+          z::log::warn "zkv: batch decr requires key" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::decr "$handle" "${parts[2]}" "${parts[3]:-1}" || (( failed += 1 ))
+        fi
         ;;
+
+      expire)
+        if (( ${#parts} < 2 )); then
+          z::log::warn "zkv: batch expire requires key" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::expire "$handle" "${parts[2]}" "${parts[3]:-0}" || (( failed += 1 ))
+        fi
+        ;;
+
+      persist)
+        if (( ${#parts} < 2 )); then
+          z::log::warn "zkv: batch persist requires key" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::persist "$handle" "${parts[2]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      hset)
+        if (( ${#parts} < 4 )); then
+          z::log::warn "zkv: batch hset requires key field value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::hset "$handle" "${parts[2]}" "${parts[3]}" "${parts[4]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      hdel)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch hdel requires key field" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::hdel "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      lpush)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch lpush requires key value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::lpush "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      rpush)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch rpush requires key value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::rpush "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      sadd)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch sadd requires key value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::sadd "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      srem)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch srem requires key value" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::srem "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      zadd)
+        if (( ${#parts} < 4 )); then
+          z::log::warn "zkv: batch zadd requires key score member" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::zadd "$handle" "${parts[2]}" "${parts[3]}" "${parts[4]}" || (( failed += 1 ))
+        fi
+        ;;
+
+      zrem)
+        if (( ${#parts} < 3 )); then
+          z::log::warn "zkv: batch zrem requires key member" line "$line"
+          (( failed += 1 ))
+        else
+          z::kv::zrem "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
+        fi
+        ;;
+
       *)
-        z::log::warn "KV: Unknown batch command: $cmd"
+        z::log::warn "zkv: unknown batch command" handle "$handle" command "$cmd"
         (( failed += 1 ))
         ;;
     esac
   done
 
   if (( failed > 0 )); then
-    z::log::error "KV: Batch operation failed ($failed errors), rolling back"
-    z::kv::rollback
-    return 1
+    z::log::error "zkv: batch failed, rolling back" handle "$handle" errors "$failed"
+    z::kv::rollback "$handle"
+    return $ZBASE_ERROR_GENERAL
   fi
 
-  z::kv::commit
-  z::log::debug "KV: Batch operation completed successfully"
+  z::kv::commit "$handle"
+  return $?
+}
+
+
+# =============================================================================
+# RENAME / COPY
+# =============================================================================
+
+# _z::kv::_copy_ttl <handle> <src> <dst>
+# Transfers the TTL from <src> to <dst>, or removes the TTL on <dst> if <src>
+# has no expiry.
+_z::kv::_copy_ttl() {
+  local handle="$1" src="$2" dst="$3"
+
+  z::kv::ttl "$handle" "$src"
+  typeset -i ttl_rem
+  (( ttl_rem = REPLY > 0 ? REPLY : 0 ))
+
+  if (( ttl_rem > 0 )); then
+    _z::kv::epoch || return $?
+    _zkv_aset "_zkv_ttl_${handle}" "$dst" "$(( REPLY + ttl_rem ))"
+  else
+    _zkv_adel "_zkv_ttl_${handle}" "$dst"
+  fi
 
   return 0
 }
 
-################################################################################
-# UTILITY OPERATIONS
-################################################################################
+# _z::kv::_copy_key_data <handle> <src> <dst>
+# Copies all data (value, metadata, TTL) from <src> to <dst>, replacing any
+# existing <dst> key.  Handles all five structure types.
+_z::kv::_copy_key_data() {
+  local handle="$1" src="$2" dst="$3"
 
-###
-# Rename key
-#
-# Usage:
-#   z::kv::rename "old_key" "new_key"
-#
-# @param 1: string - Old key
-# @param 2: string - New key
-# @return 0 on success, 1 if old key doesn't exist
-###
+  local _meta_n="_zkv_meta_${handle}"
+  local _store_n="_zkv_store_${handle}"
+  local _lists_n="_zkv_lists_${handle}"
+  local _sets_n="_zkv_sets_${handle}"
+  local _zsets_n="_zkv_zsets_${handle}"
+  local _hashes_n="_zkv_hashes_${handle}"
+
+  _zkv_aget "$_meta_n" "$src"
+  local vtype="${REPLY:-string}"
+  local struct
+
+  _z::kv::structure_of "$vtype"
+  struct="$REPLY"
+
+  # Remove the destination key if it already exists to avoid type collisions.
+  if _zkv_ahas "$_meta_n" "$dst"; then
+    _z::kv::reap_key "$handle" "$dst"
+  fi
+
+  _zkv_aset "$_meta_n" "$dst" "$vtype"
+
+  case "$struct" in
+    string)
+      _zkv_aget "$_store_n" "$src"
+      _zkv_aset "$_store_n" "$dst" "$REPLY"
+      ;;
+
+    list)
+      _zkv_aget "$_lists_n" "$src"
+      _zkv_aset "$_lists_n" "$dst" "$REPLY"
+      ;;
+
+    set)
+      _zkv_aget "$_sets_n" "$src"
+      _zkv_aset "$_sets_n" "$dst" "$REPLY"
+      ;;
+
+    zset)
+      _zkv_aget "$_zsets_n" "$src"
+      _zkv_aset "$_zsets_n" "$dst" "$REPLY"
+      ;;
+
+    hash)
+      # Copy each composite hash field key, substituting the dst prefix.
+      local src_enc dst_enc src_prefix dst_prefix hk field_enc
+
+      _z::kv::encode_value "$src"
+      src_enc="$REPLY"
+
+      _z::kv::encode_value "$dst"
+      dst_enc="$REPLY"
+
+      src_prefix="${src_enc}${_ZKV_RECSEP}"
+      dst_prefix="${dst_enc}${_ZKV_RECSEP}"
+
+      for hk in "${(@Pk)_hashes_n}"; do
+        if [[ $hk == ${src_prefix}* ]]; then
+          field_enc="${hk#${src_prefix}}"
+          _zkv_aget "$_hashes_n" "$hk"
+          _zkv_aset "$_hashes_n" "${dst_prefix}${field_enc}" "$REPLY"
+        fi
+      done
+      ;;
+  esac
+
+  _z::kv::_copy_ttl "$handle" "$src" "$dst" || return $?
+
+  return 0
+}
+
+# z::kv::rename <handle> <old-key> <new-key>
+# Renames <old-key> to <new-key>, replacing any existing <new-key>.
+# No-ops if old == new.
 z::kv::rename() {
   emulate -L zsh
-  local old_key="$1"
-  local new_key="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if ! z::probe::kv "$old_key"; then
-    z::log::error "KV: Cannot rename - key not found: $old_key"
-    return 1
+  local handle="$1" old="$2" new="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$old" "$handle" || return $?
+  _z::kv::validate_key   "$new" "$handle" || return $?
+
+  if ! z::kv::exists "$handle" "$old"; then
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
-  local value=$(z::kv::get "$old_key")
-  local value_type="${_zcore_kv_meta[$old_key]:-string}"
+  if [[ $old == "$new" ]]; then
+    return 0
+  fi
 
-  z::kv::set "$new_key" "$value" --type "$value_type"
-  z::kv::del "$old_key"
+  _z::kv::_copy_key_data "$handle" "$old" "$new" || return $?
+  _z::kv::reap_key "$handle" "$old"
 
-  z::log::debug "KV: Renamed '$old_key' to '$new_key'"
+  (( _zkv_stats_${handle}[writes] += 1 ))
+  (( _zkv_stats_${handle}[deletes] += 1 ))
+
+  _z::kv::trigger_watchers "$handle" "$old" "" "rename_from"
+  _z::kv::trigger_watchers "$handle" "$new" "" "rename_to"
+  _z::kv::auto_persist "$handle"
 
   return 0
 }
 
-###
-# Copy key
-#
-# Usage:
-#   z::kv::copy "source_key" "dest_key"
-#
-# @param 1: string - Source key
-# @param 2: string - Destination key
-# @return 0 on success, 1 if source doesn't exist
-###
+# z::kv::copy <handle> <src-key> <dst-key>
+# Copies <src-key> to <dst-key>, replacing any existing <dst-key>.
 z::kv::copy() {
   emulate -L zsh
-  local source="$1"
-  local dest="$2"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  if ! z::probe::kv "$source"; then
-    z::log::error "KV: Cannot copy - key not found: $source"
-    return 1
+  local handle="$1" src="$2" dst="$3"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$src" "$handle" || return $?
+  _z::kv::validate_key   "$dst" "$handle" || return $?
+
+  if ! z::kv::exists "$handle" "$src"; then
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
-  local value=$(z::kv::get "$source")
-  local value_type="${_zcore_kv_meta[$source]:-string}"
+  _z::kv::_copy_key_data "$handle" "$src" "$dst" || return $?
 
-  z::kv::set "$dest" "$value" --type "$value_type"
+  (( _zkv_stats_${handle}[writes] += 1 ))
 
-  z::log::debug "KV: Copied '$source' to '$dest'"
+  _z::kv::trigger_watchers "$handle" "$dst" "" "copy"
+  _z::kv::auto_persist "$handle"
 
   return 0
 }
 
-###
-# Get random key
-#
-# Usage:
-#   random_key=$(z::kv::randomkey)
-#
-# @stdout Random key name
-# @return 0 if keys exist, 1 if store empty
-###
+
+# =============================================================================
+# SCAN / RANDOM
+# =============================================================================
+
+# z::kv::randomkey <handle>
+# Returns a uniformly random live key via REPLY.
 z::kv::randomkey() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local -a all_keys
-  all_keys=("${(@k)_zcore_kv_store}")
+  local handle="$1"
 
-  if (( ${#all_keys} == 0 )); then
-    return 1
-  fi
+  REPLY=""
 
-  # Get random index
-  typeset -i random_idx
-  (( random_idx = (RANDOM % ${#all_keys}) + 1 ))
+  _z::kv::require_handle "$handle" || return $?
 
-  print -r -- "${all_keys[random_idx]}"
+  local _meta_n="_zkv_meta_${handle}"
+  local -a active
+  local k
+
+  for k in "${(@Pk)_meta_n}"; do
+    _z::kv::check_ttl "$handle" "$k" || continue
+    active+=( "$k" )
+  done
+
+  (( ${#active} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+
+  typeset -i idx
+  (( idx = (RANDOM % ${#active}) + 1 ))
+
+  REPLY="${active[idx]}"
   return 0
 }
 
-###
-# Scan keys with cursor (for large datasets)
-#
-# Usage:
-#   z::kv::scan 0 "user:*" 10  # Get first 10 matching keys
-#
-# @param 1: integer - Cursor (0 to start)
-# @param 2: string - Pattern (optional)
-# @param 3: integer - Count (optional, default: 10)
-# @stdout "cursor key1 key2 ..." (cursor 0 means done)
-# @return 0 always
-###
+# z::kv::scan <handle> [<cursor>] [<pattern>] [<count>]
+# Cursor-based key iteration.  Returns the next cursor in REPLY (0 = done)
+# and the current page of keys in the reply array.
+# cursor=0 starts from the beginning; count controls page size (default: 10).
 z::kv::scan() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" cursor_raw="${2:-0}" pattern="${3:-*}" count_raw="${4:-10}"
+
+  REPLY=0
+  reply=()
+
+  _z::kv::require_handle "$handle"              || return $?
+  z::validate::integer   "$cursor_raw" "cursor" || return $ZBASE_ERROR_INVALID_INPUT
+  z::validate::integer   "$count_raw" "count"   || return $ZBASE_ERROR_INVALID_INPUT
+
   typeset -i cursor count
-  (( cursor = ${1:-0} ))
-  local pattern="${2:-*}"
-  (( count = ${3:-10} ))
+  cursor="$cursor_raw"
+  count="$count_raw"
 
-  local -a all_keys matching_keys
-  all_keys=("${(@k)_zcore_kv_store}")
+  if (( cursor < 0 || count < 1 )); then
+    z::log::error "zkv: invalid scan bounds" cursor "$cursor" count "$count"
+    return $ZBASE_ERROR_INVALID_INPUT
+  fi
 
-  # Filter by pattern
-  local key
-  for key in "${all_keys[@]}"; do
-    if [[ $key == ${~pattern} ]]; then
-      matching_keys+=("$key")
-    fi
+  local _meta_n="_zkv_meta_${handle}"
+  local -a matching
+  local k
+
+  # Collect all matching live keys in a stable (sorted) order.
+  for k in "${(@ko)_meta_n}"; do
+    _z::kv::check_ttl "$handle" "$k" || continue
+    [[ $k == ${~pattern} ]] && matching+=( "$k" )
   done
 
-  typeset -i total start end next_cursor
-  (( total = ${#matching_keys} ))
+  typeset -i total="${#matching}" start end
+
   (( start = cursor + 1 ))
-  (( end = start + count - 1 ))
-  (( end > total )) && (( end = total ))
+  (( end = cursor + count ))
+  (( end > total )) && end="$total"
 
   if (( start > total )); then
-    print "0"
+    REPLY=0
     return 0
   fi
 
-  if (( end >= total )); then
-    (( next_cursor = 0 ))
-  else
-    (( next_cursor = end ))
-  fi
+  # Return 0 as the next cursor when we have reached the end of the key space.
+  REPLY="$(( end >= total ? 0 : end ))"
+  reply=( "${(@)matching[start,end]}" )
 
-  # Output: cursor followed by keys
-  print -n "$next_cursor"
-
-  if (( start <= end )); then
-    local -a result_keys
-    result_keys=("${(@)matching_keys[start,end]}")
-    print -n " ${(j: :)result_keys}"
-  fi
-
-  print ""
   return 0
 }
 
-################################################################################
-# ADVANCED STATISTICS
-################################################################################
 
-###
-# Get memory usage estimate
-#
-# Usage:
-#   z::kv::memory
-#
-# @stdout Memory usage info
-# @return 0 always
-###
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+# z::kv::config <handle> <key> <value>
+# Updates a single configuration parameter for an open store.
+# Validates the value against the parameter's constraints before applying.
+z::kv::config() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2" value="$3"
+
+  _z::kv::require_handle "$handle"           || return $?
+  z::validate::nonempty  "$key" "config_key" || return $ZBASE_ERROR_INVALID_INPUT
+
+  local _cfg_n="_zkv_cfg_${handle}"
+
+  if ! _zkv_ahas "$_cfg_n" "$key"; then
+    z::log::error "zkv: unknown config key" handle "$handle" key "$key"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  case "$key" in
+    auto_persist|enable_ttl)
+      z::validate::enum "0|1" "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      ;;
+
+    max_key_length)
+      z::validate::integer::range "$value" 1 1048576 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      ;;
+
+    max_value_length)
+      z::validate::integer::range "$value" 1 1073741824 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      ;;
+
+    max_snapshots)
+      z::validate::integer::range "$value" 1 1000 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      ;;
+
+    persist_debounce)
+      z::validate::integer::range "$value" 0 86400 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      ;;
+
+    persist_file)
+      z::validate::nonempty "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::probe::path::writable "$value" "$key" || return $ZBASE_ERROR_PERMISSION
+      ;;
+  esac
+
+  _zkv_aset "$_cfg_n" "$key" "$value"
+
+  return 0
+}
+
+
+# =============================================================================
+# PERFORMANCE MODE
+# =============================================================================
+
+# z::kv::enable_performance_mode <handle>
+# Bypasses validation, TTL checks, watchers, and auto-persist for direct
+# string writes (z::kv::set only).  Intended for bulk-load hot paths.
+z::kv::enable_performance_mode() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  _zkv_perf_mode[$handle]=1
+
+  z::log::info "zkv: performance mode enabled" handle "$handle" \
+    note "validation, watchers, TTL checks, and auto-persist are partially bypassed for direct string writes"
+
+  return 0
+}
+
+# z::kv::disable_performance_mode <handle>
+# Restores full validation and side-effect processing for z::kv::set.
+z::kv::disable_performance_mode() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  unset "_zkv_perf_mode[$handle]"
+
+  z::log::info "zkv: performance mode disabled" handle "$handle"
+  return 0
+}
+
+
+# =============================================================================
+# DIAGNOSTICS
+# =============================================================================
+
+# z::kv::stats <handle>
+# Prints a formatted summary of operation counters, key counts, and
+# configuration for the given store.
+z::kv::stats() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _store_n="_zkv_store_${handle}"
+  local _meta_n="_zkv_meta_${handle}"
+  local _lists_n="_zkv_lists_${handle}"
+  local _sets_n="_zkv_sets_${handle}"
+  local _zsets_n="_zkv_zsets_${handle}"
+  local _hashes_n="_zkv_hashes_${handle}"
+  local _wat_n="_zkv_watchers_${handle}"
+  local _locks_n="_zkv_locks_${handle}"
+  local _snaps_n="_zkv_snaps_${handle}"
+  local _stats_n="_zkv_stats_${handle}"
+  local _cfg_n="_zkv_cfg_${handle}"
+  local _state_n="_zkv_state_${handle}"
+
+  typeset -i active=0 expired=0
+  local k
+
+  for k in "${(@Pk)_meta_n}"; do
+    if _z::kv::check_ttl "$handle" "$k"; then
+      (( active += 1 ))
+    else
+      (( expired += 1 ))
+    fi
+  done
+
+  local hit_rate="N/A"
+
+  _zkv_aget "$_stats_n" reads
+  typeset -i _reads="$REPLY"
+
+  _zkv_aget "$_stats_n" hits
+  typeset -i _hits="$REPLY"
+
+  _zkv_aget "$_stats_n" writes
+  typeset -i _writes="$REPLY"
+
+  _zkv_aget "$_stats_n" deletes
+  typeset -i _deletes="$REPLY"
+
+  _zkv_aget "$_stats_n" misses
+  typeset -i _misses="$REPLY"
+
+  _zkv_aget "$_stats_n" expired
+  typeset -i _exp="$REPLY"
+
+  if (( _reads > 0 )); then
+    LC_NUMERIC=C printf -v hit_rate "%.2f%%" "$(( (_hits * 100.0) / _reads ))"
+  fi
+
+  typeset -i snap_count=0
+  local sk
+
+  for sk in "${(@Pk)_snaps_n}"; do
+    [[ $sk == snap_*.label ]] && (( snap_count += 1 ))
+  done
+
+  _zkv_aget "$_cfg_n" auto_persist
+  local _ap_on="$REPLY"
+
+  _zkv_aget "$_cfg_n" persist_file
+  local _pf="$REPLY"
+
+  _zkv_aget "$_cfg_n" persist_debounce
+  local _pd="$REPLY"
+
+  _zkv_aget "$_cfg_n" max_snapshots
+  local _maxsnaps="$REPLY"
+
+  _zkv_aget "$_state_n" dirty
+  local _dirty="$REPLY"
+
+  local persist_str
+
+  if (( _ap_on )); then
+    persist_str="enabled → ${_pf} (debounce ${_pd}s, dirty=${_dirty})"
+  else
+    persist_str="disabled"
+  fi
+
+  local perf_str="no"
+  (( ${+_zkv_perf_mode[$handle]} )) && perf_str="yes"
+
+  local tx_str="idle"
+  _zkv_tx_active "$handle" && tx_str="active"
+
+  _zkv_alen "$_store_n"
+  typeset -i _nstr="$REPLY"
+
+  _zkv_alen "$_lists_n"
+  typeset -i _nlst="$REPLY"
+
+  _zkv_alen "$_sets_n"
+  typeset -i _nset="$REPLY"
+
+  _zkv_alen "$_zsets_n"
+  typeset -i _nzst="$REPLY"
+
+  _zkv_alen "$_hashes_n"
+  typeset -i _nhsh="$REPLY"
+
+  _zkv_alen "$_wat_n"
+  typeset -i _nwat="$REPLY"
+
+  _zkv_alen "$_locks_n"
+  typeset -i _nlk="$REPLY"
+
+  print "\nKV Store Statistics [${handle}]:"
+  print "================================="
+  print "Keys:           ${active} active / ${expired} expired"
+  print "String Keys:    ${_nstr}"
+  print "Lists:          ${_nlst}"
+  print "Sets:           ${_nset}"
+  print "Sorted Sets:    ${_nzst}"
+  print "Hash Fields:    ${_nhsh}"
+  print ""
+  print "Operations:"
+  print "  Reads:        ${_reads}"
+  print "  Writes:       ${_writes}"
+  print "  Deletes:      ${_deletes}"
+  print "  Hits:         ${_hits}"
+  print "  Misses:       ${_misses}"
+  print "  Expired:      ${_exp}"
+  print "  Hit Rate:     ${hit_rate}"
+  print ""
+  print "Watchers:       ${_nwat}"
+  print "Locks:          ${_nlk}"
+  print "Snapshots:      ${snap_count} / ${_maxsnaps}"
+  print "Transaction:    ${tx_str}"
+  print "Perf Mode:      ${perf_str}"
+  print "Auto-persist:   ${persist_str}"
+  print ""
+
+  return 0
+}
+
+# z::kv::size <handle>
+# Returns the count of live (non-expired) keys via REPLY.
+z::kv::size() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  REPLY=0
+
+  _z::kv::require_handle "$handle" || return $?
+
+  local _meta_n="_zkv_meta_${handle}"
+  typeset -i count=0
+  local k
+
+  for k in "${(@Pk)_meta_n}"; do
+    _z::kv::check_ttl "$handle" "$k" || continue
+    (( count += 1 ))
+  done
+
+  REPLY="$count"
+  return 0
+}
+
+# z::kv::memory <handle>
+# Prints a breakdown of approximate memory usage (character-byte counts) for
+# each structure map and a human-readable total.
 z::kv::memory() {
   emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  print "\nKV Memory Usage:"
-  print "================"
+  local handle="$1"
 
-  typeset -i total_bytes=0
+  _z::kv::require_handle "$handle" || return $?
 
-  # Calculate store size
-  typeset -i store_bytes=0
-  local key value
-  for key value in "${(@kv)_zcore_kv_store}"; do
-    (( store_bytes += ${#key} + ${#value} ))
+  typeset -i sb=0 lb=0 setb=0 zsetb=0 hb=0 mb=0 tot=0
+
+  local _store_n="_zkv_store_${handle}"
+  local _meta_n="_zkv_meta_${handle}"
+  local _lists_n="_zkv_lists_${handle}"
+  local _sets_n="_zkv_sets_${handle}"
+  local _zsets_n="_zkv_zsets_${handle}"
+  local _hashes_n="_zkv_hashes_${handle}"
+
+  local -a _pairs
+  typeset -i _i
+
+  # Sum key + value byte lengths for each map.
+  _pairs=( "${(@Pkv)_store_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( sb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
   done
 
-  # Calculate lists size
-  typeset -i lists_bytes=0
-  for key value in "${(@kv)_zcore_kv_lists}"; do
-    (( lists_bytes += ${#key} + ${#value} ))
+  _pairs=( "${(@Pkv)_meta_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( mb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
   done
 
-  # Calculate sets size
-  typeset -i sets_bytes=0
-  for key value in "${(@kv)_zcore_kv_sets}"; do
-    (( sets_bytes += ${#key} + ${#value} ))
+  _pairs=( "${(@Pkv)_lists_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( lb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
   done
 
-  # Calculate zsets size
-  typeset -i zsets_bytes=0
-  for key value in "${(@kv)_zcore_kv_zsets}"; do
-    (( zsets_bytes += ${#key} + ${#value} ))
+  _pairs=( "${(@Pkv)_sets_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( setb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
   done
 
-  # Calculate hashes size
-  typeset -i hashes_bytes=0
-  for key value in "${(@kv)_zcore_kv_hashes}"; do
-    (( hashes_bytes += ${#key} + ${#value} ))
+  _pairs=( "${(@Pkv)_zsets_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( zsetb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
   done
 
-  (( total_bytes = store_bytes + lists_bytes + sets_bytes + zsets_bytes + hashes_bytes ))
+  _pairs=( "${(@Pkv)_hashes_n}" )
+  for (( _i = 1; _i <= ${#_pairs}; _i += 2 )); do
+    (( hb += ${#_pairs[_i]} + ${#_pairs[_i+1]} ))
+  done
 
-  print "Store:        ${store_bytes} bytes (${#_zcore_kv_store} keys)"
-  print "Lists:        ${lists_bytes} bytes (${#_zcore_kv_lists} lists)"
-  print "Sets:         ${sets_bytes} bytes (${#_zcore_kv_sets} sets)"
-  print "Sorted Sets:  ${zsets_bytes} bytes (${#_zcore_kv_zsets} zsets)"
-  print "Hashes:       ${hashes_bytes} bytes (${#_zcore_kv_hashes} hashes)"
-  print "Total:        ${total_bytes} bytes"
+  (( tot = sb + mb + lb + setb + zsetb + hb ))
 
-  # Human readable
-  typeset -F kb mb
-  (( kb = total_bytes / 1024.0 ))
-  (( mb = kb / 1024.0 ))
+  local human
 
-  if (( mb >= 1 )); then
-    printf "              %.2f MB\n" "$mb"
-  elif (( kb >= 1 )); then
-    printf "              %.2f KB\n" "$kb"
+  if (( tot >= 1048576 )); then
+    LC_NUMERIC=C printf -v human "%.2f MB" "$(( tot / 1048576.0 ))"
+  elif (( tot >= 1024 )); then
+    LC_NUMERIC=C printf -v human "%.2f KB" "$(( tot / 1024.0 ))"
+  else
+    printf -v human "%d bytes" "$tot"
   fi
+
+  _zkv_alen "$_store_n"
+  typeset -i _nstr="$REPLY"
+
+  _zkv_alen "$_lists_n"
+  typeset -i _nlst="$REPLY"
+
+  _zkv_alen "$_sets_n"
+  typeset -i _nset="$REPLY"
+
+  _zkv_alen "$_zsets_n"
+  typeset -i _nzst="$REPLY"
+
+  _zkv_alen "$_hashes_n"
+  typeset -i _nhsh="$REPLY"
+
+  print "\nKV Memory Usage [${handle}]:"
+  print "============================="
+  print "Meta:         ${mb} bytes"
+  print "Store:        ${sb} bytes  (${_nstr} keys)"
+  print "Lists:        ${lb} bytes  (${_nlst} lists)"
+  print "Sets:         ${setb} bytes  (${_nset} sets)"
+  print "Sorted Sets:  ${zsetb} bytes  (${_nzst} zsets)"
+  print "Hashes:       ${hb} bytes  (${_nhsh} fields)"
+  print "Total:        ${tot} bytes  (${human})"
+  print ""
+
+  return 0
+}
+
+# z::kv::info <handle> <key>
+# Prints structure, type, TTL, and size/length information for a single key.
+z::kv::info() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1" key="$2"
+
+  _z::kv::require_handle "$handle"        || return $?
+  _z::kv::validate_key   "$key" "$handle" || return $?
+
+  print "\nKey Information [${handle}]: ${key}"
+  print "======================================="
+
+  local _meta_n="_zkv_meta_${handle}"
+
+  if ! _zkv_ahas "$_meta_n" "$key"; then
+    print "Key not found.\n"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  _zkv_aget "$_meta_n" "$key"
+  local vtype="$REPLY"
+  local struct
+
+  _z::kv::structure_of "$vtype"
+  struct="$REPLY"
+
+  z::kv::ttl "$handle" "$key"
+  local ttl_val="$REPLY" ttl_str
+
+  case "$ttl_val" in
+    -1) ttl_str="no expiration" ;;
+    -2) ttl_str="key not found" ;;
+     0) ttl_str="expired" ;;
+     *) ttl_str="${ttl_val}s remaining" ;;
+  esac
+
+  print "Structure:  ${struct}"
+  print "Data Type:  ${vtype}"
+  print "TTL:        ${ttl_str}"
+
+  case "$struct" in
+    string)
+      _zkv_aget "_zkv_store_${handle}" "$key"
+      local val="$REPLY"
+      print "Value:      ${val}"
+      print "Size:       ${#val} bytes"
+      ;;
+
+    list)
+      z::kv::llen "$handle" "$key"
+      print "Length:     ${REPLY}"
+      ;;
+
+    set)
+      z::kv::scard "$handle" "$key"
+      print "Cardinality: ${REPLY}"
+      ;;
+
+    zset)
+      z::kv::zcard "$handle" "$key"
+      print "Members:    ${REPLY}"
+      ;;
+
+    hash)
+      z::kv::hlen "$handle" "$key"
+      print "Fields:     ${REPLY}"
+      ;;
+  esac
 
   print ""
   return 0
 }
 
-###
-# Get detailed info about a key
-#
-# Usage:
-#   z::kv::info "mykey"
-#
-# @param 1: string - Key name
-# @return 0 if found, 1 if not found
-###
-z::kv::info() {
+# z::kv::export <handle>
+# Prints a human-readable dump of all live keys and their values to stdout.
+z::kv::export() {
   emulate -L zsh
-  local key="$1"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  print "\nKey Information: $key"
-  print "===================="
+  local handle="$1"
 
-  # Check in store
-  if (( ${+_zcore_kv_store[$key]} )); then
-    local value="${_zcore_kv_store[$key]}"
-    local value_type="${_zcore_kv_meta[$key]:-string}"
+  _z::kv::require_handle "$handle" || return $?
 
-    print "Type:       string/value"
-    print "Data Type:  $value_type"
-    print "Value:      $value"
-    print "Size:       ${#value} bytes"
+  z::log::get_timestamp "human"
+  local ts="$REPLY"
 
-    local ttl_val=$(z::kv::ttl "$key")
-    if [[ $ttl_val == -1 ]]; then
-      print "TTL:        No expiration"
-    elif [[ $ttl_val == -2 ]]; then
-      print "TTL:        Key not found"
-    else
-      print "TTL:        ${ttl_val}s remaining"
-    fi
+  print "# zkv export [${handle}] — ${ts}"
+  print ""
 
-    print ""
-    return 0
-  fi
+  local _meta_n="_zkv_meta_${handle}"
+  local k vtype struct
 
-  # Check in lists
-  if (( ${+_zcore_kv_lists[$key]} )); then
-    local list_data="${_zcore_kv_lists[$key]}"
-    local -a items
-    items=("${(@s:|:)list_data}")
+  for k in "${(@Pko)_meta_n}"; do
+    _z::kv::check_ttl "$handle" "$k" || continue
 
-    print "Type:       list"
-    print "Length:     ${#items}"
-    print "Size:       ${#list_data} bytes"
-    print ""
-    return 0
-  fi
+    _zkv_aget "$_meta_n" "$k"
+    vtype="${REPLY:-string}"
 
-  # Check in sets
-  if (( ${+_zcore_kv_sets[$key]} )); then
-    local set_data="${_zcore_kv_sets[$key]}"
-    local -a members
-    members=("${(@s:|:)set_data}")
+    _z::kv::structure_of "$vtype"
+    struct="$REPLY"
 
-    print "Type:       set"
-    print "Cardinality: ${#members}"
-    print "Size:       ${#set_data} bytes"
-    print ""
-    return 0
-  fi
+    case "$struct" in
+      string)
+        z::kv::get "$handle" "$k" || continue
+        print "${k} (${vtype}) = ${REPLY}"
+        ;;
 
-  # Check in zsets
-  if (( ${+_zcore_kv_zsets[$key]} )); then
-    local zset_data="${_zcore_kv_zsets[$key]}"
-    local -a items
-    items=("${(@s:|:)zset_data}")
+      list)
+        z::kv::lrange "$handle" "$k" 0 -1
+        print "${k} (list) = [${(pj:, :)reply}]"
+        ;;
 
-    print "Type:       sorted set"
-    print "Members:    ${#items}"
-    print "Size:       ${#zset_data} bytes"
-    print ""
-    return 0
-  fi
+      set)
+        z::kv::smembers "$handle" "$k"
+        print "${k} (set) = {${(pj:, :)reply}}"
+        ;;
 
-  # Check in hashes
-  typeset -i hash_fields=0
-  local hash_key
-  for hash_key in "${(@k)_zcore_kv_hashes}"; do
-    if [[ $hash_key == ${key}.* ]]; then
-      (( hash_fields += 1 ))
-    fi
+      zset)
+        z::kv::zrange_withscores "$handle" "$k" 0 -1
+        print "${k} (zset) = ${reply[*]}"
+        ;;
+
+      hash)
+        z::kv::hgetall "$handle" "$k"
+        print "${k} (hash) = ${reply[*]}"
+        ;;
+    esac
   done
 
-  if (( hash_fields > 0 )); then
-    print "Type:       hash"
-    print "Fields:     $hash_fields"
-    print ""
+  return 0
+}
+
+# z::kv::reset_stats <handle>
+# Resets all operation counters to zero.
+z::kv::reset_stats() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local handle="$1"
+
+  _z::kv::require_handle "$handle" || return $?
+
+  eval "_zkv_stats_${handle}=( [reads]=0 [writes]=0 [deletes]=0 [hits]=0 [misses]=0 [expired]=0 )"
+
+  return 0
+}
+
+# z::kv::list_handles
+# Prints all open store handles with their key count and configuration summary.
+# Also populates the reply array with the handle names.
+z::kv::list_handles() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  reply=( "${(@k)_zkv_handles}" )
+
+  print "\nOpen KV Stores:"
+  print "==============="
+
+  if (( ${#_zkv_handles} == 0 )); then
+    print "  None.\n"
     return 0
   fi
 
-  print "Key not found in any data structure.\n"
-  return 1
+  local h _cfg_n _meta_n perf
+  typeset -i _nkeys _ttlon _apon
+
+  for h in "${(@k)_zkv_handles}"; do
+    _cfg_n="_zkv_cfg_${h}"
+    _meta_n="_zkv_meta_${h}"
+
+    _zkv_alen "$_meta_n"
+    _nkeys="$REPLY"
+
+    _zkv_aget "$_cfg_n" enable_ttl
+    _ttlon="$REPLY"
+
+    _zkv_aget "$_cfg_n" auto_persist
+    _apon="$REPLY"
+
+    perf="no"
+    (( ${+_zkv_perf_mode[$h]} )) && perf="yes"
+
+    print "  ${h}  (keys=${_nkeys}, ttl=${_ttlon}, persist=${_apon}, perf=${perf})"
+  done
+
+  print ""
+  return 0
 }
