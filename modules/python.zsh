@@ -237,7 +237,6 @@ __z::mod::python::activate_venv_script()
 __z::mod::python::setup_aliases()
 {
   emulate -L zsh
-  
 
   local -i error_count=0
 
@@ -326,8 +325,6 @@ z::mod::pyenv::create()
   local venv_name="${1:-.venv}"
   local python_version="${2:-}"
 
-  
-
   # Detect project type
   local project_type
   project_type=$(__z::mod::python::detect_project_type)
@@ -409,8 +406,6 @@ z::mod::pyenv::activate()
 {
   emulate -L zsh
   local venv_path="${1:-}"
-
-  
 
   if [[ -n "$VIRTUAL_ENV" ]]; then
     z::log::info "Already in virtual environment: $(basename "$VIRTUAL_ENV")"

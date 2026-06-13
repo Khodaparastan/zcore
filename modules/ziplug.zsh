@@ -52,9 +52,9 @@ __z::mod::zi::install() {
       z::log::debug "zinit already installed; sourced from: $ZINIT_HOME"
       return 0
     fi
-      z::log::error "Found zinit at $ZINIT_SCRIPT but failed to source it."
-      return 1
-    fi
+    z::log::error "Found zinit at $ZINIT_SCRIPT but failed to source it."
+    return 1
+  fi
 
   # ── Fresh install ────────────────────────────────────────────────────────
   z::log::info "zinit not found — attempting installation..."
@@ -86,8 +86,8 @@ __z::mod::zi::install() {
     z::log::info "zinit installed and sourced successfully."
     return 0
   fi
-    z::log::error "Failed to source newly installed zinit script."
-    return 1
+  z::log::error "Failed to source newly installed zinit script."
+  return 1
 }
 
 ###
