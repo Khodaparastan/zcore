@@ -1,1589 +1,1456 @@
-#!/usr/bin/env zsh
-# =============================================================================
-# zbase — z::opt  &  z::probe
+##############################################################################
+# Binary separator constants
+# Public contract — consumed by zkv, zbus, and any component that needs
+# binary-safe field/record encoding.
 #
-# Description:
-#   Option parsing, input validation, filesystem probing, command/function
-#   introspection, variable management, environment management, and execution
-#   safety scanning utilities for the zbase framework.
+# Chosen from C0 control range: outside printable ASCII, extremely unlikely
+# in real-world values, and safely round-tripped through zsh string ops.
 #
-# Usage:
-#   Source this file from within a zsh session or framework loader:
-#     source /path/to/zbase.zsh
+#   Z_SEP    \x01  US  — unit separator      (field delimiter)
+#   Z_RECSEP \x02  STX — start of text       (record delimiter)
+#   Z_ESC    \x03  ETX — end of text         (escape prefix)
+##############################################################################
+typeset -gr Z_SEP=$'\x01'
+typeset -gr Z_RECSEP=$'\x02'
+typeset -gr Z_ESC=$'\x03'
+
+(( ${+_ZBASE_LOADED} )) && { return 0 2>/dev/null || exit 0; }
+if (( ! ${+functions[z::log::error]} )); then
+    print -u2 "zbase: fatal: zlog must be sourced before zbase"
+    return 1 2>/dev/null || exit 1
+fi
+
+typeset -gi ZBASE_ERROR_GENERAL=1
+typeset -gi ZBASE_ERROR_INVALID_INPUT=2
+typeset -gi ZBASE_ERROR_NOT_FOUND=3
+typeset -gi ZBASE_ERROR_PERMISSION=4
+typeset -gi ZCORE_ERROR_GENERAL=$ZBASE_ERROR_GENERAL
+typeset -gi ZCORE_ERROR_INVALID_INPUT=$ZBASE_ERROR_INVALID_INPUT
+typeset -gi ZCORE_ERROR_NOT_FOUND=$ZBASE_ERROR_NOT_FOUND
+typeset -gi ZCORE_ERROR_PERMISSION=$ZBASE_ERROR_PERMISSION
+
+# ---------------------------------------------------------------------------
+# z::result convention
 #
-# Conventions:
-#   - Functions that return a value set $REPLY.
-#     Callers MUST read $REPLY — never use $() on these functions.
-#   - Internal (private) functions are prefixed with _z::
-#   - Debug-only log calls are guarded with z::log::if_debug to eliminate
-#     overhead when debug logging is disabled.
-#   - Variable values that may contain secrets are never logged.
-#   - Silent boolean probes (z::probe::file, z::probe::dir, z::probe::readable,
-#     z::probe::writable) emit no errors — callers decide how to handle failure.
+# Every public function that produces a value uses these globals as its return
+# channel.  Callers must read the relevant variable immediately after the call
+# and before calling any other zbase function (which may overwrite it).
 #
-# Dependencies:
-#   z::log::error  z::log::warn  z::log::info  z::log::debug
-#   z::log::errorf z::log::debugf
-#   z::log::if_debug  z::log::rate_limit  z::log::once  z::log::always
-#   z::log::with_context  z::log::remove_context
-#   z::log::benchmark_start  z::log::benchmark_end
-#   Zsh 5.8+
+#   REPLY   — scalar result (string / integer).  Set to "" on entry.
+#             On error REPLY is reset to "" (or the caller-supplied default).
 #
-# No dependency on z::config, z::kv, z::sys, z::event, or any other module.
+#   reply   — array result.  Set to () on entry of every list-returning
+#             function.  Scalar-returning functions also reset reply=() on
+#             entry so that a stale array is never inherited by the caller.
 #
-# Author: Khodaparastan
-# Date:   2026-04-21
-# =============================================================================
-
-# =============================================================================
-# ERROR CODES
+#   REPLY2  — optional secondary scalar (e.g. a detail string alongside the
+#             primary result).  Set to "" on entry.  Only populated when the
+#             function documents it explicitly.
 #
-# Defined as integer constants so that `return $ZCORE_ERROR_*` always
-# produces a non-zero exit status even when the variable is referenced
-# before this file is sourced (the typeset -gi ensures global scope).
-# =============================================================================
+# Functions that never produce a value (pure predicates, setters, etc.) do
+# not touch REPLY / reply / REPLY2.
+# ---------------------------------------------------------------------------
 
-typeset -gi ZCORE_ERROR_GENERAL=1
-typeset -gi ZCORE_ERROR_INVALID_INPUT=2
-typeset -gi ZCORE_ERROR_NOT_FOUND=3
-typeset -gi ZCORE_ERROR_PERMISSION=4
+typeset -g  _ZBASE_VERSION='1.0.1'
+typeset -gi _ZBASE_SYMLINK_MAX_ITER=40
+typeset -gi _ZBASE_EXEC_TIMEOUT_DEFAULT=30
+typeset -gi _ZBASE_EXEC_TIMEOUT_MAX=3600
+typeset -gi _ZBASE_PERF_MODE=0
+typeset -gi _ZBASE_ASYNC_MAX_PIDS=50
 
-# =============================================================================
-# SECTION 1 — OPTION PARSING  (z::opt::*)
-# =============================================================================
+if (( ! ${+_ZBASE_EXEC_INIT_CMD_RE} )); then
+    typeset -g _ZBASE_EXEC_INIT_CMD_RE='(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)'
+    typeset -g _ZBASE_EXEC_META_RE='[;&()]'
+    typeset -g _ZBASE_EXEC_FORK_BOMB_1_RE=':\(\)'
+    typeset -g _ZBASE_EXEC_FORK_BOMB_2_RE=':\|:'
+fi
 
-###
-# Get an option value from a zparseopts-produced associative array.
+(( ${+_ZBASE_ASYNC_PIDS} )) || typeset -ga _ZBASE_ASYNC_PIDS=()
+
+typeset -gi _ZBASE_HAVE_ZSTAT=0
+zmodload zsh/stat 2>/dev/null && _ZBASE_HAVE_ZSTAT=1
+
+typeset -g _ZBASE_TIMEOUT_CMD=""
+if (( ${+commands[gtimeout]} )); then
+    _ZBASE_TIMEOUT_CMD="${commands[gtimeout]}"
+elif (( ${+commands[timeout]} )); then
+    _ZBASE_TIMEOUT_CMD="${commands[timeout]}"
+fi
+##############################################################################
+# z::time::* — epoch time primitives
 #
-# Short option takes precedence over long when both are present.
-# Presence is tracked with an explicit matched flag — never by comparing
-# the resolved value against the default (which would break when the user
-# supplies a value that happens to equal the default).
-#
-# @param 1: string  - Name of the local -A array (not the array itself)
-# @param 2: string  - Short flag letter WITHOUT dash, e.g. "t"; may be ""
-# @param 3: string  - Long  flag name  WITHOUT dashes, e.g. "type"; may be ""
-# @param 4: string  - Default value when flag is absent (default: "")
-# @sets  REPLY      - Resolved option value
-# @return 0 always
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- t: -type:
-#   z::opt::get opts 't' 'type' 'text'
-#   local fmt="$REPLY"
-###
-z::opt::get() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+# Lives in zbase. Zero-dep, REPLY-based, no fork on the hot path when
+# zsh/datetime is loaded.
+##############################################################################
 
-  local opts_var="$1" short_opt="$2" long_opt="$3" default_value="${4:-}"
-  REPLY="$default_value"
+zmodload zsh/datetime 2>/dev/null
 
-  if [[ -z $opts_var ]]; then
-    z::log::error "z::opt::get: opts_var parameter required" \
-      param "opts_var"
-    return 0
-  fi
-
-  # Warn when both flags are empty — likely a caller mistake
-  if [[ -z $short_opt && -z $long_opt ]]; then
-    z::log::warn "z::opt::get: both short_opt and long_opt are empty; returning default" \
-      opts_var "$opts_var"
-    return 0
-  fi
-
-  # Verify the named variable exists and is an associative array
-  if (( ! ${(P)+opts_var} )) || [[ ${(Pt)opts_var} != *association* ]]; then
-    return 0
-  fi
-
-  local matched=0
-
-  # Short option has higher precedence.
-  # ${+assoc[key]} — 1 if key exists in the associative array, 0 otherwise.
-  # This is the correct O(1) key-existence check for assoc arrays.
-  if [[ -n $short_opt ]] && (( ${+${(P)opts_var}[-${short_opt}]} )); then
-    REPLY="${${(P)opts_var}[-${short_opt}]}"
-    matched=1
-  fi
-
-  # Long option — only when short did not match
-  if (( !matched )) && [[ -n $long_opt ]] && (( ${+${(P)opts_var}[--${long_opt}]} )); then
-    REPLY="${${(P)opts_var}[--${long_opt}]}"
-  fi
-
-  return 0
-}
-
-###
-# Test whether a flag is present in a zparseopts-produced associative array.
-#
-# Uses ${+assoc[key]} for direct key-existence check on the associative array —
-# O(1), no full-array copy required.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: string  - Short flag letter WITHOUT dash; may be ""
-# @param 3: string  - Long  flag name  WITHOUT dashes; may be ""
-# @return 0 if present, 1 if absent
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- f -force
-#   if z::opt::has opts 'f' 'force'; then
-#     echo "force is set"
-#   fi
-###
-z::opt::has() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local opts_var="$1" short_opt="$2" long_opt="$3"
-
-  if [[ -z $opts_var ]]; then
-    z::log::error "z::opt::has: opts_var parameter required" \
-      param "opts_var"
-    return 1
-  fi
-
-  if (( ! ${(P)+opts_var} )) || [[ ${(Pt)opts_var} != *association* ]]; then
-    return 1
-  fi
-
-  # ${+assoc[key]} — correct O(1) key-existence check for associative arrays
-  if [[ -n $short_opt ]] && (( ${+${(P)opts_var}[-${short_opt}]} )); then
-    return 0
-  fi
-
-  if [[ -n $long_opt ]] && (( ${+${(P)opts_var}[--${long_opt}]} )); then
-    return 0
-  fi
-
-  return 1
-}
-
-###
-# Parse a generic boolean flag: present → 1, absent → 0.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: string  - Short flag letter WITHOUT dash
-# @param 3: string  - Long  flag name  WITHOUT dashes
-# @sets  REPLY      - "1" if present, "0" if absent
-# @return 0 always
-# @note   Validation errors from z::opt::has are treated as "flag absent" (REPLY=0).
-#
-# @example
-#   local -A opts
-#   zparseopts -D -E -A opts -- r -recursive
-#   z::opt::parse::bool opts 'r' 'recursive'
-#   typeset -i recursive=$REPLY
-###
-z::opt::parse::bool() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  if z::opt::has "${1:-}" "${2:-}" "${3:-}"; then
-    REPLY=1
+##############################################################################
+# z::time::epoch
+#   Sets REPLY to current Unix epoch in seconds.
+##############################################################################
+z::time::epoch() {
+  if (( ${+EPOCHSECONDS} )); then
+    REPLY=$EPOCHSECONDS
   else
-    REPLY=0
+    REPLY=$(date +%s)
   fi
-
-  return 0
 }
 
-# ---------------------------------------------------------------------------
-# Internal helper — shared implementation for all single-flag boolean helpers.
-#
-# @param 1: string  - opts_var name
-# @param 2: string  - short flag (without dash)
-# @param 3: string  - long  flag (without dashes)
-# @param 4: int     - default value: must be 0 or 1
-# @param 5: string  - caller name for error messages
-# @sets  REPLY      - resolved integer value: 0 or 1
-# @return 0 always
-# ---------------------------------------------------------------------------
-_z::opt::parse::flag() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local opts_var="$1" short_flag="$2" long_flag="$3"
-  local caller_name="${5:-z::opt::parse::flag}"
-  local raw_default="${4:-0}"
-
-  # Validate that the default is strictly 0 or 1 — silent coercion masks bugs
-  if [[ $raw_default != 0 && $raw_default != 1 ]]; then
-    z::log::warn "${caller_name}: default value must be 0 or 1, got '${raw_default}'; using 0" \
-      caller "$caller_name" \
-      default "$raw_default"
-    raw_default=0
+##############################################################################
+# z::time::epoch_ms
+#   Sets REPLY to current Unix epoch in milliseconds.
+#   Exact integer via string composition (avoids float precision loss).
+##############################################################################
+z::time::epoch_ms() {
+  if (( ${+EPOCHREALTIME} )); then
+    local er=$EPOCHREALTIME
+    local sec=${er%.*}
+    local frac=${er#*.}
+    # EPOCHREALTIME has 6-digit microsecond fraction; defensive pad.
+    while (( ${#frac} < 6 )); do frac="${frac}0"; done
+    REPLY="${sec}${frac[1,3]}"
+  else
+    REPLY=$(date +%s%3N 2>/dev/null) || REPLY=$(( $(date +%s) * 1000 ))
   fi
+}
 
-  typeset -i flag_val
-  (( flag_val = raw_default ))
+##############################################################################
+# z::time::epoch_ns
+#   Sets REPLY to current Unix epoch in nanoseconds.
+#   zsh EPOCHREALTIME has microsecond precision; the last three ns digits
+#   are always 000.
+##############################################################################
+z::time::epoch_ns() {
+  if (( ${+EPOCHREALTIME} )); then
+    local er=$EPOCHREALTIME
+    local sec=${er%.*}
+    local frac=${er#*.}
+    while (( ${#frac} < 6 )); do frac="${frac}0"; done
+    REPLY="${sec}${frac}000"
+  else
+    REPLY=$(date +%s%N 2>/dev/null) \
+      || REPLY="$(( $(date +%s) * 1000000000 ))"
+  fi
+}
 
-  if [[ -z $opts_var ]]; then
-    z::log::error "${caller_name}: opts_var parameter required" \
-      param "opts_var"
+##############################################################################
+# z::time::monotonic_ms
+#   Sets REPLY to milliseconds since an arbitrary fixed point (process start).
+#   Useful for benchmarks where wall-clock jumps would corrupt measurements.
+#   Falls back to epoch_ms when CLOCK_MONOTONIC isn't accessible from zsh.
+##############################################################################
+z::time::monotonic_ms() {
+  # zsh has no native monotonic clock; SECONDS is wall-clock too.
+  # Best we can do without a C helper is epoch_ms. Document the limitation.
+  z::time::epoch_ms
+}
+
+_z::opt::is_assoc() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+    local opts_var="${1:-}"
+
+    [[ -n $opts_var ]] || return 1
+    [[ $opts_var == [[:alpha:]_][[:alnum:]_]# ]] || return 1
+    (( ${+parameters[$opts_var]} )) || return 1
+    [[ ${(Pt)opts_var} == *association* ]]
+}
+
+z::opt::get() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+    local opts_var="${1:-}" short_opt="${2:-}" long_opt="${3:-}" default_value="${4:-}"
+    local matched=0
+    local _sk _lk
+    local -A _opts
+
+    REPLY="$default_value"
+    REPLY2=""
+    reply=()
+
+    if [[ -z $opts_var ]]; then
+        z::log::error "z::opt::get: opts_var parameter required" param "opts_var"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+
+    if [[ -z $short_opt && -z $long_opt ]]; then
+        z::log::warn "z::opt::get: both short_opt and long_opt are empty; returning default" \
+            opts_var "$opts_var"
+        return 0
+    fi
+
+    if ! _z::opt::is_assoc "$opts_var"; then
+        if (( ! ${+parameters[$opts_var]} )); then
+            z::log::debug "z::opt::get: opts_var does not exist" opts_var "$opts_var"
+        else
+            z::log::debug "z::opt::get: opts_var is not an associative array" \
+                opts_var "$opts_var" type "${(Pt)opts_var}"
+        fi
+        return 0
+    fi
+
+    _opts=( "${(@kvP)opts_var}" )
+
+    _sk="-${short_opt}"
+    _lk="--${long_opt}"
+
+    if [[ -n $short_opt && -n ${_opts[$_sk]+x} ]]; then
+        REPLY="${_opts[$_sk]}"
+        matched=1
+    elif [[ -n $long_opt && -n ${_opts[$_lk]+x} ]]; then
+        REPLY="${_opts[$_lk]}"
+        matched=1
+    fi
+
+    if z::log::if_debug; then
+        local _saved_reply="$REPLY"
+        z::log::debug "z::opt::get resolved" \
+            opts_var  "$opts_var" \
+            short_opt "${short_opt:--}" \
+            long_opt  "${long_opt:--}" \
+            matched   "$matched"
+        REPLY="$_saved_reply"
+    fi
+
+    return 0
+}
+
+z::opt::has() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+    local opts_var="${1:-}" short_opt="${2:-}" long_opt="${3:-}"
+    local _sk _lk
+    local -A _opts
+
+    if [[ -z $opts_var ]]; then
+        z::log::error "z::opt::has: opts_var parameter required" param "opts_var"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+
+    if [[ -z $short_opt && -z $long_opt ]]; then
+        return 1
+    fi
+
+    if ! _z::opt::is_assoc "$opts_var"; then
+        return 1
+    fi
+
+    _opts=( "${(@kvP)opts_var}" )
+
+    _sk="-${short_opt}"
+    _lk="--${long_opt}"
+
+    [[ -n $short_opt && -n ${_opts[$_sk]+x} ]] && return 0
+    [[ -n $long_opt  && -n ${_opts[$_lk]+x} ]] && return 0
+
+    return 1
+}
+
+z::opt::parse::bool() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    if z::opt::has "${1:-}" "${2:-}" "${3:-}"; then
+        REPLY=1
+    else
+        REPLY=0
+    fi
+    return 0
+}
+
+_z::opt::parse::flag() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local opts_var="$1" short_flag="$2" long_flag="$3"
+    local raw_default="${4:-0}"
+    local caller_name="${5:-z::opt::parse::flag}"
+    if [[ $raw_default != 0 && $raw_default != 1 ]]; then
+        z::log::warn "${caller_name}: default value must be 0 or 1, got '${raw_default}'; using 0" \
+            caller "$caller_name" default "$raw_default"
+        raw_default=0
+    fi
+    typeset -i flag_val=$raw_default
+    if [[ -z $opts_var ]]; then
+        z::log::error "${caller_name}: opts_var parameter required" param "opts_var"
+        REPLY=$flag_val
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    if z::opt::has "$opts_var" "$short_flag" "$long_flag"; then
+        flag_val=1
+    fi
     REPLY=$flag_val
     return 0
-  fi
-
-  if z::opt::has "$opts_var" "$short_flag" "$long_flag"; then
-    (( flag_val = 1 ))
-  fi
-
-  REPLY=$flag_val
-  return 0
 }
 
-###
-# Parse --force / -f.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: int     - Default value when flag absent (default: 0); must be 0 or 1
-# @sets  REPLY      - 0 or 1
-# @return 0 always
-###
-z::opt::parse::force() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  _z::opt::parse::flag "$1" 'f' 'force' "${2:-0}" 'z::opt::parse::force'
-}
+z::opt::parse::force()   { _z::opt::parse::flag "$1" 'f' 'force'   "${2:-0}" 'z::opt::parse::force'; }
+z::opt::parse::dryrun()  { _z::opt::parse::flag "$1" 'n' 'dry-run' "${2:-0}" 'z::opt::parse::dryrun'; }
+z::opt::parse::verbose() { _z::opt::parse::flag "$1" 'v' 'verbose' "${2:-0}" 'z::opt::parse::verbose'; }
+z::opt::parse::quiet()   { _z::opt::parse::flag "$1" 'q' 'quiet'   "${2:-0}" 'z::opt::parse::quiet'; }
 
-###
-# Parse --dry-run / -n.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: int     - Default value when flag absent (default: 0); must be 0 or 1
-# @sets  REPLY      - 0 or 1
-# @return 0 always
-###
-z::opt::parse::dryrun() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  _z::opt::parse::flag "$1" 'n' 'dry-run' "${2:-0}" 'z::opt::parse::dryrun'
-}
-
-###
-# Parse --verbose / -v.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: int     - Default value when flag absent (default: 0); must be 0 or 1
-# @sets  REPLY      - 0 or 1
-# @return 0 always
-###
-z::opt::parse::verbose() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  _z::opt::parse::flag "$1" 'v' 'verbose' "${2:-0}" 'z::opt::parse::verbose'
-}
-
-###
-# Parse --quiet / -q.
-#
-# @param 1: string  - Name of the local -A array
-# @param 2: int     - Default value when flag absent (default: 0); must be 0 or 1
-# @sets  REPLY      - 0 or 1
-# @return 0 always
-###
-z::opt::parse::quiet() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  _z::opt::parse::flag "$1" 'q' 'quiet' "${2:-0}" 'z::opt::parse::quiet'
-}
-
-# =============================================================================
-# SECTION 2 — VALIDATION  (z::validate::*)
-# =============================================================================
-
-###
-# Validate an identifier name.
-# Accepted characters: alphanumeric, underscore, hyphen  [[:alnum:]_-]
-#
-# @param 1: string  - Name to validate
-# @param 2: string  - Context label for error messages (default: "Identifier")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::validate::identifier "$alias_name" "Alias name" || return 1
-###
 z::validate::identifier() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local name="$1" context="${2:-Identifier}"
-
-  if [[ -z $name ]]; then
-    z::log::errorf "%s cannot be empty" "$context" \
-      field "$context"
-    return 1
-  fi
-
-  # [[:alnum:]_-]## — extendedglob: one or more of the allowed character class
-  if [[ $name != [[:alnum:]_-]## ]]; then
-    z::log::error "Invalid ${context}" \
-      field   "$context"               \
-      value   "$name"                  \
-      allowed "alphanumeric, underscore, hyphen"
-    return 1
-  fi
-
-  return 0
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="$1" context="${2:-Identifier}"
+    if [[ -z $name ]]; then
+        z::log::error "${context} cannot be empty" field "$context"
+        return 1
+    fi
+    if [[ $name != [[:alnum:]_-]## ]]; then
+        z::log::error "Invalid ${context}" \
+            field "$context" value "$name" allowed "alphanumeric, underscore, hyphen"
+        return 1
+    fi
+    return 0
 }
 
-###
-# Validate that a value is non-empty.
-#
-# @param 1: string  - Value to validate
-# @param 2: string  - Field label for error messages (default: "Value")
-# @return 0 if non-empty, 1 if empty
-#
-# @example
-#   z::validate::nonempty "$value" "Config value" || return 1
-###
+z::validate::varname() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="$1" context="${2:-Variable name}"
+    if [[ -z $name ]]; then
+        z::log::error "${context} cannot be empty" field "$context"
+        return 1
+    fi
+    if [[ $name != [[:alpha:]_][[:alnum:]_]# ]]; then
+        z::log::error "Invalid ${context}" \
+            field "$context" value "$name" \
+            allowed "letter or underscore, followed by alphanumeric/underscore"
+        return 1
+    fi
+    return 0
+}
+
 z::validate::nonempty() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local value="$1" field_name="${2:-Value}"
-
-  if [[ -z $value ]]; then
-    z::log::errorf "%s cannot be empty" "$field_name" \
-      field "$field_name"
-    return 1
-  fi
-
-  return 0
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local value="$1" field_name="${2:-Value}"
+    if [[ -z $value ]]; then
+        z::log::error "${field_name} cannot be empty" field "$field_name"
+        return 1
+    fi
+    return 0
 }
 
-###
-# Validate that a value is an integer (optional leading minus sign).
-#
-# @param 1: string  - Value to validate
-# @param 2: string  - Field label for error messages (default: "Value")
-# @return 0 if valid integer, 1 if invalid
-#
-# @example
-#   z::validate::integer "$port" "Port number" || return 1
-###
 z::validate::integer() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local value="$1" field_name="${2:-Value}"
-
-  # Pattern: optional leading minus followed by one or more digits
-  if [[ $value != (-[0-9]##|[0-9]##) ]]; then
-    z::log::error "${field_name} must be an integer" \
-      field "$field_name"                            \
-      value "$value"
-    return 1
-  fi
-
-  return 0
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local value="$1" field_name="${2:-Value}"
+    if [[ $value != (-[1-9][0-9]#|[0-9]|[1-9][0-9]#) ]]; then
+        z::log::error "${field_name} must be an integer" field "$field_name" value "$value"
+        return 1
+    fi
+    return 0
 }
 
-###
-# Validate that an integer falls within an inclusive range.
-# Bounds are validated as integers before use; typeset -i assignments
-# occur only after validation to prevent silent coercion.
-#
-# @param 1: string  - Value to validate
-# @param 2: int     - Minimum value (inclusive)
-# @param 3: int     - Maximum value (inclusive)
-# @param 4: string  - Field label for error messages (default: "Value")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::validate::integer::range "$port" 1 65535 "Port" || return 1
-###
 z::validate::integer::range() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local value="$1" field_name="${4:-Value}"
-
-  if [[ -z ${2-} || -z ${3-} ]]; then
-    z::log::error "z::validate::integer::range: min and max parameters required" \
-      param_2 "${2:-<missing>}"                                                   \
-      param_3 "${3:-<missing>}"
-    return 1
-  fi
-
-  # Validate bounds first — typeset -i assignments happen only after this
-  # to prevent silent coercion of non-integer strings to 0.
-  z::validate::integer "$2" "min (range boundary)" || return 1
-  z::validate::integer "$3" "max (range boundary)" || return 1
-  z::validate::integer "$value" "$field_name"       || return 1
-
-  # Safe to assign after validation
-  typeset -i min_val max_val int_value
-  (( min_val   = ${2} ))
-  (( max_val   = ${3} ))
-  (( int_value = value ))
-
-  if (( int_value < min_val || int_value > max_val )); then
-    z::log::error "${field_name} out of range" \
-      field "$field_name"                      \
-      value "$int_value"                       \
-      min   "$min_val"                         \
-      max   "$max_val"
-    return 1
-  fi
-
-  return 0
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local value="$1" field_name="${4:-Value}"
+    z::validate::nonempty "${2:-}" "min (range boundary)" || return 1
+    z::validate::nonempty "${3:-}" "max (range boundary)" || return 1
+    z::validate::integer  "$2"     "min (range boundary)" || return 1
+    z::validate::integer  "$3"     "max (range boundary)" || return 1
+    z::validate::integer  "$value" "$field_name"          || return 1
+    typeset -i min_val=$(( 10#$2 )) max_val=$(( 10#$3 )) int_value=$(( 10#$value ))
+    if (( min_val > max_val )); then
+        z::log::error "Invalid range boundaries" \
+            field "$field_name" min "$min_val" max "$max_val"
+        return 1
+    fi
+    if (( int_value < min_val || int_value > max_val )); then
+        z::log::error "${field_name} out of range" \
+            field "$field_name" value "$int_value" min "$min_val" max "$max_val"
+        return 1
+    fi
+    return 0
 }
 
-###
-# Validate that a value is one of an allowed set (enum).
-# O(n) linear scan — acceptable for small enum sets (< 20 values).
-#
-# @param 1: string  - Pipe-separated allowed values, e.g. "red|green|blue"
-# @param 2: string  - Value to validate
-# @param 3: string  - Field label for error messages (default: "Value")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::validate::enum "text|json|csv" "$format" "Output format" || return 1
-###
 z::validate::enum() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local allowed_values="$1" value="$2" field_name="${3:-Value}"
-  local -a allowed_array
-
-  if [[ -z $allowed_values ]]; then
-    z::log::error "z::validate::enum: allowed_values parameter required" \
-      param "allowed_values"
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local allowed_values="$1" value="$2" field_name="${3:-Value}"
+    local -a allowed_array
+    if [[ -z $allowed_values ]]; then
+        z::log::error "z::validate::enum: allowed_values parameter required" param "allowed_values"
+        return 1
+    fi
+    if [[ -z $value ]]; then
+        z::log::error "${field_name} cannot be empty" field "$field_name" allowed "$allowed_values"
+        return 1
+    fi
+    allowed_array=("${(@s:|:)allowed_values}")
+    # Linear scan via (r) first-match subscript. Fine for small enums.
+    [[ -n ${allowed_array[(r)$value]} ]] && return 0
+    z::log::error "Invalid ${field_name}" \
+        field "$field_name" value "$value" allowed "$allowed_values"
     return 1
-  fi
-
-  if [[ -z $value ]]; then
-    z::log::error "${field_name} cannot be empty" \
-      field   "$field_name"                       \
-      allowed "$allowed_values"
-    return 1
-  fi
-
-  # (s:|:) — split on literal pipe character
-  allowed_array=("${(@s:|:)allowed_values}")
-
-  # (i) returns the first matching index; > array length means not found
-  if (( ${allowed_array[(i)$value]} > ${#allowed_array} )); then
-    # Rate-limit validation errors to prevent log flooding in tight loops
-    z::log::rate_limit "validate-enum-${field_name}" 10 5 error \
-      "Invalid ${field_name}"  \
-      field   "$field_name"    \
-      value   "$value"         \
-      allowed "$allowed_values"
-    return 1
-  fi
-
-  return 0
 }
 
-###
-# Validate that a value is a recognised boolean representation.
-# Accepted (case-insensitive): 0, 1, true, false, yes, no, on, off
-#
-# @param 1: string  - Value to validate
-# @param 2: string  - Field label for error messages (default: "Value")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::validate::boolean "$enabled" "Enabled flag" || return 1
-###
 z::validate::boolean() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local value="$1" field_name="${2:-Value}"
-
-  # :l — lowercase modifier; avoids a separate tolower call
-  case "${value:l}" in
-    0|1|true|false|yes|no|on|off)
-      return 0
-      ;;
-    *)
-      z::log::error "Invalid ${field_name}" \
-        field   "$field_name"               \
-        value   "$value"                    \
-        allowed "0, 1, true, false, yes, no, on, off"
-      return 1
-      ;;
-  esac
-}
-
-# =============================================================================
-# SECTION 3 — PATH PROBING  (z::probe::*)
-# =============================================================================
-
-###
-# Validate that a path exists, with an optional type constraint.
-#
-# @param 1: string  - Path to test
-# @param 2: string  - Expected type: "file" | "dir" | "any"  (default: "any")
-# @param 3: string  - Field label for error messages (default: "Path")
-# @return 0 if valid, 1 if invalid
-#
-# @example
-#   z::probe::path "$config" file "Config file" || return 1
-#   z::probe::path "$dir"    dir  "Output dir"  || return 1
-###
-z::probe::path() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1" path_type="${2:-any}" field_name="${3:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::errorf "%s cannot be empty" "$field_name" \
-      field "$field_name"
-    return 1
-  fi
-
-  case $path_type in
-    file)
-      if [[ ! -f $path ]]; then
-        z::log::error "${field_name} does not exist or is not a regular file" \
-          field "$field_name"                                                  \
-          path  "$path"
-        return 1
-      fi
-      ;;
-    dir)
-      if [[ ! -d $path ]]; then
-        z::log::error "${field_name} does not exist or is not a directory" \
-          field "$field_name"                                               \
-          path  "$path"
-        return 1
-      fi
-      ;;
-    any)
-      if [[ ! -e $path ]]; then
-        z::log::error "${field_name} does not exist" \
-          field "$field_name"                         \
-          path  "$path"
-        return 1
-      fi
-      ;;
-    *)
-      z::log::error "z::probe::path: invalid path_type" \
-        field     "$field_name"                          \
-        path_type "$path_type"                           \
-        allowed   "file, dir, any"
-      return 1
-      ;;
-  esac
-
-  return 0
-}
-
-###
-# Validate that a path is readable by the current process.
-#
-# @param 1: string  - Path to test
-# @param 2: string  - Field label for error messages (default: "Path")
-# @return 0 if readable, 1 if not
-#
-# @example
-#   z::probe::path::readable "$input" "Input file" || return 1
-###
-z::probe::path::readable() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1" field_name="${2:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::errorf "%s cannot be empty" "$field_name" \
-      field "$field_name"
-    return 1
-  fi
-
-  if [[ ! -r $path ]]; then
-    z::log::error "${field_name} is not readable" \
-      field "$field_name"                          \
-      path  "$path"
-    return 1
-  fi
-
-  return 0
-}
-
-###
-# Validate that a path is writable by the current process.
-# If the path does not yet exist, the parent directory is checked instead.
-# Uses Zsh :h modifier — no dirname subprocess.
-# Note: :h on a bare filename (no directory component) returns "." (CWD).
-#
-# @param 1: string  - Path to test
-# @param 2: string  - Field label for error messages (default: "Path")
-# @return 0 if writable, 1 if not
-#
-# @example
-#   z::probe::path::writable "$output" "Output file" || return 1
-###
-z::probe::path::writable() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1" field_name="${2:-Path}"
-
-  if [[ -z $path ]]; then
-    z::log::errorf "%s cannot be empty" "$field_name" \
-      field "$field_name"
-    return 1
-  fi
-
-  if [[ -e $path ]]; then
-    if [[ ! -w $path ]]; then
-      z::log::error "${field_name} is not writable" \
-        field "$field_name"                          \
-        path  "$path"
-      return 1
-    fi
-  else
-    # Path does not exist yet — check parent directory writability.
-    # :h is Zsh's equivalent of dirname; returns "." for bare filenames.
-    local parent_dir="${path:h}"
-    if [[ ! -w $parent_dir ]]; then
-      z::log::error "${field_name} cannot be created: parent directory not writable" \
-        field      "$field_name" \
-        path       "$path"       \
-        parent_dir "$parent_dir"
-      return 1
-    fi
-  fi
-
-  return 0
-}
-
-# =============================================================================
-# SECTION 4 — COMMAND & FUNCTION PROBING  (z::probe::cmd, z::probe::func,
-#              z::cmd::which, z::func::*)
-# =============================================================================
-
-###
-# Test whether an external command is available in $PATH.
-#
-# Uses $+commands — O(1) Zsh hash lookup, no subprocess.
-#
-# @param 1: string - Command name
-# @return 0 if available, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not found
-#
-# @example
-#   if z::probe::cmd "git"; then ...
-###
-z::probe::cmd() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local cmd="${1:-}"
-
-  z::validate::nonempty "$cmd" "cmd" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # ${+commands[name]} — 1 if key exists in the commands hash, 0 otherwise
-  (( ${+commands[$cmd]} ))
-}
-
-###
-# Return the full path of a command.
-# Sets $REPLY — never use $() to call this function.
-#
-# @param 1:  string - Command name
-# @sets $REPLY      - Full path if found, empty string if not
-# @return 0 if found, ZCORE_ERROR_NOT_FOUND if not found
-#
-# @example
-#   z::cmd::which "git"; local git_path="$REPLY"
-###
-z::cmd::which() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local cmd="${1:-}"
-  REPLY=""
-
-  z::validate::nonempty "$cmd" "cmd" || return $ZCORE_ERROR_INVALID_INPUT
-
-  if ! z::probe::cmd "$cmd"; then
-    z::log::error "Command not found" cmd "$cmd"
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  REPLY="${commands[$cmd]}"
-  return 0
-}
-
-###
-# Test whether a Zsh function is defined in the current session.
-#
-# Uses $+functions — O(1) Zsh hash lookup, no subprocess.
-#
-# @param 1: string - Function name
-# @return 0 if defined, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not found
-#
-# @example
-#   if z::probe::func "my::handler"; then ...
-###
-z::probe::func() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local func="${1:-}"
-
-  z::validate::nonempty "$func" "func" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # ${+functions[name]} — 1 if function is defined, 0 otherwise
-  (( ${+functions[$func]} ))
-}
-
-###
-# Call a function by name with arguments.
-# Validates existence before calling — no special-case suppression lists.
-# Benchmarks execution time when debug logging is active.
-#
-# @param 1:   string - Function name
-# @param ...: any    - Arguments forwarded to the function
-# @return Function exit code, or ZCORE_ERROR_* on validation failure
-#
-# @example
-#   z::func::call "my::handler" arg1 arg2
-###
-z::func::call() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local func="${1:-}"
-
-  z::validate::nonempty "$func" "func" || return $ZCORE_ERROR_INVALID_INPUT
-  shift
-
-  if ! z::probe::func "$func"; then
-    z::log::warn "Function not found" func "$func"
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  typeset -i exit_code=0
-
-  # Benchmark under debug — zero overhead when INFO is disabled (benchmark is a no-op)
-  if z::log::if_debug; then
-    z::log::benchmark_start "z::func::call:${func}"
-    local _bench_timer="$REPLY"
-  fi
-
-  "$func" "$@" || exit_code=$?
-
-  if z::log::if_debug; then
-    [[ -n ${_bench_timer:-} ]] && z::log::benchmark_end "$_bench_timer"
-    if (( exit_code != 0 )); then
-      z::log::debug "Function returned non-zero" func "$func" exit_code "$exit_code"
-    fi
-  fi
-
-  return $exit_code
-}
-
-###
-# Unset a function by name.
-# Note: behaviour for autoloaded-but-not-yet-loaded functions is
-# implementation-defined; unset -f removes the autoload marker.
-#
-# @param 1: string - Function name
-# @return 0 on success, ZCORE_ERROR_* on failure
-#
-# @example
-#   z::func::unset "my::old::handler"
-###
-z::func::unset() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local target="${1:-}"
-
-  z::validate::nonempty "$target" "func" || return $ZCORE_ERROR_INVALID_INPUT
-
-  if ! (( ${+functions[$target]} )); then
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  if unset -f -- "$target"; then
-    if z::log::if_debug; then
-      z::log::debug "Function unset" func "$target"
-    fi
-    return 0
-  fi
-
-  return $ZCORE_ERROR_GENERAL
-}
-
-###
-# List all defined functions matching a glob pattern.
-# Output is sorted ascending, one name per line.
-#
-# @param 1: string - Glob pattern (optional, default: *)
-# @stdout  One function name per line, sorted
-# @return 0 always
-#
-# @example
-#   z::func::list "z::kv::*"
-###
-z::func::list() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local pattern="${1:-*}"
-
-  if [[ -z ${1:-} && $# -gt 0 ]]; then
-    # Use z::log::once to avoid flooding logs when called in a loop
-    z::log::once "func-list-empty-pattern" warn \
-      "z::func::list: empty pattern provided, defaulting to '*'"
-  fi
-
-  # ${(k)functions[(I)pattern]} — returns all keys in the functions hash
-  # whose names match the glob pattern. (I) on an assoc array returns all
-  # matching keys (unlike arrays where it returns the first index).
-  # ${~pattern} — force glob expansion of the pattern variable.
-  local -a matched
-  matched=("${(k)functions[(I)${~pattern}]}")
-
-  local func
-  for func in "${(o)matched[@]}"; do
-    print -r -- "$func"
-  done
-
-  return 0
-}
-
-# =============================================================================
-# SECTION 5 — VARIABLE MANAGEMENT  (z::probe::var, z::var::*)
-# =============================================================================
-
-###
-# Test whether a parameter (variable) is defined.
-#
-# @param 1: string - Variable name
-# @return 0 if defined, ZCORE_ERROR_INVALID_INPUT if empty, 1 if not defined
-#
-# @example
-#   if z::probe::var "MY_CONFIG"; then ...
-###
-z::probe::var() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local name="${1:-}"
-
-  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # ${+parameters[name]} — 1 if the parameter is set, 0 otherwise
-  (( ${+parameters[$name]} ))
-}
-
-###
-# Get the value of a variable by name.
-# Sets $REPLY — never use $() to call this function.
-#
-# @param 1: string - Variable name
-# @param 2: string - Default value if variable is not defined (default: "")
-# @sets $REPLY     - Variable value or default
-# @return 0 always
-#
-# @example
-#   z::var::get "MY_TIMEOUT" "30"; local timeout="$REPLY"
-###
-z::var::get() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local name="${1:-}" default="${2:-}"
-  REPLY="$default"
-
-  if [[ -z $name ]]; then
-    return 0
-  fi
-
-  if z::probe::var "$name"; then
-    REPLY="${(P)name}"  # (P) — indirect expansion: value of the variable named by $name
-  fi
-
-  return 0
-}
-
-###
-# Set a global variable by name.
-#
-# NOTE: Values are intentionally not logged to prevent secret leakage.
-#       Only the variable name is logged at debug level.
-# NOTE: The -- prevents flag injection if $name starts with '-'.
-#
-# @param 1: string - Variable name
-# @param 2: string - Value to assign
-# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if name is empty
-#
-# @example
-#   z::var::set "MY_CONFIG" "/etc/app.conf"
-###
-z::var::set() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local name="${1:-}" value="${2:-}"
-
-  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # -- prevents flag injection if $name starts with '-'
-  typeset -g -- "${name}=${value}"
-
-  if z::log::if_debug; then
-    # Value is intentionally omitted — may contain secrets
-    z::log::debug "Variable set" name "$name"
-  fi
-
-  return 0
-}
-
-###
-# Unset a variable by name.
-# Refuses to unset readonly variables.
-#
-# @param 1: string - Variable name
-# @return 0 on success, ZCORE_ERROR_* on failure
-#
-# @example
-#   z::var::unset "MY_TEMP_VAR"
-###
-z::var::unset() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local target="${1:-}"
-
-  z::validate::nonempty "$target" "name" || return $ZCORE_ERROR_INVALID_INPUT
-
-  if ! (( ${+parameters[$target]} )); then
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  # (tP) — parameter type flags via indirect expansion; check for readonly
-  if [[ ${(tP)target} == *readonly* ]]; then
-    z::log::error "Cannot unset readonly variable" name "$target"
-    return $ZCORE_ERROR_PERMISSION
-  fi
-
-  if unset -v -- "$target"; then
-    if z::log::if_debug; then
-      z::log::debug "Variable unset" name "$target"
-    fi
-    return 0
-  fi
-
-  return $ZCORE_ERROR_GENERAL
-}
-
-# =============================================================================
-# SECTION 6 — FILESYSTEM CONVENIENCE PROBES
-#
-# Silent boolean checks — no error emission. Callers decide how to handle
-# failure. All use ${1:-} so an empty argument silently returns false (1).
-# This differs intentionally from z::probe::path which errors on empty input.
-# =============================================================================
-
-###
-# Test whether a path is a regular file.
-# @note Silent — no error emitted on empty or missing input.
-#
-# @param 1: string - Path to test
-# @return 0 if regular file, 1 otherwise
-###
-z::probe::file() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  [[ -f ${1:-} ]]
-}
-
-###
-# Test whether a path is a directory.
-# @note Silent — no error emitted on empty or missing input.
-#
-# @param 1: string - Path to test
-# @return 0 if directory, 1 otherwise
-###
-z::probe::dir() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  [[ -d ${1:-} ]]
-}
-
-###
-# Test whether a path is readable.
-# @note Silent — no error emitted on empty or missing input.
-# Renamed from z::file::readable for namespace consistency with z::probe::*.
-#
-# @param 1: string - Path to test
-# @return 0 if readable, 1 otherwise
-###
-z::probe::readable() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  [[ -r ${1:-} ]]
-}
-
-###
-# Test whether a path is writable.
-# @note Silent — no error emitted on empty or missing input.
-# Renamed from z::file::writable for namespace consistency with z::probe::*.
-#
-# @param 1: string - Path to test
-# @return 0 if writable, 1 otherwise
-###
-z::probe::writable() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-  [[ -w ${1:-} ]]
-}
-
-# =============================================================================
-# SECTION 7 — ENVIRONMENT MANAGEMENT  (z::env::*)
-#
-# Path normalization uses only tilde expansion via parameter substitution
-# and the :A modifier for absolute path resolution — no subprocesses.
-# =============================================================================
-
-###
-# Normalize a path using pure Zsh.
-# Handles ~, ~+, ~-, and relative paths.
-# Sets $REPLY to the normalized absolute path.
-#
-# @param 1:  string - Path to normalize
-# @sets $REPLY      - Normalized absolute path
-# @return 0 always
-# @private
-###
-_z::env::normalize_path() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local path="$1"
-  REPLY=""
-
-  # Use quoted prefix patterns to avoid tilde interpretation issues
-  case $path in
-    '~')          path="$HOME"                        ;;
-    '~/'*)        path="${HOME}/${path#'~/'}"          ;;
-    '~+'|'~+/'*)  path="${PWD}${path#'~+'}"            ;;  # ~+ expands to $PWD
-    '~-'|'~-/'*)  path="${OLDPWD:-$PWD}${path#'~-'}"  ;;  # ~- expands to $OLDPWD
-    [^/]*)        path="${PWD%/}/$path"               ;;  # relative path — prepend CWD
-  esac
-
-  # :A — resolve symlinks and canonicalize to absolute path (no subprocess)
-  REPLY="${path:A}"
-  return 0
-}
-
-###
-# Add a directory to PATH.
-# Normalizes path using pure Zsh — no subprocess.
-# Skips silently if directory does not exist or is already in PATH.
-# Uses z::log::once for the "already in PATH" notice to prevent log spam
-# when called repeatedly (e.g., in a loop or re-sourced config).
-#
-# @param 1: string - Directory path
-# @param 2: string - Position: "prepend" | "append" (default: "append")
-# @return 0 on success, ZCORE_ERROR_* on failure
-#
-# @example
-#   z::env::path_add "$HOME/.local/bin" prepend
-###
-z::env::path_add() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local dir="${1:-}"
-  local position="${2:-append}"
-
-  z::validate::nonempty "$dir" "dir"                         || return $ZCORE_ERROR_INVALID_INPUT
-  z::validate::enum "prepend|append" "$position" "position"  || return $ZCORE_ERROR_INVALID_INPUT
-
-  _z::env::normalize_path "$dir"
-  dir="$REPLY"
-
-  if [[ ! -d $dir ]]; then
-    if z::log::if_debug; then
-      z::log::debug "Directory does not exist, skipping PATH add" dir "$dir"
-    fi
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  # Sentinel colons prevent false partial matches (e.g. /usr matching /usr/local)
-  if [[ ":${PATH}:" == *":${dir}:"* ]]; then
-    # Use once to suppress repeated "already in PATH" noise in re-sourced configs
-    z::log::once "path-already-has-${dir}" debug \
-      "Directory already in PATH" dir "$dir"
-    return 0
-  fi
-
-  case $position in
-    prepend) export PATH="${dir}:${PATH}" ;;
-    append)  export PATH="${PATH}:${dir}" ;;
-  esac
-
-  # Flush the command hash table so newly added paths are found immediately
-  builtin hash -r 2>/dev/null
-
-  if z::log::if_debug; then
-    z::log::debug "Added to PATH" dir "$dir" position "$position"
-  fi
-  return 0
-}
-
-###
-# Remove a directory from PATH.
-# Normalizes path using pure Zsh.
-#
-# @param 1: string - Directory path to remove
-# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if empty
-#
-# @example
-#   z::env::path_remove "$HOME/.local/bin"
-###
-z::env::path_remove() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local dir="${1:-}"
-
-  z::validate::nonempty "$dir" "dir" || return $ZCORE_ERROR_INVALID_INPUT
-
-  _z::env::normalize_path "$dir"
-  dir="$REPLY"
-
-  # Split PATH on ':', filter out the target dir, then rejoin with ':'
-  local -a path_array
-  path_array=("${(s.:.)PATH}")
-  path_array=("${path_array[@]:#$dir}")
-  export PATH="${(j.:.)path_array}"
-
-  # Flush the command hash table after modifying PATH
-  builtin hash -r 2>/dev/null
-
-  if z::log::if_debug; then
-    z::log::debug "Removed from PATH" dir "$dir"
-  fi
-  return 0
-}
-
-###
-# Test whether a directory is in PATH.
-# Normalizes the path before checking for consistency with path_add/path_remove.
-#
-# @param 1: string - Directory path
-# @return 0 if present, ZCORE_ERROR_INVALID_INPUT if empty, 1 if absent
-###
-z::env::path_has() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local dir="${1:-}"
-
-  z::validate::nonempty "$dir" "dir" || return $ZCORE_ERROR_INVALID_INPUT
-
-  _z::env::normalize_path "$dir"
-  dir="$REPLY"
-
-  # Sentinel colons prevent false partial matches
-  [[ ":${PATH}:" == *":${dir}:"* ]]
-}
-
-###
-# Create a shell alias.
-#
-# @param 1: string - Alias name (no spaces, no = sign)
-# @param 2: string - Alias value
-# @return 0 on success, ZCORE_ERROR_* on failure
-#
-# @example
-#   z::env::alias_set "ll" "ls -lah"
-###
-z::env::alias_set() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local alias_name="${1:-}" alias_value="${2:-}"
-
-  z::validate::nonempty "$alias_name"  "alias_name"  || return $ZCORE_ERROR_INVALID_INPUT
-  z::validate::nonempty "$alias_value" "alias_value" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # Glob check is faster than regex for simple character membership tests
-  if [[ $alias_name == *[[:space:]=]* ]]; then
-    z::log::error "Invalid alias name: contains spaces or equals sign" \
-      name "$alias_name"
-    return $ZCORE_ERROR_INVALID_INPUT
-  fi
-
-  if ! builtin alias "${alias_name}=${alias_value}"; then
-    z::log::error "Failed to create alias" name "$alias_name"
-    return $ZCORE_ERROR_GENERAL
-  fi
-
-  if z::log::if_debug; then
-    z::log::debug "Alias created" name "$alias_name" value "$alias_value"
-  fi
-  return 0
-}
-
-###
-# Remove a shell alias.
-#
-# @param 1: string - Alias name
-# @return 0 on success, ZCORE_ERROR_* on failure
-#
-# @example
-#   z::env::alias_unset "ll"
-###
-z::env::alias_unset() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local alias_name="${1:-}"
-
-  z::validate::nonempty "$alias_name" "alias_name" || return $ZCORE_ERROR_INVALID_INPUT
-
-  if ! builtin unalias "$alias_name"; then
-    if z::log::if_debug; then
-      z::log::debug "Alias not found" name "$alias_name"
-    fi
-    return $ZCORE_ERROR_NOT_FOUND
-  fi
-
-  if z::log::if_debug; then
-    z::log::debug "Alias removed" name "$alias_name"
-  fi
-  return 0
-}
-
-###
-# Export a variable to the environment.
-#
-# NOTE: Values are intentionally not logged to prevent secret leakage.
-# NOTE: Uses typeset -gx with -- to prevent flag injection.
-#
-# @param 1: string - Variable name
-# @param 2: string - Value
-# @return 0 on success, ZCORE_ERROR_INVALID_INPUT if name is empty
-#
-# @example
-#   z::env::export "APP_ENV" "production"
-###
-z::env::export() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local name="${1:-}" value="${2:-}"
-
-  z::validate::nonempty "$name" "name" || return $ZCORE_ERROR_INVALID_INPUT
-
-  # typeset -gx with -- prevents flag injection if $name starts with '-'
-  typeset -gx -- "${name}=${value}"
-
-  if z::log::if_debug; then
-    # Value is intentionally omitted — may contain secrets
-    z::log::debug "Variable exported" name "$name"
-  fi
-  return 0
-}
-
-# =============================================================================
-# SECTION 8 — EXECUTION SAFETY VALIDATORS  (_z::exec::*, z::exec::scan,
-#              z::exec::is_safe)
-#
-# Pure safety analysis — no side effects beyond logging.
-# Detection is heuristic and best-effort. Known limitations:
-#   - Does not detect `cmd | sudo sh` (sudo as a prefix before shell)
-#   - Fork bomb detection covers the canonical `:() { :|: & }` form only;
-#     variants like `a(){ a|a& };a` are not detected
-#   - Static tokenization via (z) does not handle all quoting edge cases
-# =============================================================================
-
-# Pre-compiled ERE patterns stored in variables.
-# Zsh caches compiled regexes when the RHS of =~ is a variable, not a literal.
-typeset -g _ZBASE_EXEC_INIT_CMD_RE='(starship|mise|direnv|zoxide|atuin|mcfly|fzf|oh-my-posh)[[:space:]]+init([[:space:]]|$)'
-typeset -g _ZBASE_EXEC_META_RE='[;&()]'
-typeset -g _ZBASE_EXEC_FORK_BOMB_1_RE=':\(\)'
-typeset -g _ZBASE_EXEC_FORK_BOMB_2_RE=':\|:'
-
-###
-# Detect shell tool init commands — these are exempt from safety scanning
-# as they are known-safe patterns from trusted tools.
-#
-# @param 1: string - Command string to test
-# @return 0 if init command, 1 otherwise
-# @private
-###
-_z::exec::is_init_cmd() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local input="$1"
-  [[ $input =~ $_ZBASE_EXEC_INIT_CMD_RE ]]
-}
-
-###
-# Detect dangerous shell metacharacters in a command string.
-#
-# @param 1: string - Command string to test
-# @return 0 if dangerous chars found, 1 if clean
-# @private
-###
-_z::exec::has_dangerous_metachars() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local input="$1"
-  [[ -z $input ]] && return 1
-  # Semicolons, ampersands, parens, and backticks can chain or subshell commands
-  [[ $input =~ $_ZBASE_EXEC_META_RE ]] || [[ $input == *'`'* ]]
-}
-
-###
-# Check a single parsed command segment for dangerous patterns.
-# Detects: destructive rm -rf / --recursive --force on root/home paths,
-# dd writes to raw block devices.
-# Single-pass flag and path collection for rm.
-#
-# @param 1:   string - Command name
-# @param ...: string - Command arguments
-# @return 0 if safe, 1 if dangerous
-# @private
-###
-_z::exec::check_segment() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local cmd="$1"
-  shift
-  local -a args
-  (( $# > 0 )) && args=("$@")
-
-  if [[ $cmd == rm ]]; then
-    typeset -i have_r=0 have_f=0
-    local -a dangerous_paths=()
-    local a
-
-    # Single pass: collect flags and paths simultaneously
-    for a in "${args[@]}"; do
-      case $a in
-        --recursive)          (( have_r = 1 ))                ;;
-        --force)              (( have_f = 1 ))                ;;
-        --*)                  ;;  # other long options — skip
-        -*)
-          [[ $a == *r* ]] && (( have_r = 1 ))
-          [[ $a == *f* ]] && (( have_f = 1 ))
-          ;;
-        /|/*|~|~/*|'$HOME'|'$HOME'/*)
-          dangerous_paths+=("$a")
-          ;;
-      esac
-    done
-
-    if (( have_r && have_f && ${#dangerous_paths} > 0 )); then
-      z::log::error "Dangerous rm detected" \
-        cmd  "rm"                            \
-        path "${dangerous_paths[1]}"
-      return 1
-    fi
-  fi
-
-  if [[ $cmd == dd ]]; then
-    local kv dev base
-    for kv in "${args[@]}"; do
-      if [[ $kv == of=/dev/* ]]; then
-        dev="${kv#of=}"
-        base="${dev#/dev/}"
-        case $base in
-          sd*|hd*|nvme*|disk*|rdisk*)
-            z::log::error "Dangerous dd detected" \
-              cmd    "dd"                          \
-              device "$dev"
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local value="$1" field_name="${2:-Value}"
+    case "${value:l}" in
+        0|1|true|false|yes|no|on|off) return 0 ;;
+        *)
+            z::log::error "Invalid ${field_name}" \
+                field "$field_name" value "$value" \
+                allowed "0, 1, true, false, yes, no, on, off"
             return 1
             ;;
-        esac
-      fi
-    done
-  fi
-
-  return 0
-}
-
-###
-# Scan a full command string for dangerous patterns.
-# Tokenizes via Zsh (z) flag — no subprocess.
-# Checks: pipe-to-shell, fork bomb, per-segment dangerous commands.
-#
-# Known limitations: see section header comment.
-#
-# @param 1: string - Command string to scan
-# @return 0 if safe, 1 if dangerous pattern detected
-# @private
-###
-_z::exec::scan_patterns() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local input="${1:-}"
-  [[ -z $input ]] && return 0
-
-  if _z::exec::is_init_cmd "$input"; then
-    return 0
-  fi
-
-  # "${(z)input}" — tokenize using shell word-splitting rules, no subprocess.
-  # Quoted to preserve empty tokens from quoted empty arguments.
-  local -a words
-  words=("${(z)input}")
-  (( ${#words} == 0 )) && return 0
-
-  typeset -i i j
-  local next_cmd base
-
-  # Scan for pipe-to-shell patterns: cmd | sh / bash / zsh / etc.
-  for (( i = 1; i <= ${#words}; i++ )); do
-    if [[ ${words[i]} == '|' ]]; then
-      (( j = i + 1 ))
-      next_cmd=""
-      while (( j <= ${#words} )); do
-        case ${words[j]} in
-          '|'|'||'|'&&'|';'|'&') break ;;
-          # Skip command prefixes that don't change the effective command.
-          # Note: "cmd | sudo sh" is NOT detected — sudo is treated as a prefix.
-          # This is a known limitation of static analysis without full parsing.
-          nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
-            (( j += 1 ))
-            continue
-            ;;
-          # Skip leading VAR=value assignments
-          [[:alpha:]_][[:alnum:]_]*=*)
-            (( j += 1 ))
-            continue
-            ;;
-        esac
-        next_cmd="${words[j]}"
-        break
-      done
-      if [[ -n ${next_cmd:-} ]]; then
-        base="${next_cmd:t}"  # :t — tail (basename) of the path
-        case $base in
-          sh|bash|zsh|ksh|dash)
-            z::log::rate_limit "exec-pipe-shell" 5 60 error \
-              "Dangerous pattern: pipe to shell"             \
-              shell "$base"                                  \
-              input "$input"
-            return 1
-            ;;
-        esac
-      fi
-    fi
-  done
-
-  # Detect fork bomb pattern: :() { :|: & }
-  # Note: variant forms like `a(){ a|a& };a` are not detected.
-  if [[ $input =~ $_ZBASE_EXEC_FORK_BOMB_1_RE && $input =~ $_ZBASE_EXEC_FORK_BOMB_2_RE ]]; then
-    z::log::rate_limit "exec-fork-bomb" 3 60 error \
-      "Dangerous pattern: fork bomb detected"       \
-      input "$input"
-    return 1
-  fi
-
-  # Walk tokens and dispatch each pipeline segment to _z::exec::check_segment
-  local -a seg=()
-  local w
-  for w in "${words[@]}"; do
-    case $w in
-      '|'|'||'|'&&'|';'|'&')
-        # Segment boundary — check accumulated segment, then reset
-        if (( ${#seg} )); then
-          local cmd="${seg[1]}"
-          local -a seg_args=("${(@)seg[2,-1]}")
-          _z::exec::check_segment "$cmd" "${seg_args[@]}" || return 1
-          seg=()
-        fi
-        ;;
-      # Skip command prefixes only at the start of a segment
-      nocorrect|noglob|builtin|command|exec|time|nice|nohup|sudo|doas|env)
-        if (( ${#seg} == 0 )); then
-          continue
-        else
-          seg+=("$w")
-        fi
-        ;;
-      # Skip leading VAR=value assignments only at the start of a segment
-      [[:alpha:]_][[:alnum:]_]*=*)
-        if (( ${#seg} == 0 )); then
-          continue
-        else
-          seg+=("$w")
-        fi
-        ;;
-      *)
-        seg+=("$w")
-        ;;
     esac
-  done
-
-  # Check the final segment (no trailing delimiter)
-  if (( ${#seg} )); then
-    local cmd="${seg[1]}"
-    local -a seg_args=("${(@)seg[2,-1]}")
-    _z::exec::check_segment "$cmd" "${seg_args[@]}" || return 1
-  fi
-
-  return 0
 }
 
-###
-# Public interface: scan a command string for dangerous patterns.
-#
-# @param 1: string - Command string to scan
-# @return 0 if safe, 1 if dangerous, ZCORE_ERROR_INVALID_INPUT if empty
-#
-# @example
-#   z::exec::scan "cat file | bash" || return 1
-###
+z::probe::path() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local path="$1" path_type="${2:-any}" field_name="${3:-Path}"
+    if [[ -z $path ]]; then
+        z::log::error "${field_name} cannot be empty" field "$field_name"
+        return 1
+    fi
+    case $path_type in
+        file)
+            if [[ ! -f $path ]]; then
+                z::log::error "${field_name} does not exist or is not a regular file" \
+                    field "$field_name" path "$path"
+                return 1
+            fi
+            ;;
+        dir)
+            if [[ ! -d $path ]]; then
+                z::log::error "${field_name} does not exist or is not a directory" \
+                    field "$field_name" path "$path"
+                return 1
+            fi
+            ;;
+        any)
+            if [[ ! -e $path ]]; then
+                z::log::error "${field_name} does not exist" field "$field_name" path "$path"
+                return 1
+            fi
+            ;;
+        *)
+            z::log::error "z::probe::path: invalid path_type" \
+                field "$field_name" path_type "$path_type" allowed "file, dir, any"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+z::probe::path::readable() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local path="$1" field_name="${2:-Path}"
+    if [[ -z $path ]]; then
+        z::log::error "${field_name} cannot be empty" field "$field_name"
+        return 1
+    fi
+    if [[ ! -r $path ]]; then
+        z::log::error "${field_name} is not readable" field "$field_name" path "$path"
+        return 1
+    fi
+    return 0
+}
+
+z::probe::path::writable() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local path="$1" field_name="${2:-Path}"
+    if [[ -z $path ]]; then
+        z::log::error "${field_name} cannot be empty" field "$field_name"
+        return 1
+    fi
+    if [[ -e $path ]]; then
+        if [[ ! -w $path ]]; then
+            z::log::error "${field_name} is not writable" field "$field_name" path "$path"
+            return 1
+        fi
+    else
+        local parent_dir="${path:h}"
+        [[ $parent_dir == '.' ]] && parent_dir="$PWD"
+        if [[ ! -w $parent_dir ]]; then
+            z::log::error "${field_name} cannot be created: parent directory not writable" \
+                field "$field_name" path "$path" parent_dir "$parent_dir"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Pure filesystem-test predicates — no glob expansion, no emulate overhead needed.
+z::probe::file()     { [[ -f ${1:-} ]]; }
+z::probe::dir()      { [[ -d ${1:-} ]]; }
+z::probe::readable() { [[ -r ${1:-} ]]; }
+z::probe::writable() { [[ -w ${1:-} ]]; }
+
+z::probe::cmd() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local cmd="${1:-}"
+    z::validate::nonempty "$cmd" "cmd" || return $ZBASE_ERROR_INVALID_INPUT
+    (( ${+commands[$cmd]} || ${+functions[$cmd]} || ${+builtins[$cmd]} || ${+aliases[$cmd]} ))
+}
+
+z::probe::func() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local func="${1:-}"
+    z::validate::nonempty "$func" "func" || return $ZBASE_ERROR_INVALID_INPUT
+    (( ${+functions[$func]} ))
+}
+
+z::probe::var() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="${1:-}"
+    z::validate::nonempty "$name" "name" || return $ZBASE_ERROR_INVALID_INPUT
+    (( ${+parameters[$name]} ))
+}
+
+z::cmd::which() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local cmd="${1:-}"
+    REPLY=""
+    REPLY2=""
+    reply=()
+    z::validate::nonempty "$cmd" "cmd" || return $ZBASE_ERROR_INVALID_INPUT
+    # Library lookup preference: function > alias > builtin > external.
+    # This is an introspection policy, not a strict claim about interactive alias expansion order.
+    if   (( ${+functions[$cmd]} )); then REPLY2="function"; REPLY="${functions[$cmd]}"
+    elif (( ${+aliases[$cmd]}   )); then REPLY2="alias";    REPLY="${aliases[$cmd]}"
+    elif (( ${+builtins[$cmd]}  )); then REPLY2="builtin";  REPLY="$cmd"
+    elif (( ${+commands[$cmd]}  )); then REPLY2="external"; REPLY="${commands[$cmd]}"
+    else
+        z::log::error "Command not found" cmd "$cmd"
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    return 0
+}
+
+z::func::call() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local func="${1:-}"
+    z::validate::nonempty "$func" "func" || return $ZBASE_ERROR_INVALID_INPUT
+    shift
+    if ! z::probe::func "$func"; then
+        z::log::warn "Function not found" func "$func"
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    typeset -i exit_code=0
+    local _bench_timer="" _call_ctx=""
+    # Cache debug flag once; z::log::if_debug must not be re-evaluated inside
+    # the always-block because debug state can change in async contexts, which
+    # would leave _bench_timer set but benchmark_end never called.
+    typeset -i _is_debug=0
+    z::log::if_debug && _is_debug=1
+    if (( _is_debug )); then
+        z::log::with_context "func" "$func"
+        _call_ctx="$REPLY"
+        z::log::benchmark_start "z::func::call:${func}"
+        _bench_timer="$REPLY"
+        [[ -n $_call_ctx ]] && ${_call_ctx}::debug "Calling function" argc "$#"
+    fi
+    {
+        "$func" "$@" || exit_code=$?
+    } always {
+        if (( _is_debug )); then
+            [[ -n $_bench_timer ]] && z::log::benchmark_end "$_bench_timer"
+            if (( exit_code != 0 )) && [[ -n $_call_ctx ]]; then
+                ${_call_ctx}::debug "Function returned non-zero" exit_code "$exit_code"
+            fi
+            [[ -n $_call_ctx ]] && z::log::remove_context "$_call_ctx"
+        fi
+    }
+    return $exit_code
+}
+
+z::func::unset() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local target="${1:-}"
+    z::validate::nonempty "$target" "func" || return $ZBASE_ERROR_INVALID_INPUT
+    if ! (( ${+functions[$target]} )); then
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    if unfunction -- "$target"; then
+        if z::log::if_debug; then
+            z::log::debug "Function unset" func "$target"
+        fi
+        return 0
+    fi
+    z::log::error "Failed to unset function" func "$target"
+    return $ZBASE_ERROR_GENERAL
+}
+
+z::func::list() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local pattern="${1:-*}"
+    REPLY=""
+    REPLY2=""
+    reply=()
+    if [[ -z ${1:-} && $# -gt 0 ]]; then
+        z::log::once "func-list-empty-pattern" warn \
+            "z::func::list: empty pattern provided, defaulting to '*'"
+    fi
+    # reply holds the sorted list; also print for pipeline consumers
+    reply=("${(ko)functions[(I)$pattern]}")
+    print -rC1 -- "${reply[@]}"
+    return 0
+}
+
+z::var::get() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="${1:-}" default="${2:-}"
+    REPLY="$default"
+    REPLY2=""
+    reply=()
+    [[ -z $name ]] && return 0
+    if z::probe::var "$name"; then
+        REPLY="${(P)name}"
+        REPLY2="${(tP)name}"  # REPLY2: zsh type string, e.g. "scalar" "array" "integer"
+    fi
+    return 0
+}
+
+z::var::set() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="${1:-}" value="${2:-}"
+    z::validate::varname "$name" "name" || return $ZBASE_ERROR_INVALID_INPUT
+    typeset -g -- "${name}=${value}"
+    if z::log::if_debug; then
+        z::log::debug "Variable set" name "$name"
+    fi
+    return 0
+}
+
+z::var::unset() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local target="${1:-}"
+    z::validate::nonempty "$target" "name" || return $ZBASE_ERROR_INVALID_INPUT
+    if ! (( ${+parameters[$target]} )); then
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    if [[ ${(tP)target} == *readonly* ]]; then
+        z::log::error "Cannot unset readonly variable" name "$target"
+        return $ZBASE_ERROR_PERMISSION
+    fi
+    if unset -v -- "$target"; then
+        if z::log::if_debug; then
+            z::log::debug "Variable unset" name "$target"
+        fi
+        return 0
+    fi
+    z::log::error "Failed to unset variable" name "$target"
+    return $ZBASE_ERROR_GENERAL
+}
+
+_z::env::normalize_path() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local path="$1"
+    REPLY=""
+    REPLY2=""
+    reply=()
+    case $path in
+        '~')          path="$HOME"                        ;;
+        '~/'*)        path="${HOME}/${path#'~/'}"         ;;
+        # '~+' alone expands to $PWD; '~+/...' strips the prefix and appends.
+        # Note: '~+foo' (no slash) does NOT match '~+/'* and falls through to
+        # the [^/]* arm, which prepends $PWD — resulting in "$PWD/~+foo", which
+        # is technically wrong but an unsupported edge case. Document, don't fix.
+        '~+'|'~+/'*)  path="${PWD}${path#'~+'}"           ;;
+        '~-'|'~-/'*)  path="${OLDPWD:-$PWD}${path#'~-'}"  ;;
+        [^/]*)        path="${PWD%/}/$path"               ;;
+    esac
+    REPLY="${path:A}"
+    return 0
+}
+
+z::env::path_add() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local dir="${1:-}" position="${2:-append}"
+    z::validate::nonempty "$dir" "dir"                        || return $ZBASE_ERROR_INVALID_INPUT
+    z::validate::enum "prepend|append" "$position" "position" || return $ZBASE_ERROR_INVALID_INPUT
+    _z::env::normalize_path "$dir"
+    dir="$REPLY"
+    if [[ ! -d $dir ]]; then
+        z::log::debug "Directory does not exist, skipping PATH add" dir "$dir"
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    if [[ ${path[(r)$dir]} == "$dir" ]]; then
+        local safe_key="path-already-has-${dir//[^[:alnum:]]/_}"
+        z::log::once "$safe_key" debug "Directory already in PATH" dir "$dir"
+        return 0
+    fi
+    case $position in
+        prepend) path=("$dir" "${path[@]}") ;;
+        append)  path+=("$dir")             ;;
+    esac
+    builtin hash -r 2>/dev/null
+    z::log::debug "Added to PATH" dir "$dir" position "$position"
+    return 0
+}
+
+z::env::path_remove() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local dir="${1:-}"
+    z::validate::nonempty "$dir" "dir" || return $ZBASE_ERROR_INVALID_INPUT
+    _z::env::normalize_path "$dir"
+    dir="$REPLY"
+    path=("${(@)path:#$dir}")
+    builtin hash -r 2>/dev/null
+    z::log::debug "Removed from PATH" dir "$dir"
+    return 0
+}
+
+z::env::path_has() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local dir="${1:-}"
+    z::validate::nonempty "$dir" "dir" || return $ZBASE_ERROR_INVALID_INPUT
+    _z::env::normalize_path "$dir"
+    dir="$REPLY"
+    [[ ${path[(r)$dir]} == "$dir" ]]
+}
+
+z::env::alias_set() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local alias_name="${1:-}" alias_value="${2:-}"
+    z::validate::nonempty "$alias_name"  "alias_name"  || return $ZBASE_ERROR_INVALID_INPUT
+    z::validate::nonempty "$alias_value" "alias_value" || return $ZBASE_ERROR_INVALID_INPUT
+    if [[ $alias_name == *[[:space:]=]* ]]; then
+        z::log::error "Invalid alias name: contains spaces or equals sign" name "$alias_name"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    aliases[$alias_name]="$alias_value"
+    if [[ ${aliases[$alias_name]} != "$alias_value" ]]; then
+        z::log::error "Alias not registered after creation" name "$alias_name"
+        return $ZBASE_ERROR_GENERAL
+    fi
+    if z::log::if_debug; then
+        z::log::debug "Alias created" name "$alias_name" value "$alias_value"
+    fi
+    return 0
+}
+
+z::env::alias_unset() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local alias_name="${1:-}"
+    z::validate::nonempty "$alias_name" "alias_name" || return $ZBASE_ERROR_INVALID_INPUT
+    if ! (( ${+aliases[$alias_name]} )); then
+        if z::log::if_debug; then
+            z::log::debug "Alias not found" name "$alias_name"
+        fi
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+    if ! unset "aliases[$alias_name]"; then
+        z::log::error "Failed to remove alias" name "$alias_name"
+        return $ZBASE_ERROR_GENERAL
+    fi
+    if z::log::if_debug; then
+        z::log::debug "Alias removed" name "$alias_name"
+    fi
+    return 0
+}
+
+z::env::export() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local name="${1:-}" value="${2:-}"
+    z::validate::varname "$name" "name" || return $ZBASE_ERROR_INVALID_INPUT
+    typeset -gx -- "${name}=${value}"
+    if z::log::if_debug; then
+        z::log::debug "Variable exported" name "$name"
+    fi
+    return 0
+}
+
+_z::exec::is_init_cmd() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    [[ ${1:-} =~ $_ZBASE_EXEC_INIT_CMD_RE ]]
+}
+
+_z::exec::has_dangerous_metachars() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local input="$1"
+    [[ -z $input ]] && return 1
+    [[ $input =~ $_ZBASE_EXEC_META_RE ]] || [[ $input == *'`'* ]]
+}
+
+_z::exec::check_segment() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local cmd="$1"
+    shift
+    local -a args
+    (( $# > 0 )) && args=("$@")
+    local cmd_base="${cmd:t}"
+    case "$cmd_base" in
+        sh|bash|zsh|ksh|dash)
+            z::log::always "SECURITY: Direct shell invocation in scanned input" shell "$cmd_base"
+            return 1
+            ;;
+    esac
+    if [[ $cmd_base == rm ]]; then
+        typeset -i have_r=0 have_f=0 have_no_preserve_root=0 dangerous_path_count=0
+        typeset -i past_double_dash=0
+        local first_dangerous_path="" a
+        for a in "${args[@]}"; do
+            # '--' terminates flag parsing; treat everything after as path arguments
+            if [[ $a == '--' ]]; then
+                (( past_double_dash = 1 ))
+                continue
+            fi
+            if (( past_double_dash )); then
+                case $a in
+                    /|/*|~|~/*|\$HOME|\$HOME/*|\${HOME}|\${HOME}/*)
+                        (( dangerous_path_count += 1 ))
+                        [[ -z $first_dangerous_path ]] && first_dangerous_path="$a"
+                        ;;
+                esac
+                continue
+            fi
+            case $a in
+                --recursive)        (( have_r = 1 ))                ;;
+                --force)            (( have_f = 1 ))                ;;
+                --no-preserve-root) (( have_no_preserve_root = 1 )) ;;
+                --*)                                                 ;;
+                -*)
+                    [[ $a == *r* ]] && (( have_r = 1 ))
+                    [[ $a == *f* ]] && (( have_f = 1 ))
+                    ;;
+                /|/*|~|~/*|'$HOME'|'$HOME'/*|'${HOME}'|'${HOME}'/*)
+                    (( dangerous_path_count += 1 ))
+                    [[ -z $first_dangerous_path ]] && first_dangerous_path="$a"
+                    ;;
+            esac
+        done
+        if (( have_r && dangerous_path_count > 0 && (have_f || have_no_preserve_root) )); then
+            z::log::always "SECURITY: Dangerous rm detected" cmd "rm" path "$first_dangerous_path"
+            return 1
+        fi
+    fi
+    if [[ $cmd_base == dd ]]; then
+        local kv dev base
+        for kv in "${args[@]}"; do
+            if [[ $kv == of=/dev/* ]]; then
+                dev="${kv#of=}"
+                base="${dev#/dev/}"
+                case $base in
+                    sd*|hd*|nvme*|disk*|rdisk*)
+                        z::log::always "SECURITY: Dangerous dd detected" cmd "dd" device "$dev"
+                        return 1
+                        ;;
+                esac
+            fi
+        done
+    fi
+    return 0
+}
+
+_z::exec::segment_command_index() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+    local -a seg
+    local token=""
+    typeset -i i=1 seg_len=$#
+
+    seg=("$@")
+    (( seg_len > 0 )) || return 1
+
+    while (( i <= seg_len )); do
+        token="${seg[i]}"
+
+        case $token in
+            [[:alpha:]_][[:alnum:]_]#=*)
+                (( i += 1 ))
+                ;;
+            nocorrect|noglob)
+                (( i += 1 ))
+                ;;
+            builtin|command|time|nohup)
+                (( i += 1 ))
+                while (( i <= seg_len )); do
+                    token="${seg[i]}"
+                    case $token in
+                        --)
+                            (( i += 1 ))
+                            break
+                            ;;
+                        -*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                ;;
+            nice)
+                (( i += 1 ))
+                while (( i <= seg_len )); do
+                    token="${seg[i]}"
+                    case $token in
+                        --)
+                            (( i += 1 ))
+                            break
+                            ;;
+                        -n)
+                            (( i += 2 ))
+                            continue
+                            ;;
+                        [+-][0-9]##|[0-9]##)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        -*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                ;;
+            exec)
+                (( i += 1 ))
+                while (( i <= seg_len )); do
+                    token="${seg[i]}"
+                    case $token in
+                        --)
+                            (( i += 1 ))
+                            break
+                            ;;
+                        -a)
+                            (( i += 2 ))
+                            continue
+                            ;;
+                        -c|-l)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        -*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                ;;
+            env)
+                (( i += 1 ))
+                while (( i <= seg_len )); do
+                    token="${seg[i]}"
+                    case $token in
+                        --)
+                            (( i += 1 ))
+                            break
+                            ;;
+                        -u|--unset)
+                            (( i += 2 ))
+                            continue
+                            ;;
+                        [[:alpha:]_][[:alnum:]_]#=*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        -*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                ;;
+            sudo|doas)
+                (( i += 1 ))
+                while (( i <= seg_len )); do
+                    token="${seg[i]}"
+                    case $token in
+                        --)
+                            (( i += 1 ))
+                            break
+                            ;;
+                        -u|-g|-h|-p|-C|-c|-r|-t|-a|-D)
+                            (( i += 2 ))
+                            continue
+                            ;;
+                        --user|--group|--host|--prompt|--close-from|--class|--role|--type|--chdir)
+                            (( i += 2 ))
+                            continue
+                            ;;
+                        [[:alpha:]_][[:alnum:]_]#=*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        -*)
+                            (( i += 1 ))
+                            continue
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                ;;
+            *)
+                REPLY="$i"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+_z::exec::scan_patterns() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local input="${1:-}"
+    local -a words seg seg_args
+    local cmd="" w=""
+    typeset -i cmd_idx=0
+
+    [[ -z $input ]] && return 0
+    _z::exec::is_init_cmd "$input" && return 0
+
+    # Use whitespace-only splitting to avoid shell-parsing untrusted input.
+    # This is intentionally lexical, not syntactic: quoted arguments are still
+    # split on spaces, so heuristics can miss cases like '"/tmp dir"'.
+    words=("${(s: :)input}")
+    (( ${#words} == 0 )) && return 0
+
+    if [[ $input =~ $_ZBASE_EXEC_FORK_BOMB_1_RE && $input =~ $_ZBASE_EXEC_FORK_BOMB_2_RE ]]; then
+        z::log::always "SECURITY: Dangerous pattern: fork bomb detected" input "$input"
+        return 1
+    fi
+
+    seg=()
+    for w in "${words[@]}"; do
+        case $w in
+            '|'|'||'|'&&'|';'|'&')
+                if (( ${#seg} )); then
+                    if _z::exec::segment_command_index "${seg[@]}"; then
+                        cmd_idx=$(( 10#$REPLY ))
+                        cmd="${seg[cmd_idx]}"
+                        if (( cmd_idx < ${#seg} )); then
+                            seg_args=("${(@)seg[cmd_idx + 1,-1]}")
+                        else
+                            seg_args=()
+                        fi
+                        _z::exec::check_segment "$cmd" "${seg_args[@]}" || return 1
+                    fi
+                    seg=()
+                fi
+                ;;
+            *)
+                seg+=("$w")
+                ;;
+        esac
+    done
+
+    if (( ${#seg} )); then
+        if _z::exec::segment_command_index "${seg[@]}"; then
+            cmd_idx=$(( 10#$REPLY ))
+            cmd="${seg[cmd_idx]}"
+            if (( cmd_idx < ${#seg} )); then
+                seg_args=("${(@)seg[cmd_idx + 1,-1]}")
+            else
+                seg_args=()
+            fi
+            _z::exec::check_segment "$cmd" "${seg_args[@]}" || return 1
+        fi
+    fi
+
+    return 0
+}
+
 z::exec::scan() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  local input="${1:-}"
-
-  z::validate::nonempty "$input" "input" || return $ZCORE_ERROR_INVALID_INPUT
-
-  _z::exec::scan_patterns "$input"
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local input="${1:-}"
+    z::validate::nonempty "$input" "input" || return $ZBASE_ERROR_INVALID_INPUT
+    _z::exec::scan_patterns "$input"
 }
 
-###
-# Alias for z::exec::scan — semantic sugar for conditional use.
-#
-# @param 1: string - Command string to test
-# @return 0 if safe, 1 if dangerous
-#
-# @example
-#   if z::exec::is_safe "$cmd"; then z::exec::run "$cmd"; fi
-###
 z::exec::is_safe() {
-  emulate -L zsh
-  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
-
-  z::exec::scan "$@"
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    z::exec::scan "$@"
 }
 
-# =============================================================================
-# FRAMEWORK LOAD AUDIT
-# Emit a single always-on log entry when zbase is sourced.
-# This creates an audit trail for framework lifecycle events.
-# =============================================================================
-z::log::always "zbase loaded" \
-  module  "zbase"             \
-  version "1.0.0"             \
-  pid     "$$"
+z::exec::run() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local input="${1:-}"
+    typeset -i timeout=$_ZBASE_EXEC_TIMEOUT_DEFAULT exit_code=0
+    if [[ -z $input ]]; then
+        z::log::error "z::exec::run: command required"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    if [[ -n ${2:-} ]]; then
+        if [[ ${2:-} != <-> ]]; then
+            z::log::error "z::exec::run: timeout must be a non-negative integer" timeout "${2:-}"
+            return $ZBASE_ERROR_INVALID_INPUT
+        fi
+        timeout=$(( 10#${2} ))
+        if (( timeout > _ZBASE_EXEC_TIMEOUT_MAX )); then
+            z::log::error "z::exec::run: timeout exceeds allowed maximum" \
+                timeout "$timeout" max "$_ZBASE_EXEC_TIMEOUT_MAX"
+            return $ZBASE_ERROR_INVALID_INPUT
+        fi
+    fi
+    if ! _z::exec::is_init_cmd "$input"; then
+        if _z::exec::has_dangerous_metachars "$input"; then
+            z::log::error "z::exec::run: rejected dangerous metacharacters" input "$input"
+            return $ZBASE_ERROR_PERMISSION
+        fi
+    fi
+    _z::exec::scan_patterns "$input" || return $?
+    if (( timeout > 0 )) && [[ -n $_ZBASE_TIMEOUT_CMD ]]; then
+        "$_ZBASE_TIMEOUT_CMD" "$timeout" zsh -o pipefail -c "$input" || exit_code=$?
+        if (( exit_code == 124 )); then
+            z::log::warn "z::exec::run: timeout after ${timeout}s" cmd "$input"
+        fi
+    else
+        if (( timeout > 0 )) && [[ -z $_ZBASE_TIMEOUT_CMD ]]; then
+            z::log::once "zbase-no-timeout-cmd" debug \
+                "z::exec::run: no timeout binary available; running without enforcement"
+        fi
+        zsh -o pipefail -c "$input" || exit_code=$?
+    fi
+    if (( exit_code != 0 && exit_code != 124 )); then
+        z::log::warn "z::exec::run: command failed" exit_code "$exit_code" cmd "$input"
+    fi
+    return $exit_code
+}
+
+z::exec::eval() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local input="${1:-}"
+    if [[ -z $input ]]; then
+        z::log::error "z::exec::eval: command required"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    z::exec::run "$input" "${2:-}"
+}
+
+_z::exec::eval_trusted() {
+    local input="${1:-}" label="${2:-unknown}"
+    typeset -i exit_code=0
+    if [[ -z $input ]]; then
+        z::log::error "_z::exec::eval_trusted: input required"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    local _ctx=""
+    # Intentional trust boundary: this runs in the live caller shell rather than
+    # under emulate -L, so tool init code can mutate the active environment.
+    if z::log::if_debug; then
+        z::log::with_context "trusted_eval" "$label"
+        _ctx="$REPLY"
+        [[ -n $_ctx ]] && ${_ctx}::debug "Trusted eval in current shell"
+    fi
+    builtin eval -- "$input" || exit_code=$?
+    if (( exit_code != 0 )); then
+        if [[ -n $_ctx ]]; then
+            ${_ctx}::warn "Trusted eval failed" exit_code "$exit_code"
+        else
+            z::log::warn "Trusted eval failed" label "$label" exit_code "$exit_code"
+        fi
+    fi
+    [[ -n $_ctx ]] && z::log::remove_context "$_ctx"
+    return $exit_code
+}
+
+_z::exec::async_prune() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local pid
+    local -a alive
+    for pid in "${_ZBASE_ASYNC_PIDS[@]}"; do
+        kill -0 -- "$pid" 2>/dev/null && alive+=("$pid")
+    done
+    _ZBASE_ASYNC_PIDS=("${alive[@]}")
+}
+
+z::exec::async() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local cmd="${1:-}" callback="${2:-}"
+    local job_id
+    REPLY=""
+    REPLY2=""
+    reply=()
+    if [[ -z $cmd ]]; then
+        z::log::error "z::exec::async: command required"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    _z::exec::async_prune
+    if (( ${#_ZBASE_ASYNC_PIDS} >= _ZBASE_ASYNC_MAX_PIDS )); then
+        z::log::error "z::exec::async: pending PID cap reached; call z::exec::wait_all first" \
+            pending "${#_ZBASE_ASYNC_PIDS}" max "$_ZBASE_ASYNC_MAX_PIDS"
+        return $ZBASE_ERROR_GENERAL
+    fi
+    {
+        emulate -L zsh
+        local result
+        typeset -i exit_code=0
+        result=$(z::exec::run "$cmd" 2>&1)
+        exit_code=$?
+        if [[ -n $callback ]] && z::probe::func "$callback"; then
+            "$callback" "$exit_code" "$result"
+        elif (( exit_code != 0 )) && z::log::if_debug; then
+            z::log::debug "z::exec::async: job failed with no callback" \
+                exit_code "$exit_code" cmd "$cmd"
+        fi
+    } &
+    job_id=$!
+    _ZBASE_ASYNC_PIDS+=("$job_id")
+    if z::log::if_debug; then
+        z::log::debug "z::exec::async: job launched" pid "$job_id" cmd "$cmd"
+    fi
+    REPLY="$job_id"
+    return 0
+}
+
+z::exec::wait_all() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local pid
+    local -a pending_pids
+    typeset -i wait_status=0 pid_status=0
+    pending_pids=("${_ZBASE_ASYNC_PIDS[@]}")
+    _ZBASE_ASYNC_PIDS=()
+    for pid in "${pending_pids[@]}"; do
+        wait "$pid"
+        pid_status=$?
+        if (( pid_status != 0 && pid_status != 127 )); then
+            wait_status=$pid_status
+        fi
+    done
+    return $wait_status
+}
+
+z::exec::from_hook() {
+    emulate -L zsh
+    local tool_name="${1:-}" subcommand="${2:-init}" shell_arg="${3:-zsh}"
+    local init_code init_label
+    typeset -i tool_rc=0
+    if ! z::probe::cmd "$tool_name"; then
+        z::log::debug "${tool_name} not found, skipping hook"
+        return 0
+    fi
+    init_label="${tool_name} ${subcommand} ${shell_arg}"
+    local _hook_timer=""
+    if z::log::if_debug; then
+        z::log::benchmark_start "z::exec::from_hook:${tool_name}"
+        _hook_timer="$REPLY"
+    fi
+    # Explicit trust boundary: output from a known, validated tool binary is
+    # eval'd directly without pattern scanning.  This is intentionally different
+    # from z::exec::run (which scans untrusted strings).  Do not remove this
+    # comment — the asymmetry is by design.
+    init_code=$("$tool_name" "$subcommand" "$shell_arg" 2>/dev/null)
+    tool_rc=$?
+    if [[ -n $init_code ]]; then
+        if (( tool_rc != 0 )); then
+            z::log::debug "${tool_name} exited non-zero but produced output; proceeding with eval" \
+                label "$init_label" exit_code "$tool_rc"
+        fi
+        if _z::exec::eval_trusted "$init_code" "$init_label"; then
+            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
+            z::log::debug "${tool_name} initialized" label "$init_label"
+            return 0
+        else
+            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
+            z::log::warn "Failed to initialize ${tool_name}" label "$init_label"
+            return $ZBASE_ERROR_GENERAL
+        fi
+    else
+        [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
+        z::log::debug "${tool_name} produced no init output" \
+            label "$init_label" exit_code "$tool_rc"
+        return 0
+    fi
+}
+
+_z::file::resolve::step() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local _var="$1"
+    local _cur="${(P)_var}"
+    local _target=""
+    if (( _ZBASE_HAVE_ZSTAT )); then
+        zstat -A _target +link -- "$_cur" 2>/dev/null || return 1
+    else
+        _target=$(readlink -- "$_cur" 2>/dev/null) || return 1
+    fi
+    [[ -z $_target ]] && return 1
+    if [[ $_target == /* ]]; then
+        : "${(P)_var::=$_target}"
+    else
+        : "${(P)_var::=${_cur:h}/$_target}"
+    fi
+    : "${(P)_var::=${${(P)_var}:A}}"
+    return 0
+}
+
+z::file::resolve() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+    local path="${1:-}"
+    REPLY=""
+    REPLY2=""
+    reply=()
+    if [[ -z $path || $path =~ ^[[:space:]]*$ ]]; then
+        z::log::error "z::file::resolve: empty path"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+    _z::env::normalize_path "$path"
+    path="$REPLY"
+    local current_path="${path:A}"
+    local physical_dir
+    typeset -A visited_paths
+    typeset -i iteration_count=0
+    if (( _ZBASE_HAVE_ZSTAT )) || (( ${+commands[readlink]} )); then
+        while [[ -L $current_path ]]; do
+            (( iteration_count += 1 ))
+            if (( iteration_count > _ZBASE_SYMLINK_MAX_ITER )); then
+                z::log::warn "z::file::resolve: symlink resolution exceeded max" \
+                    path "$current_path" max "$_ZBASE_SYMLINK_MAX_ITER"
+                REPLY="$current_path"
+                return $ZBASE_ERROR_GENERAL
+            fi
+            if (( ${+visited_paths[$current_path]} )); then
+                z::log::warn "z::file::resolve: symlink cycle detected" path "$current_path"
+                REPLY="$current_path"
+                return $ZBASE_ERROR_GENERAL
+            fi
+            visited_paths[$current_path]=1
+            _z::file::resolve::step current_path || break
+        done
+    fi
+    if [[ -d ${current_path:h} ]]; then
+        if physical_dir=$(cd -P -- "${current_path:h}" 2>/dev/null && pwd -P); then
+            if [[ $physical_dir == / ]]; then
+                current_path="/${current_path:t}"
+            else
+                current_path="${physical_dir}/${current_path:t}"
+            fi
+        fi
+    fi
+    REPLY="$current_path"
+    return 0
+}
+
+_z::file::source::resolve_readable() {
+    emulate -L zsh
+    setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+    local file="${1:-}" resolved_file
+    typeset -i resolve_rc=0
+
+    typeset -g  REPLY=""
+    typeset -g  REPLY2=""
+    typeset -ga reply=()
+
+    if [[ -z $file ]]; then
+        z::log::error "z::file::source: file path required"
+        return $ZBASE_ERROR_INVALID_INPUT
+    fi
+
+    _z::env::normalize_path "$file"
+    resolved_file="$REPLY"
+
+    if (( ! _ZBASE_PERF_MODE )); then
+        z::file::resolve "$resolved_file"
+        resolve_rc=$?
+        if (( resolve_rc != 0 )); then
+            z::log::error "z::file::source: failed to resolve" \
+                path "$file" error_code "$resolve_rc"
+            return $resolve_rc
+        fi
+        resolved_file="$REPLY"
+    fi
+
+    if [[ ! -f $resolved_file || ! -r $resolved_file ]]; then
+        z::log::warn "z::file::source: file not readable" path "$resolved_file"
+        return $ZBASE_ERROR_NOT_FOUND
+    fi
+
+    REPLY="$resolved_file"
+    return 0
+}
+
+z::file::source() {
+    local use_global_scope=0
+    local file="" resolved_file=""
+    typeset -i exit_code=0
+
+    if [[ ${1-} == --global ]]; then
+        use_global_scope=1
+        shift
+    fi
+
+    file="${1:-}"
+    shift
+
+    _z::file::source::resolve_readable "$file" || return $?
+    resolved_file="$REPLY"
+
+    local _src_timer=""
+    if z::log::if_debug; then
+        z::log::benchmark_start "z::file::source:${resolved_file:t}"
+        _src_timer="$REPLY"
+    fi
+
+    if (( use_global_scope )); then
+        builtin source "$resolved_file" "$@" || exit_code=$?
+    else
+        emulate -L zsh
+        setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+        builtin source "$resolved_file" "$@" || exit_code=$?
+    fi
+
+    [[ -n $_src_timer ]] && z::log::benchmark_end "$_src_timer"
+
+    if (( exit_code != 0 )); then
+        z::log::warn "z::file::source: source failed" \
+            path "$resolved_file" exit_code "$exit_code"
+    fi
+    return $exit_code
+}
+
+z::log::once "zbase-loaded" info "zbase loaded" \
+    module       "zbase" \
+    version      "$_ZBASE_VERSION" \
+    pid          "$$" \
+    has_zstat    "$_ZBASE_HAVE_ZSTAT" \
+    timeout_cmd  "${_ZBASE_TIMEOUT_CMD:-none}"
+
+typeset -gi _ZBASE_LOADED=1
