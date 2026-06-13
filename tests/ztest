@@ -1,0 +1,368 @@
+#!/usr/bin/env zsh
+##############################################################################
+# ztest — minimal test framework for zsh modules
+#
+# Conventions:
+#   - Test functions named test_* are auto-discovered
+#   - Each test runs in a forked subshell — global state is isolated
+#   - Failed assertions print to stderr, increment a per-test counter,
+#     and continue (so one test can report multiple failures)
+#   - Optional hooks: test_setup, test_teardown (per-test)
+#                     test_setup_all, test_teardown_all (per-run)
+#
+# Usage:
+#   source ./ztest.zsh
+#   source ./tests/test_my_module.zsh
+#   ztest::run                 # all test_* functions
+#   ztest::run "test_zkv_*"    # filtered
+#
+# Assumptions:
+#   - The framework must not alter shell emulation/options around user code.
+#   - Hook names remain global; if multiple sourced files redefine test_setup
+#     or test_teardown, the last definition still wins.
+##############################################################################
+
+# Idempotent load
+if (( ${_ztest_loaded:-0} )); then
+    return 0
+fi
+typeset -gi _ztest_loaded=1
+
+# ── Counters ──────────────────────────────────────────────────────────────
+typeset -gi _ztest_pass=0 _ztest_fail=0 _ztest_skip=0
+typeset -gi _ztest_total_assertions=0
+typeset -g _ztest_current=""
+
+# Colors via zlog if available, plain otherwise
+_ztest_c() {
+    if (( ${+functions[z::log::colorize]} )); then
+        z::log::colorize "$1" "$2"
+        print -r -- "$REPLY"
+    else
+        print -r -- "$2"
+    fi
+}
+
+_ztest_mktemp() {
+    local tmp
+    tmp=$(mktemp -t ztest.XXXXXX 2>/dev/null) \
+        || tmp=$(mktemp "${TMPDIR:-/tmp}/ztest.XXXXXX" 2>/dev/null) \
+        || return 1
+    REPLY="$tmp"
+}
+
+_ztest_print_file_indented() {
+    local file="$1"
+    local prefix="${2:-    }"
+    local fd="${3:-2}"
+    local line
+
+    [[ -r "$file" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        print -u${fd} -r -- "${prefix}${line}"
+    done < "$file"
+}
+
+_ztest_extract_skip_reason() {
+    local file="$1"
+    local line
+
+    REPLY=""
+    [[ -r "$file" ]] || return 1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == SKIP:* ]]; then
+            REPLY="${line#SKIP:}"
+            return 0
+        fi
+    done < "$file"
+
+    return 1
+}
+
+##############################################################################
+# Assertions — print to stderr on fail, bump counter, return non-zero.
+# Each test should `return 0` at the end; assertion failures propagate via
+# the per-test counter that's checked in _ztest_run_one.
+#
+# Note:
+#   ztest::assert::true/false accept callable command forms only.
+#   They cannot directly take raw `[[ ... ]]` or `(( ... ))` syntax as argv.
+##############################################################################
+
+ztest::assert::eq() {
+    local expected="$1" actual="$2" msg="${3:-}"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ "$expected" == "$actual" ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::eq failed${msg:+ ($msg)}"
+    print -u2 -r -- "      expected: '$expected'"
+    print -u2 -r -- "      actual:   '$actual'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::ne() {
+    local notexp="$1" actual="$2" msg="${3:-}"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ "$notexp" != "$actual" ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::ne failed${msg:+ ($msg)}"
+    print -u2 -r -- "      both were: '$actual'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::true() {
+    (( _ztest_local_assertions += 1 ))
+
+    if "$@"; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::true failed: ${(j: :)${(@q)@}}"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::false() {
+    (( _ztest_local_assertions += 1 ))
+
+    if ! "$@" 2>/dev/null; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::false failed (expected non-zero): ${(j: :)${(@q)@}}"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::returns() {
+    local expected_rc="$1"
+    shift
+    (( _ztest_local_assertions += 1 ))
+
+    "$@" 2>/dev/null
+    local actual=$?
+
+    if (( actual == expected_rc )); then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::returns failed: ${(j: :)${(@q)@}}"
+    print -u2 -r -- "      expected rc=$expected_rc, got rc=$actual"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::contains() {
+    local haystack="$1" needle="$2"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ "$haystack" == *"$needle"* ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::contains failed"
+    print -u2 -r -- "      haystack: '$haystack'"
+    print -u2 -r -- "      needle:   '$needle'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::set() {
+    local var="$1"
+    (( _ztest_local_assertions += 1 ))
+
+    if (( ${(P)+var} )); then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::set failed: variable '$var' is not set"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::assert::array_eq() {
+    local exp_name="$1" act_name="$2"
+    local -a exp act
+    local i
+
+    (( _ztest_local_assertions += 1 ))
+    exp=("${(@P)exp_name}")
+    act=("${(@P)act_name}")
+
+    if (( ${#exp} == ${#act} )); then
+        for (( i = 1; i <= ${#exp}; i++ )); do
+            if [[ "${exp[i]}" != "${act[i]}" ]]; then
+                print -u2 -r -- "  ✗ assert::array_eq failed at index $i"
+                print -u2 -r -- "      expected: '${exp[i]}'"
+                print -u2 -r -- "      actual:   '${act[i]}'"
+                (( _ztest_local_fails += 1 ))
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::array_eq failed: length ${#exp} != ${#act}"
+    print -u2 -r -- "      expected: (${(j:, :)exp})"
+    print -u2 -r -- "      actual:   (${(j:, :)act})"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::fail() {
+    print -u2 -r -- "  ✗ ${1:-explicit fail}"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+ztest::skip() {
+    print -u2 -r -- "SKIP:${1:-no reason}"
+    exit 77
+}
+
+##############################################################################
+# Runner
+##############################################################################
+
+_ztest_run_one() {
+    local test_name="$1"
+    local tmp_base tmp_err tmp_out tmp_count
+    local raw_assertions=""
+    typeset -i assertions=0
+
+    if ! _ztest_mktemp; then
+        (( _ztest_fail += 1 ))
+        _ztest_c red "  ✗ $test_name"
+        print -u2 -r -- "    ztest: failed to create temp file"
+        return 1
+    fi
+
+    tmp_base="$REPLY"
+    tmp_err="$tmp_base"
+    tmp_out="${tmp_base}.out"
+    tmp_count="${tmp_base}.count"
+
+    (
+        typeset -gi _ztest_local_fails=0
+        typeset -gi _ztest_local_assertions=0
+        _ztest_current="$test_name"
+
+        TRAPEXIT() {
+            print -r -- "$_ztest_local_assertions" >| "$tmp_count"
+        }
+
+        if (( ${+functions[test_setup]} )); then
+            test_setup || {
+                print -u2 -r -- "  ✗ test_setup failed"
+                exit 1
+            }
+        fi
+
+        "$test_name"
+        local test_rc=$?
+
+        if (( ${+functions[test_teardown]} )); then
+            test_teardown || true
+        fi
+
+        if (( _ztest_local_fails > 0 || test_rc != 0 )); then
+            exit 1
+        fi
+        exit 0
+    ) >"$tmp_out" 2>"$tmp_err"
+
+    local rc=$?
+
+    if [[ -r "$tmp_count" ]]; then
+        IFS= read -r raw_assertions < "$tmp_count"
+        [[ "$raw_assertions" == <-> ]] && assertions="$raw_assertions"
+    fi
+
+    (( _ztest_total_assertions += assertions ))
+
+    case "$rc" in
+        0)
+            (( _ztest_pass += 1 ))
+            _ztest_c green "  ✓ $test_name (${assertions} assertion(s))"
+            ;;
+        77)
+            (( _ztest_skip += 1 ))
+            _ztest_extract_skip_reason "$tmp_err" || true
+            _ztest_c yellow "  ⊘ $test_name — ${REPLY:-skipped}"
+            ;;
+        *)
+            (( _ztest_fail += 1 ))
+            _ztest_c red "  ✗ $test_name"
+            [[ -s "$tmp_err" ]] && _ztest_print_file_indented "$tmp_err" "    " 2
+            if [[ -s "$tmp_out" ]]; then
+                print -u2 -r -- "    [stdout]"
+                _ztest_print_file_indented "$tmp_out" "    " 2
+            fi
+            ;;
+    esac
+
+    rm -f -- "$tmp_err" "$tmp_out" "$tmp_count"
+}
+
+ztest::run() {
+    local pattern="${1:-test_*}"
+    local -a tests
+
+    tests=(${(M)${(k)functions}:#${~pattern}})
+    tests=(${tests:#test_setup})
+    tests=(${tests:#test_teardown})
+    tests=(${tests:#test_setup_all})
+    tests=(${tests:#test_teardown_all})
+    tests=("${(@o)tests}")
+
+    if (( ${#tests} == 0 )); then
+        print -u2 -r -- "ztest: no tests matching '$pattern'"
+        return 1
+    fi
+
+    _ztest_pass=0
+    _ztest_fail=0
+    _ztest_skip=0
+    _ztest_total_assertions=0
+
+    print
+    _ztest_c bold "ztest: running ${#tests} test(s) matching '$pattern'"
+    print -r -- "──────────────────────────────────────────────────────────"
+
+    if (( ${+functions[test_setup_all]} )); then
+        test_setup_all || {
+            print -u2 -r -- "test_setup_all failed"
+            return 1
+        }
+    fi
+
+    local t
+    for t in "${tests[@]}"; do
+        _ztest_run_one "$t"
+    done
+
+    if (( ${+functions[test_teardown_all]} )); then
+        test_teardown_all || true
+    fi
+
+    print -r -- "──────────────────────────────────────────────────────────"
+    local total=$(( _ztest_pass + _ztest_fail + _ztest_skip ))
+
+    if (( _ztest_fail == 0 )); then
+        _ztest_c green "✓ ${_ztest_pass}/${total} passed (${_ztest_total_assertions} assertions, ${_ztest_skip} skipped)"
+        return 0
+    fi
+
+    _ztest_c red "✗ ${_ztest_fail}/${total} failed (${_ztest_pass} passed, ${_ztest_skip} skipped, ${_ztest_total_assertions} assertions)"
+    return 1
+}
