@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
 
-if [[ ! -f "${0:h}/../z.zsh" ]]; then
-  print -r -- "ERROR: z.zsh not found. Please run this script from the 'examples' directory." >&2
+if [[ ! -f "${0:h}/../zcore.zsh" ]]; then
+  print -r -- "ERROR: zcore.zsh not found. Please run this script from the 'examples' directory." >&2
   exit 1
 fi
-source "${0:h}/../z.zsh" || exit 1
+source "${0:h}/../zcore.zsh" || exit 1
 
 z::log::info "--- Zcore Logging and Configuration Demo ---"
 
