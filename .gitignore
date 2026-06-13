@@ -7,3 +7,7 @@ README.md
 .zsh_history
 .zcompdump
 logs
+.z*
+.clauge-worktrees
+.junie
+.serena

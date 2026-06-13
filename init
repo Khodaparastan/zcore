@@ -89,8 +89,8 @@ z::interactive::load_mods() {
 z::interactive::load_libs() {
   emulate -L zsh
   setopt local_options typeset_silent
-  source "$ZDOTDIR/zlog.zsh"
-  source "$ZDOTDIR/zbase.zsh"
+  source "$ZDOTDIR/zlog"
+  source "$ZDOTDIR/zbase"
   source "$ZDOTDIR/ui.zsh"
   source "$ZDOTDIR/zkv.zsh"
   source "$ZDOTDIR/zbus.zsh"
