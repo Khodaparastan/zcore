@@ -1,1148 +1,1632 @@
-#!/usr/bin/env zsh
-
-################################################################################
-# ZCORE EVENT BUS  (zbus)
-################################################################################
+# =============================================================================
+# zbus — Zsh Event Bus
 #
-# A production-grade pub/sub event system for Zsh with:
-#   - Event registration and emission
-#   - Priority-based handler ordering (0–100, higher runs first)
-#   - One-time event handlers
-#   - Event namespacing and wildcard patterns
-#   - Handler removal and full cleanup
-#   - Event history and statistics
-#   - Async event emission (fire-and-forget)
-#   - Safe emission with per-handler subshell + hard timeout isolation
-#   - Error isolation (a failing handler never crashes the bus)
-#   - Full zlog integration for structured, leveled diagnostics
+# A process-scoped, in-memory event bus with priority-ordered dispatch,
+# wildcard subscriptions, TTL-safe async emission, pub/sub channels,
+# a ring-buffer history, and per-event statistics.
 #
-# Requires: zlog.zsh (z::log::*), z.zsh (z::config::*, z::validate::*, z::probe::*)
-# System:   timeout(1) — GNU coreutils, for hard per-handler timeout in emit_safe
-# Version: 2.1.0
-################################################################################
+# Usage:
+#   source zbus          # after sourcing zlog, zbase, and zkv
+#   z::bus::init [options]
+#   z::bus::on   <event> <handler-func> [--priority <0-100>] [--once]
+#   z::bus::emit <event> [args ...]
+#   # ... see Public API below
+#
+# Public API:   z::bus::*
+# Private API:  _z::bus::*
+#
+# Architecture:
+#   Handlers, metadata, channels, history, stats — all process-scoped maps.
+#   Config — stored in the "__zbus" zkv store (persists if zkv auto-persist
+#             is enabled).
+#   Wildcards — separate map; matched via [[ name == ${~pattern} ]].
+#   emit_safe  — subprocess + watchdog with elapsed-time timeout detection.
+#   emit_async — backgrounded dispatch with PID tracking, prunable, joinable.
+#
+# Requires:
+#   zlog  — must be sourced before zbus (provides z::log::*)
+#   zbase — must be sourced before zbus (provides z::validate::*, z::probe::*)
+#   zkv   — v4+ must be sourced before zbus (provides z::kv::*)
+# =============================================================================
 
-# Guard against double-sourcing
-if [[ ${_zcore_event_bus_loaded:-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
-typeset -g _zcore_event_bus_loaded=1
 
-################################################################################
-# STATE
-################################################################################
+# -----------------------------------------------------------------------------
+# RUNTIME DEPENDENCY CHECKS
+# -----------------------------------------------------------------------------
 
-# Handler storage — split for O(1) exact vs O(n) wildcard
-typeset -gA _zcore_event_handlers_exact     # event_name  -> pipe-separated handler IDs
-typeset -gA _zcore_event_handlers_wildcard  # pattern     -> pipe-separated handler IDs
+if (( ! ${+functions[z::log::info]} )); then
+  print -u2 "zbus: fatal: zlog must be sourced before zbus"; return 1
+fi
+if (( ! ${+functions[z::validate::nonempty]} )); then
+  print -u2 "zbus: fatal: zbase must be sourced before zbus"; return 1
+fi
+if (( ! ${+functions[z::kv::open]} )); then
+  print -u2 "zbus: fatal: zkv must be sourced before zbus"; return 1
+fi
+if (( ! ${+Z_SEP} )); then
+  print -u2 "zbus: fatal: zbase separator constants missing"; return 1
+fi
+if (( ! ${+ZBASE_ERROR_GENERAL} )); then
+  print -u2 "zbus: fatal: zbase error codes missing — zbase too old"; return 1
+fi
+if (( ! ${+ZKV_VERSION} )) || (( ZKV_VERSION < 4 )); then
+  print -u2 "zbus: fatal: zkv v4+ required (got ${ZKV_VERSION:-<unknown>})"; return 1
+fi
 
-# Per-handler metadata: "${id}.{key}" -> value
-typeset -gA _zcore_event_handler_meta
 
-# Event history (ring-buffer maintained by __z::event::add_to_history)
-typeset -ga _zcore_event_history
+# -----------------------------------------------------------------------------
+# IDEMPOTENT LOAD GUARD
+# -----------------------------------------------------------------------------
 
-# Monotonic handler ID counter
-typeset -gi _zcore_event_handler_id=0
+if (( ${_zbus_loaded:-0} )); then return 0; fi
+typeset -gi _zbus_loaded=1
 
-# Emission statistics: "${event}.{emitted|handled|failed}" -> count
-typeset -gA _zcore_event_stats
 
-################################################################################
-# PRIORITY CONSTANTS  (read-only globals)
-################################################################################
+# -----------------------------------------------------------------------------
+# CONSTANTS
+# -----------------------------------------------------------------------------
 
-typeset -gri ZCORE_EVENT_PRIORITY_HIGHEST=100
-typeset -gri ZCORE_EVENT_PRIORITY_HIGH=75
-typeset -gri ZCORE_EVENT_PRIORITY_NORMAL=50
-typeset -gri ZCORE_EVENT_PRIORITY_LOW=25
-typeset -gri ZCORE_EVENT_PRIORITY_LOWEST=0
+typeset -gri ZBUS_VERSION=3
 
-################################################################################
-# DEFAULT CONFIGURATION  (via z::config, overridable at runtime)
-################################################################################
+# Named priority levels for z::bus::on --priority.
+typeset -gri ZBUS_PRIORITY_HIGHEST=100
+typeset -gri ZBUS_PRIORITY_HIGH=75
+typeset -gri ZBUS_PRIORITY_NORMAL=50
+typeset -gri ZBUS_PRIORITY_LOW=25
+typeset -gri ZBUS_PRIORITY_LOWEST=0
 
-# Hard-coded default constants — used as fallback when z::config::get is
-# unavailable (e.g. z::kv backend not loaded) to prevent arithmetic errors.
-typeset -gri ZCORE_EVENT_MAX_HISTORY=100
-typeset -gri ZCORE_EVENT_HANDLER_TIMEOUT=5
-typeset -gri ZCORE_EVENT_MAX_HANDLERS_PER_EVENT=50
+# Config key constants — these are the zkv keys stored in the __zbus store.
+typeset -gr ZBUS_CFG_MAX_HISTORY="cfg:max_history"
+typeset -gr ZBUS_CFG_HANDLER_TIMEOUT="cfg:handler_timeout"
+typeset -gr ZBUS_CFG_MAX_HANDLERS="cfg:max_handlers_per_event"
+typeset -gr ZBUS_CFG_ENABLE_HISTORY="cfg:enable_history"
+typeset -gr ZBUS_CFG_ENABLE_STATS="cfg:enable_stats"
+typeset -gr ZBUS_CFG_ENABLE_WILDCARDS="cfg:enable_wildcards"
 
-# Register the same values with the config system for runtime overrides.
-z::config::set event_max_history            $ZCORE_EVENT_MAX_HISTORY
-z::config::set event_handler_timeout        $ZCORE_EVENT_HANDLER_TIMEOUT
-z::config::set event_max_handlers_per_event $ZCORE_EVENT_MAX_HANDLERS_PER_EVENT
-z::config::set event_enable_history         true
-z::config::set event_enable_stats           true
-z::config::set event_enable_wildcards       true
+# Internal zkv store handle for persisted configuration.
+typeset -gr _ZBUS_STORE="__zbus"
 
-################################################################################
-# PRIVATE HELPERS
-################################################################################
+# Separator constants inherited from zbase (see NOTE in _z::bus::parse_handler_list).
+typeset -gr _ZBUS_SEP="$Z_SEP"
+typeset -gr _ZBUS_RECSEP="$Z_RECSEP"
 
-###
-# Generate the next unique handler ID.
-# Sets the variable named by $1 in the caller's scope.
-# @private
-###
-__z::event::generate_id() {
-  emulate -L zsh
-  setopt localoptions no_unset warn_create_global
-  (( _zcore_event_handler_id += 1 ))
-  : ${(P)1::=handler_${_zcore_event_handler_id}}
-}
 
-###
-# Validate event name — alphanumeric plus _ : * -
-# @private  @return 0 valid | ZCORE_ERROR_INVALID_INPUT invalid
-###
-__z::event::validate_event_name() {
-  emulate -L zsh
-  setopt localoptions no_unset extended_glob
+# -----------------------------------------------------------------------------
+# MODULE STATE — all process-scoped
+# -----------------------------------------------------------------------------
 
-  local event_name="$1"
-  z::validate::nonempty "$event_name" "Event name" || return $ZCORE_ERROR_INVALID_INPUT
+# Lazy-init flag; set to 1 after z::bus::init completes.
+typeset -gi _zbus_initialized=0
+typeset -gi _zbus_perf_mode=0
 
-  if [[ ! $event_name =~ ^[a-zA-Z0-9_:*-]+$ ]]; then
-    z::log::error "Invalid event name format" \
-      name "$event_name" allowed "a-zA-Z0-9_:*-"
-    return $ZCORE_ERROR_INVALID_INPUT
+# Handler registry.
+# _zbus_handlers_exact:    exact event name → _ZBUS_SEP-joined handler IDs
+# _zbus_handlers_wildcard: glob pattern     → _ZBUS_SEP-joined handler IDs
+# _zbus_channels:          channel name     → _ZBUS_SEP-joined handler funcs (pub/sub)
+# _zbus_handler_meta:      "${id}.field"    → value  (function/priority/once/event)
+typeset -gA _zbus_handlers_exact
+typeset -gA _zbus_handlers_wildcard
+typeset -gA _zbus_channels
+typeset -gA _zbus_handler_meta
+typeset -gi _zbus_handler_id=0
+
+# Cached config — populated by _z::bus::cache_config on init and after every
+# z::bus::config write.  Avoids a zkv lookup on every emit/match hot path.
+typeset -gi _zbus_flag_wildcards=1
+typeset -gi _zbus_flag_history=1
+typeset -gi _zbus_flag_stats=1
+typeset -gi _zbus_cfg_max_history=100
+typeset -gi _zbus_cfg_handler_timeout=5
+typeset -gi _zbus_cfg_max_handlers=50
+
+# History ring buffer — O(1) append, O(1) trim.
+# Each entry: "${epoch}${RECSEP}${event}${RECSEP}${arg1}${SEP}${arg2}…"
+# _zbus_history_head:  next write index (0-based, mod cap)
+# _zbus_history_count: number of valid entries (≤ cap)
+typeset -ga _zbus_history_ring
+typeset -gi _zbus_history_head=0
+typeset -gi _zbus_history_count=0
+
+# Per-event operation counters, keyed by "${event}.${counter}".
+# counter ∈ { emitted, handled, failed, timeout }
+typeset -gA _zbus_stats
+
+# Async PID tracking — used by emit_async and wait_all_async.
+typeset -ga _zbus_async_pids
+typeset -gri _ZBUS_ASYNC_PID_CAP=200
+
+
+# =============================================================================
+# INIT / LAZY GUARD
+# =============================================================================
+
+# _z::bus::cache_config
+# Reads all config keys from the zkv store into the in-memory cache variables.
+# Called once on init and after every z::bus::config write.
+_z::bus::cache_config() {
+  local v
+
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_WILDCARDS" 2>/dev/null; then
+    [[ ${REPLY:l} == (true|1|yes|on) ]] && _zbus_flag_wildcards=1 || _zbus_flag_wildcards=0
+  fi
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_HISTORY" 2>/dev/null; then
+    [[ ${REPLY:l} == (true|1|yes|on) ]] && _zbus_flag_history=1 || _zbus_flag_history=0
+  fi
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_STATS" 2>/dev/null; then
+    [[ ${REPLY:l} == (true|1|yes|on) ]] && _zbus_flag_stats=1 || _zbus_flag_stats=0
+  fi
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HISTORY" 2>/dev/null; then
+    [[ $REPLY =~ '^[0-9]+$' ]] && _zbus_cfg_max_history=$REPLY
+  fi
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_HANDLER_TIMEOUT" 2>/dev/null; then
+    [[ $REPLY =~ '^[0-9]+$' ]] && _zbus_cfg_handler_timeout=$REPLY
+  fi
+  if z::kv::get "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HANDLERS" 2>/dev/null; then
+    [[ $REPLY =~ '^[0-9]+$' ]] && _zbus_cfg_max_handlers=$REPLY
   fi
 }
 
-###
-# Validate that a handler function is defined.
-# @private  @return 0 exists | ZCORE_ERROR_NOT_FOUND missing
-###
-__z::event::validate_handler() {
-  emulate -L zsh
-  setopt localoptions no_unset
+# _z::bus::ensure_init
+# Called at the top of every public entry point to trigger lazy initialisation.
+_z::bus::ensure_init() {
+  (( _zbus_initialized )) && return 0
+  z::bus::init || return $?
+  return 0
+}
 
-  local handler="$1"
-  z::validate::nonempty "$handler" "Handler" || return $ZCORE_ERROR_INVALID_INPUT
 
-  if ! z::probe::func "$handler"; then
-    z::log::error "Handler function not defined" handler "$handler"
-    return $ZCORE_ERROR_NOT_FOUND
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+# _z::bus::generate_id
+# Increments the global handler counter and returns a unique ID via REPLY.
+_z::bus::generate_id() {
+  (( _zbus_handler_id += 1 ))
+  REPLY="zbus_h_${_zbus_handler_id}"
+}
+
+# _z::bus::validate_event <name>
+# Accepts alphanumeric names plus _ : * . - ; rejects everything else.
+# The * character is allowed so wildcard patterns can be validated here too.
+_z::bus::validate_event() {
+  local name="$1"
+  z::validate::nonempty "$name" "event name" || return $ZBASE_ERROR_INVALID_INPUT
+  if [[ ! $name =~ '^[a-zA-Z0-9_:*.-]+$' ]]; then
+    z::log::error "zbus: invalid event name" name "$name" allowed "a-zA-Z0-9_:*.-"
+    return $ZBASE_ERROR_INVALID_INPUT
   fi
+  return 0
 }
 
-# Public alias used by framework probe machinery
-z::probe::event_handler() { emulate -L zsh; __z::event::validate_handler "${1:-}"; }
-
-################################################################################
-# PUBLIC API — CONVENIENCE ALIASES
-################################################################################
-
-###
-# Convenience aliases — idiomatic short-hand for subscribe / unsubscribe.
-# These are the names used throughout examples, tests, and documentation.
-###
-
-# z::event::on  — identical to z::event::subscribe
-z::event::on() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  z::event::subscribe "$@"
+# _z::bus::validate_handler <func>
+# Verifies the handler is non-empty and currently defined as a function.
+_z::bus::validate_handler() {
+  local func="$1"
+  z::validate::nonempty "$func" "handler" || return $ZBASE_ERROR_INVALID_INPUT
+  if ! z::probe::func "$func"; then
+    z::log::error "zbus: handler function not defined" handler "$func"
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+  return 0
 }
 
-# z::event::once — subscribe a handler that fires only once
-z::event::once() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  z::event::subscribe_once "$@"
-}
-
-# z::event::off  — identical to z::event::unsubscribe
-z::event::off() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  z::event::unsubscribe "$@"
-}
-
-###
-# Parse a pipe-separated handler list into the named array.
-# @private
-###
-__z::event::parse_handler_list() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local handler_list="$1"
-  local output_array="$2"
-
-  if [[ -z $handler_list ]]; then
-    : ${(PA)output_array::=()}
+# _z::bus::parse_handler_list <list> <array-name>
+# Splits a _ZBUS_SEP-delimited ID list into a named array.
+#
+# NOTE: $_ZBUS_SEP must be referenced UNBRACED inside (ps)/(pj) flag args.
+# Inside zsh flag arguments a braced ${...} is taken literally and NOT
+# parameter-expanded, so ${_ZBUS_SEP} would split/join on the literal text
+# "${_ZBUS_SEP}" instead of the \x01 byte.  The unbraced form expands
+# correctly.  This applies to every (p)s/(p)j flag throughout this file.
+_z::bus::parse_handler_list() {
+  local list="$1" arr_name="$2"
+  if [[ -z $list ]]; then
+    set -A "$arr_name"
     return 0
   fi
-
-  : ${(PA)output_array::=${(s:|:)handler_list}}
+  local -a _parsed
+  _parsed=("${(@ps:$_ZBUS_SEP:)list}")
+  set -A "$arr_name" "${_parsed[@]}"
 }
 
-###
-# Sort the named array of handler IDs descending by priority (in-place).
-# @private
-###
-__z::event::sort_handlers_by_priority() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local array_name="$1"
-  local -a handlers=("${(@P)array_name}")
-  local -a sortable
-  local handler_id
-  typeset -i priority_val
-
-  for handler_id in "${handlers[@]}"; do
-    (( priority_val = ${_zcore_event_handler_meta[${handler_id}.priority]:-50} ))
-    sortable+=("${priority_val}:${handler_id}")
-  done
-
-  # Numeric descending sort, then strip the priority prefix
-  handlers=("${(@)${(@On)sortable}#*:}")
-  : ${(PA)array_name::=${handlers[@]}}
-}
-
-###
-# Match event_name against pattern, honouring wildcard config.
-# @private  @return 0 matches | 1 no match
-###
-__z::event::match_pattern() {
-  emulate -L zsh
-  setopt localoptions extended_glob no_unset
-
-  local event_name="$1"
-  local pattern="$2"
-
+# _z::bus::match_pattern <event-name> <pattern>
+# Returns 0 if event_name matches pattern exactly, or via glob when wildcards
+# are enabled.  ${~pattern} enables glob expansion of the pattern string.
+_z::bus::match_pattern() {
+  local event_name="$1" pattern="$2"
   [[ $event_name == $pattern ]] && return 0
-
-  if { __z::event::cfg_flag event_enable_wildcards true; [[ $REPLY == true ]] }; then
-    [[ $event_name == ${~pattern} ]] && return 0
-  fi
-
-  return 1
+  (( _zbus_flag_wildcards )) || return 1
+  [[ $event_name == ${~pattern} ]]
 }
 
-###
-# Collect all handler IDs that match event_name into the named array.
-# Fills exact matches first (O(1)), then wildcard patterns (O(w)).
-# @private
-###
-__z::event::collect_handlers() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local event_name="$1"
-  local output_array="$2"
+# _z::bus::collect_handlers <event-name> <array-name>
+# Populates <array-name> with all handler IDs applicable to <event-name>:
+# exact-match IDs first, then IDs from every matching wildcard pattern.
+_z::bus::collect_handlers() {
+  local event_name="$1" arr_name="$2"
   local -a result
-  local handler_list pattern
 
-  # O(1) exact-match lookup
-  handler_list="${_zcore_event_handlers_exact[$event_name]:-}"
-  if [[ -n $handler_list ]]; then
+  local exact_list="${_zbus_handlers_exact[$event_name]:-}"
+  if [[ -n $exact_list ]]; then
     local -a exact_ids
-    __z::event::parse_handler_list "$handler_list" exact_ids
+    _z::bus::parse_handler_list "$exact_list" exact_ids
     result+=("${exact_ids[@]}")
   fi
 
-  # O(w) wildcard scan
-  if { __z::event::cfg_flag event_enable_wildcards true; [[ $REPLY == true ]] }; then
-    for pattern in "${(@k)_zcore_event_handlers_wildcard}"; do
-      if __z::event::match_pattern "$event_name" "$pattern"; then
-        handler_list="${_zcore_event_handlers_wildcard[$pattern]:-}"
-        if [[ -n $handler_list ]]; then
-          local -a wc_ids
-          __z::event::parse_handler_list "$handler_list" wc_ids
-          result+=("${wc_ids[@]}")
-        fi
+  if (( _zbus_flag_wildcards )); then
+    local pattern wc_list
+    local -a wc_ids
+    for pattern in "${(@k)_zbus_handlers_wildcard}"; do
+      if _z::bus::match_pattern "$event_name" "$pattern"; then
+        wc_list="${_zbus_handlers_wildcard[$pattern]:-}"
+        [[ -z $wc_list ]] && continue
+        wc_ids=()
+        _z::bus::parse_handler_list "$wc_list" wc_ids
+        result+=("${wc_ids[@]}")
       fi
     done
   fi
 
-  : ${(PA)output_array::=${result[@]}}
+  set -A "$arr_name" "${result[@]}"
 }
 
-###
-# Read a zbus config flag, returning the provided default when z::config::get
-# returns empty (e.g. when the z::kv backend is not loaded).
-# Usage: __z::event::cfg_flag KEY DEFAULT_VALUE
-# Sets REPLY to the resolved value.
-# @private
-###
-__z::event::cfg_flag() {
-  local _raw
-  _raw="$(z::config::get "$1" 2>/dev/null)"
-  REPLY="${_raw:-$2}"
+# _z::bus::sort_by_priority <array-name>
+# Sorts handler IDs in-place by priority descending (highest first).
+# Uses a zero-padded decimal prefix so lexicographic sort matches numeric
+# order across the full 0–100 priority range.
+_z::bus::sort_by_priority() {
+  local arr_name="$1"
+  local -a handlers=("${(@P)arr_name}")
+  (( ${#handlers} <= 1 )) && return 0
+
+  local -a sortable
+  local hid
+  typeset -i prio
+  for hid in "${handlers[@]}"; do
+    (( prio = ${_zbus_handler_meta[${hid}.priority]:-50} ))
+    sortable+=("$(printf '%03d' $prio):${hid}")
+  done
+
+  # (@On) = reverse numeric sort of the padded entries.
+  local -a sorted_entries=("${(@On)sortable}")
+  local -a sorted_ids
+  local entry
+  for entry in "${sorted_entries[@]}"; do
+    sorted_ids+=("${entry#*:}")   # strip the "NNN:" prefix
+  done
+  set -A "$arr_name" "${sorted_ids[@]}"
 }
 
-###
-# Append event to the ring-buffer history.
-# @private
-###
-__z::event::add_to_history() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  { __z::event::cfg_flag event_enable_history true; [[ $REPLY != true ]] } && return 0
-
-  local event_name="$1"
-  shift
-
-  local timestamp="${EPOCHSECONDS:-0}"
-  _zcore_event_history+=("${timestamp}|${event_name}|$*")
-
-  # Trim to max_history (keep tail)
-  typeset -i max_history current_size
-  local _max_history_raw
-  _max_history_raw="$(z::config::get event_max_history 2>/dev/null)"
-  (( max_history = ${_max_history_raw:-$ZCORE_EVENT_MAX_HISTORY} ))
-  (( current_size = ${#_zcore_event_history} ))
-
-  if (( current_size > max_history )); then
-    _zcore_event_history=("${(@)_zcore_event_history[current_size - max_history + 1,-1]}")
-  fi
-}
-
-###
-# Increment a named statistic counter for an event.
-# @private
-###
-__z::event::update_stats() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  { __z::event::cfg_flag event_enable_stats true; [[ $REPLY != true ]] } && return 0
-
-  local key="${1}.${2}"
-  typeset -i n
-  (( n = ${_zcore_event_stats[$key]:-0} + 1 ))
-  _zcore_event_stats[$key]=$n
-}
-
-###
-# Remove a single handler by its internal ID from all state tables.
-# @private
-###
-__z::event::remove_handler_by_id() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local handler_id="$1"
-  local event_pattern="${_zcore_event_handler_meta[${handler_id}.event]:-}"
+# _z::bus::remove_handler_by_id <id>
+# Removes a handler ID from the exact or wildcard registry and clears all
+# associated metadata fields.
+_z::bus::remove_handler_by_id() {
+  local hid="$1"
+  local event_pattern="${_zbus_handler_meta[${hid}.event]:-}"
   [[ -z $event_pattern ]] && return 0
 
-  local handler_list
-  if [[ $event_pattern == *'*'* ]]; then
-    handler_list="${_zcore_event_handlers_wildcard[$event_pattern]:-}"
+  # Determine which registry this handler lives in.
+  local is_wildcard=0
+  [[ $event_pattern == *'*'* ]] && is_wildcard=1
+
+  local existing_list
+  if (( is_wildcard )); then
+    existing_list="${_zbus_handlers_wildcard[$event_pattern]:-}"
   else
-    handler_list="${_zcore_event_handlers_exact[$event_pattern]:-}"
+    existing_list="${_zbus_handlers_exact[$event_pattern]:-}"
   fi
 
-  if [[ -n $handler_list ]]; then
+  if [[ -n $existing_list ]]; then
     local -a handlers
-    __z::event::parse_handler_list "$handler_list" handlers
-    handlers=("${(@)handlers:#$handler_id}")
+    _z::bus::parse_handler_list "$existing_list" handlers
+    handlers=("${(@)handlers:#$hid}")   # remove this ID from the list
 
     if (( ${#handlers} > 0 )); then
-      if [[ $event_pattern == *'*'* ]]; then
-        _zcore_event_handlers_wildcard[$event_pattern]="${(j:|:)handlers}"
+      local new_list="${(pj:$_ZBUS_SEP:)handlers}"
+      if (( is_wildcard )); then
+        _zbus_handlers_wildcard[$event_pattern]="$new_list"
       else
-        _zcore_event_handlers_exact[$event_pattern]="${(j:|:)handlers}"
+        _zbus_handlers_exact[$event_pattern]="$new_list"
       fi
     else
-      if [[ $event_pattern == *'*'* ]]; then
-        unset "_zcore_event_handlers_wildcard[${event_pattern}]"
+      # Last handler for this pattern — remove the map entry entirely.
+      if (( is_wildcard )); then
+        unset "_zbus_handlers_wildcard[$event_pattern]"
       else
-        unset "_zcore_event_handlers_exact[${event_pattern}]"
+        unset "_zbus_handlers_exact[$event_pattern]"
       fi
     fi
   fi
 
   unset \
-    "_zcore_event_handler_meta[${handler_id}.function]" \
-    "_zcore_event_handler_meta[${handler_id}.priority]" \
-    "_zcore_event_handler_meta[${handler_id}.once]"     \
-    "_zcore_event_handler_meta[${handler_id}.event]"
+    "_zbus_handler_meta[${hid}.function]" \
+    "_zbus_handler_meta[${hid}.priority]" \
+    "_zbus_handler_meta[${hid}.once]"     \
+    "_zbus_handler_meta[${hid}.event]"
 }
 
-################################################################################
-# PUBLIC API — SUBSCRIPTION
-################################################################################
 
-###
-# Subscribe a handler function to an event.
+# =============================================================================
+# HISTORY RING BUFFER
 #
-# Usage:
-#   z::event::subscribe "plugin:loaded"  my_handler
-#   z::event::subscribe "plugin:*"       my_wildcard_handler
-#   z::event::subscribe "app:start"      my_handler --priority 100
-#   z::event::subscribe "user:login"     my_once_handler --once
+# O(1) append and O(1) trim via a fixed-size circular array.
+# _zbus_history_head tracks the next write slot (0-based); zsh arrays are
+# 1-indexed so all accesses add 1.
+# =============================================================================
+
+# _z::bus::add_history <event-name> [args ...]
+# Appends one entry to the ring buffer, evicting the oldest entry when full.
+_z::bus::add_history() {
+  (( _zbus_flag_history )) || return 0
+  (( _zbus_cfg_max_history > 0 )) || return 0
+
+  local event_name="$1"; shift
+  local ts entry args_str
+
+  z::time::epoch; ts=$REPLY
+
+  if (( $# > 0 )); then
+    args_str="${(pj:$_ZBUS_SEP:)@}"   # join args with field separator
+  else
+    args_str=""
+  fi
+  entry="${ts}${_ZBUS_RECSEP}${event_name}${_ZBUS_RECSEP}${args_str}"
+
+  # Write at head (1-indexed), then advance head modulo cap.
+  _zbus_history_ring[$(( _zbus_history_head + 1 ))]="$entry"
+  (( _zbus_history_head = (_zbus_history_head + 1) % _zbus_cfg_max_history ))
+  (( _zbus_history_count < _zbus_cfg_max_history )) && (( _zbus_history_count += 1 ))
+}
+
+# _z::bus::history_snapshot
+# Iterates the ring in chronological order and populates the reply array.
+# When the ring is full, the oldest entry is at _zbus_history_head.
+_z::bus::history_snapshot() {
+  reply=()
+  (( _zbus_history_count == 0 )) && return 0
+
+  typeset -i start i idx
+
+  if (( _zbus_history_count < _zbus_cfg_max_history )); then
+    start=0   # ring not yet full; entries start at slot 0
+  else
+    start=$_zbus_history_head   # full ring; oldest entry is at head
+  fi
+
+  for (( i = 0; i < _zbus_history_count; i++ )); do
+    idx=$(( ((start + i) % _zbus_cfg_max_history) + 1 ))   # convert to 1-indexed
+    reply+=("${_zbus_history_ring[$idx]}")
+  done
+  return 0
+}
+
+
+# =============================================================================
+# STATS
+# =============================================================================
+
+# _z::bus::update_stats <event-name> <counter>
+# Increments an in-memory counter keyed by "${event}.${counter}".
+# No-ops when stats are disabled.
+_z::bus::update_stats() {
+  (( _zbus_flag_stats )) || return 0
+  local field="${1}.${2}"
+  (( _zbus_stats[$field] = ${_zbus_stats[$field]:-0} + 1 ))
+}
+
+
+# =============================================================================
+# ASYNC PID MANAGEMENT
+# =============================================================================
+
+# _z::bus::prune_async_pids
+# Removes PIDs from _zbus_async_pids that are no longer running.
+# Called before every emit_async to keep the list bounded.
+_z::bus::prune_async_pids() {
+  local -a alive
+  local pid
+  for pid in "${_zbus_async_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    fi
+  done
+  _zbus_async_pids=("${alive[@]}")
+}
+
+
+# =============================================================================
+# UNIFIED DISPATCH CORE
 #
-# @param 1  Event name (supports wildcard * patterns)
-# @param 2  Handler function name (must be defined at call time)
-# @param …  --priority N (0–100, default 50)  --once
-# @return 0 success | ZCORE_ERROR_* on failure
-###
-z::event::subscribe() {
+# Three dispatch modes:
+#   sync  — invoke handler directly in the current shell process.
+#   safe  — fork a subprocess per handler with a watchdog timer; handler
+#            side effects (variable mutations) do NOT propagate to the caller.
+#   async — the entire dispatch is backgrounded by the caller; this function
+#            runs synchronously inside the background job.
+# =============================================================================
+
+# _z::bus::dispatch_one_sync <id> <event-name> [args ...]
+# Invokes a single handler synchronously.
+# Sets REPLY="remove" when the handler should be unregistered after dispatch
+# (once-handlers or handlers with stale/missing metadata).
+# Returns the handler's exit code.
+_z::bus::dispatch_one_sync() {
+  local hid="$1" event_name="$2"; shift 2
+  REPLY=""
+  local handler_func="${_zbus_handler_meta[${hid}.function]:-}"
+  local once_flag="${_zbus_handler_meta[${hid}.once]:-false}"
+
+  if [[ -z $handler_func ]]; then
+    z::log::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
+      "zbus: missing handler metadata" id "$hid"
+    REPLY="remove"
+    return 0
+  fi
+  if ! z::probe::func "$handler_func"; then
+    z::log::once "zbus-handler-missing-${handler_func}" warn \
+      "zbus: handler no longer defined" handler "$handler_func" id "$hid"
+    REPLY="remove"
+    return 0
+  fi
+
+  typeset -i exit_code=0
+  "$handler_func" "$event_name" "$@" || exit_code=$?
+  [[ $once_flag == "true" ]] && REPLY="remove"
+  return $exit_code
+}
+
+# _z::bus::dispatch_one_safe <id> <event-name> <timeout> [args ...]
+# Invokes a single handler in a forked subshell with a two-stage watchdog
+# (SIGTERM → SIGKILL after 1 s).
+#
+# Sets REPLY="remove" for once/stale handlers (same as sync).
+# Sets REPLY2 to "ok" | "fail" | "timeout" for the caller's outcome tracking.
+#
+# Timeout classification uses elapsed wall-clock time to avoid a race where
+# the watchdog kills a handler that happened to exit with code 143/137 for
+# an unrelated reason near the timeout boundary.
+_z::bus::dispatch_one_safe() {
+  local hid="$1" event_name="$2" timeout_val="$3"; shift 3
+  REPLY=""
+  local handler_func="${_zbus_handler_meta[${hid}.function]:-}"
+  local once_flag="${_zbus_handler_meta[${hid}.once]:-false}"
+
+  if [[ -z $handler_func ]]; then
+    z::log::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
+      "zbus: missing handler metadata" id "$hid"
+    REPLY="remove"
+    return 0
+  fi
+  if ! z::probe::func "$handler_func"; then
+    z::log::once "zbus-handler-missing-${handler_func}" warn \
+      "zbus: handler no longer defined" handler "$handler_func" id "$hid"
+    REPLY="remove"
+    return 0
+  fi
+
+  typeset -i start_ts end_ts elapsed bg wdog exit_code
+  z::time::epoch; start_ts=$REPLY
+
+  # Run handler in its own subshell so it cannot mutate the caller's env.
+  ( "$handler_func" "$event_name" "$@" ) &
+  bg=$!
+
+  # Watchdog: SIGTERM first, then SIGKILL after 1 s grace period.
+  # &! disowns the watchdog so it cannot block the parent on exit.
+  (
+    sleep "$timeout_val"
+    kill -TERM "$bg" 2>/dev/null
+    sleep 1
+    kill -KILL "$bg" 2>/dev/null
+  ) &!
+  wdog=$!
+
+  wait "$bg" 2>/dev/null
+  exit_code=$?
+
+  # Reap the watchdog (may already be gone if handler finished in time).
+  kill "$wdog" 2>/dev/null || true
+  wait "$wdog" 2>/dev/null || true
+
+  z::time::epoch; end_ts=$REPLY
+  (( elapsed = end_ts - start_ts ))
+
+  # Only classify as a timeout when the exit code is SIGTERM/SIGKILL AND the
+  # elapsed time is at least the configured timeout.  This prevents a handler
+  # that legitimately exits 143 from being misclassified as a timeout.
+  if (( exit_code == 143 || exit_code == 137 )) && (( elapsed >= timeout_val )); then
+    REPLY2="timeout"
+  elif (( exit_code != 0 )); then
+    REPLY2="fail"
+  else
+    REPLY2="ok"
+  fi
+
+  [[ $once_flag == "true" ]] && REPLY="remove"
+  return $exit_code
+}
+
+# _z::bus::dispatch <event-name> <mode> [args ...]
+# Main dispatcher used by z::bus::emit and z::bus::emit_safe.
+# Collects handlers, sorts by priority, invokes each, accumulates stats,
+# and removes once/stale handlers after the loop.
+# Sets REPLY = number of failed handlers; returns 0 iff all succeeded.
+_z::bus::dispatch() {
+  local event_name="$1" mode="$2"; shift 2
+  REPLY=0
+
+  _z::bus::ensure_init                    || return $?
+  _z::bus::validate_event "$event_name"   || return $?
+
+  z::log::debug "zbus: dispatch" event "$event_name" mode "$mode" argc "$#"
+  _z::bus::update_stats "$event_name" "emitted"
+  _z::bus::add_history  "$event_name" "$@"
+
+  local -a all_handler_ids
+  _z::bus::collect_handlers "$event_name" all_handler_ids
+
+  if (( ${#all_handler_ids} == 0 )); then
+    z::log::debug "zbus: no handlers" event "$event_name"
+    return 0
+  fi
+  _z::bus::sort_by_priority all_handler_ids
+
+  typeset -i failed=0 handled=0 exit_code=0
+  typeset -i timeout_val=$_zbus_cfg_handler_timeout
+  local -a to_remove
+  local hid handler_func outcome
+
+  for hid in "${all_handler_ids[@]}"; do
+    exit_code=0
+    handler_func="${_zbus_handler_meta[${hid}.function]:-unknown}"
+
+    if [[ $mode == "safe" ]]; then
+      _z::bus::dispatch_one_safe "$hid" "$event_name" "$timeout_val" "$@" \
+        || exit_code=$?
+      outcome="$REPLY2"
+    else
+      _z::bus::dispatch_one_sync "$hid" "$event_name" "$@" || exit_code=$?
+      (( exit_code == 0 )) && outcome="ok" || outcome="fail"
+    fi
+
+    # Queue once-handlers and stale handlers for removal after the loop.
+    [[ $REPLY == "remove" ]] && to_remove+=("$hid")
+
+    case "$outcome" in
+      ok)
+        (( handled += 1 ))
+        _z::bus::update_stats "$event_name" "handled"
+        ;;
+      timeout)
+        (( failed += 1 ))
+        z::log::error "zbus: handler timed out" \
+          handler "$handler_func" event "$event_name" \
+          timeout "${timeout_val}s"
+        _z::bus::update_stats "$event_name" "timeout"
+        _z::bus::update_stats "$event_name" "failed"
+        ;;
+      fail)
+        (( failed += 1 ))
+        z::log::rate_limit "zbus-handler-fail-${handler_func}" 5 60 warn \
+          "zbus: handler failed" \
+          handler "$handler_func" event "$event_name" \
+          exit_code "$exit_code"
+        _z::bus::update_stats "$event_name" "failed"
+        ;;
+    esac
+  done
+
+  # Remove handlers outside the loop to avoid mutating the registry mid-iteration.
+  local rid
+  for rid in "${to_remove[@]}"; do
+    _z::bus::remove_handler_by_id "$rid"
+  done
+
+  z::log::debug "zbus: dispatch complete" \
+    event "$event_name" handled "$handled" failed "$failed"
+
+  REPLY=$failed
+  (( failed == 0 ))
+}
+
+
+# =============================================================================
+# STORE LIFECYCLE — z::bus::init
+# =============================================================================
+
+# z::bus::init [options]
+# Opens the __zbus zkv store, writes default config values (setnx so existing
+# persisted values are preserved), applies any option overrides, and populates
+# the in-memory config cache.
+#
+# Options:
+#   --max-history    <0..1000000>   (default: 100)
+#   --handler-timeout <1..86400>   (default: 5)
+#   --max-handlers   <1..100000>   (default: 50)
+#   --disable-history
+#   --disable-stats
+#   --disable-wildcards
+#   --reset
+z::bus::init() {
   emulate -L zsh
-  setopt localoptions no_unset warn_create_global
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local event_name="$1"
-  local handler="$2"
-  shift 2
+  z::kv::open "$_ZBUS_STORE" || return $ZBASE_ERROR_GENERAL
 
-  __z::event::validate_event_name "$event_name" || return $?
-  __z::event::validate_handler    "$handler"    || return $?
+  # Write defaults only when the key is absent (setnx) so re-init does not
+  # clobber values that were persisted from a previous session.
+  local -A defaults=(
+    [$ZBUS_CFG_MAX_HISTORY]=100
+    [$ZBUS_CFG_HANDLER_TIMEOUT]=5
+    [$ZBUS_CFG_MAX_HANDLERS]=50
+    [$ZBUS_CFG_ENABLE_HISTORY]="true"
+    [$ZBUS_CFG_ENABLE_STATS]="true"
+    [$ZBUS_CFG_ENABLE_WILDCARDS]="true"
+  )
+  local k v
+  for k v in "${(@kv)defaults}"; do
+    z::kv::setnx "$_ZBUS_STORE" "$k" "$v" 2>/dev/null || true
+  done
 
-  typeset -i priority=$ZCORE_EVENT_PRIORITY_NORMAL
-  local once=false
-
+  # Apply caller-supplied overrides.
   while (( $# > 0 )); do
     case "$1" in
-      --priority)
-        z::validate::integer       "${2:-}" "Priority" || return $ZCORE_ERROR_INVALID_INPUT
-        (( priority = 10#${2} ))
-        z::validate::integer::range "$priority" 0 100 "Priority" || return $ZCORE_ERROR_INVALID_INPUT
+      --max-history)
+        z::validate::integer::range "${2:-}" 0 1000000 "--max-history" \
+          || return $ZBASE_ERROR_INVALID_INPUT
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HISTORY" "$2"
         shift 2
         ;;
-      --once)
-        once=true
+      --handler-timeout)
+        z::validate::integer::range "${2:-}" 1 86400 "--handler-timeout" \
+          || return $ZBASE_ERROR_INVALID_INPUT
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_HANDLER_TIMEOUT" "$2"
+        shift 2
+        ;;
+      --max-handlers)
+        z::validate::integer::range "${2:-}" 1 100000 "--max-handlers" \
+          || return $ZBASE_ERROR_INVALID_INPUT
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HANDLERS" "$2"
+        shift 2
+        ;;
+      --disable-history)
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_HISTORY" "false"
+        shift
+        ;;
+      --disable-stats)
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_STATS" "false"
+        shift
+        ;;
+      --disable-wildcards)
+        z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_ENABLE_WILDCARDS" "false"
+        shift
+        ;;
+      --reset)
+        z::bus::reset
         shift
         ;;
       *)
-        z::log::warn "z::event::subscribe: unknown option" option "$1"
+        z::log::warn "zbus: unknown init option" option "$1"
         shift
         ;;
     esac
   done
 
-  local existing_handlers
-  if [[ $event_name == *'*'* ]]; then
-    existing_handlers="${_zcore_event_handlers_wildcard[$event_name]:-}"
+  _z::bus::cache_config
+
+  # If max_history was reduced and the ring already holds more entries than
+  # the new cap, trim it to the most recent N entries.
+  if (( ${#_zbus_history_ring} > _zbus_cfg_max_history )); then
+    local -a snapshot
+    _z::bus::history_snapshot
+    snapshot=("${reply[@]}")
+
+    typeset -i keep=$_zbus_cfg_max_history
+    if (( ${#snapshot} > keep )); then
+      snapshot=("${(@)snapshot[-keep,-1]}")   # keep the last N entries
+    fi
+
+    _zbus_history_ring=("${snapshot[@]}")
+    _zbus_history_head=$(( ${#snapshot} % _zbus_cfg_max_history ))
+    _zbus_history_count=${#snapshot}
+  fi
+
+  z::log::debug "zbus: initialized" store "$_ZBUS_STORE" \
+    history "$_zbus_flag_history" stats "$_zbus_flag_stats" \
+    wildcards "$_zbus_flag_wildcards"
+
+  _zbus_initialized=1
+  return 0
+}
+
+
+# =============================================================================
+# SUBSCRIPTION
+# =============================================================================
+
+# z::bus::on <event> <handler-func> [--priority <0-100>] [--once]
+# Registers <handler-func> to be called when <event> is emitted.
+# Wildcard patterns (containing *) are stored in the wildcard registry.
+# Returns the handler ID via REPLY.
+z::bus::on() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local event_name="$1" handler="$2"; shift 2
+  REPLY=""
+
+  _z::bus::ensure_init                    || return $?
+  _z::bus::validate_event   "$event_name" || return $?
+  _z::bus::validate_handler "$handler"    || return $?
+
+  typeset -i priority=$ZBUS_PRIORITY_NORMAL
+  local once="false"
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --priority)
+        z::validate::integer::range "${2:-}" 0 100 "priority" \
+          || return $ZBASE_ERROR_INVALID_INPUT
+        (( priority = 10#${2} ))   # force base-10 parse to avoid octal surprises
+        shift 2
+        ;;
+      --once)
+        once="true"
+        shift
+        ;;
+      *)
+        z::log::warn "zbus: unknown on option" option "$1"
+        shift
+        ;;
+    esac
+  done
+
+  local is_wildcard=0
+  [[ $event_name == *'*'* ]] && is_wildcard=1
+
+  local existing_list
+  if (( is_wildcard )); then
+    existing_list="${_zbus_handlers_wildcard[$event_name]:-}"
   else
-    existing_handlers="${_zcore_event_handlers_exact[$event_name]:-}"
+    existing_list="${_zbus_handlers_exact[$event_name]:-}"
   fi
 
-  local -a handler_array
-  __z::event::parse_handler_list "$existing_handlers" handler_array
+  local -a existing_handlers
+  _z::bus::parse_handler_list "$existing_list" existing_handlers
 
-  typeset -i max_handlers
-  local _max_handlers_raw
-  _max_handlers_raw="$(z::config::get event_max_handlers_per_event 2>/dev/null)"
-  (( max_handlers = ${_max_handlers_raw:-$ZCORE_EVENT_MAX_HANDLERS_PER_EVENT} ))
-  if (( ${#handler_array} >= max_handlers )); then
-    z::log::error "Handler limit reached for event" \
-      event "$event_name" limit "$max_handlers"
-    return $ZCORE_ERROR_INVALID_INPUT
+  if (( ${#existing_handlers} >= _zbus_cfg_max_handlers )); then
+    z::log::error "zbus: handler limit reached" \
+      event "$event_name" limit "$_zbus_cfg_max_handlers"
+    return $ZBASE_ERROR_PERMISSION
   fi
 
-  local handler_id
-  __z::event::generate_id handler_id
+  _z::bus::generate_id
+  local hid="$REPLY"
 
-  _zcore_event_handler_meta[${handler_id}.function]="$handler"
-  _zcore_event_handler_meta[${handler_id}.priority]="$priority"
-  _zcore_event_handler_meta[${handler_id}.once]="$once"
-  _zcore_event_handler_meta[${handler_id}.event]="$event_name"
+  _zbus_handler_meta[${hid}.function]="$handler"
+  _zbus_handler_meta[${hid}.priority]="$priority"
+  _zbus_handler_meta[${hid}.once]="$once"
+  _zbus_handler_meta[${hid}.event]="$event_name"
 
   local new_list
-  if [[ -n $existing_handlers ]]; then
-    new_list="${existing_handlers}|${handler_id}"
+  if [[ -n $existing_list ]]; then
+    new_list="${existing_list}${_ZBUS_SEP}${hid}"
   else
-    new_list="$handler_id"
+    new_list="$hid"
   fi
 
-  if [[ $event_name == *'*'* ]]; then
-    _zcore_event_handlers_wildcard[$event_name]="$new_list"
+  if (( is_wildcard )); then
+    _zbus_handlers_wildcard[$event_name]="$new_list"
   else
-    _zcore_event_handlers_exact[$event_name]="$new_list"
+    _zbus_handlers_exact[$event_name]="$new_list"
   fi
 
-  z::log::debug "Handler subscribed" \
-    handler "$handler" event "$event_name" \
-    id "$handler_id" priority "$priority" once "$once"
+  REPLY="$hid"
+  z::log::debug "zbus: subscribed" \
+    event "$event_name" handler "$handler" id "$hid" \
+    priority "$priority" once "$once"
+  return 0
 }
 
-###
-# Subscribe a one-time handler (sugar for --once).
-#
-# @param 1  Event name
-# @param 2  Handler function name
-# @param …  Additional options (--priority N)
-###
-z::event::subscribe_once() {
+# z::bus::once <event> <handler-func> [options]
+# Convenience wrapper: registers a handler that fires exactly once.
+z::bus::once() {
   emulate -L zsh
-  setopt localoptions no_unset
-  z::event::subscribe "$1" "$2" "${@:3}" --once
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+  z::bus::on "$1" "$2" "${@:3}" --once
 }
 
-################################################################################
-# PUBLIC API — EMISSION
-################################################################################
-
-###
-# Emit an event — call all registered handlers in priority order.
-#
-# Handlers receive: handler_func <event_name> <args…>
-# A failing handler is logged but does not abort remaining handlers.
-#
-# @param 1  Event name
-# @param …  Arguments forwarded verbatim to every handler
-# @return 0 all handlers succeeded | 1 one or more handlers failed
-###
-z::event::emit() {
+# z::bus::off <event-pattern> [handler-func]
+# Removes all handlers (or only those matching <handler-func>) for every
+# event that matches <event-pattern>.
+# Sets REPLY = count of removed handlers.
+# Returns ZBASE_ERROR_NOT_FOUND when nothing was removed.
+z::bus::off() {
   emulate -L zsh
-  setopt localoptions no_unset warn_create_global
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local event_name="$1"
-  shift
+  local event_pattern="$1" handler_func="${2:-}"
+  REPLY=0
 
-  __z::event::validate_event_name "$event_name" || return $?
-
-  z::log::debug "Emitting event" event "$event_name" argc "$#"
-
-  __z::event::update_stats "$event_name" emitted
-  __z::event::add_to_history "$event_name" "$@"
-
-  local -a all_handler_ids
-  __z::event::collect_handlers "$event_name" all_handler_ids
-
-  if (( ${#all_handler_ids} == 0 )); then
-    z::log::debug "No handlers for event" event "$event_name"
-    return 0
-  fi
-
-  __z::event::sort_handlers_by_priority all_handler_ids
-
-  z::log::debug "Dispatching event" \
-    event "$event_name" handlers "${#all_handler_ids}"
-
-  typeset -i failed=0 handled=0 exit_code
-  local -a handlers_to_remove
-  local handler_id handler_func once_flag
-
-  for handler_id in "${all_handler_ids[@]}"; do
-    handler_func="${_zcore_event_handler_meta[${handler_id}.function]:-}"
-    once_flag="${_zcore_event_handler_meta[${handler_id}.once]:-false}"
-
-    if [[ -z $handler_func ]]; then
-      z::log::warn "Missing handler metadata" id "$handler_id"
-      continue
-    fi
-
-    if ! z::probe::func "$handler_func"; then
-      z::log::warn "Handler no longer defined" handler "$handler_func" id "$handler_id"
-      handlers_to_remove+=("$handler_id")
-      continue
-    fi
-
-    z::log::debug "Calling handler" handler "$handler_func" id "$handler_id"
-
-    exit_code=0
-    "$handler_func" "$event_name" "$@" || exit_code=$?
-
-    if (( exit_code != 0 )); then
-      (( failed += 1 ))
-      z::log::warn "Handler failed" \
-        handler "$handler_func" event "$event_name" exit_code "$exit_code"
-      __z::event::update_stats "$event_name" failed
-    else
-      (( handled += 1 ))
-      __z::event::update_stats "$event_name" handled
-    fi
-
-    if [[ $once_flag == true ]]; then
-      handlers_to_remove+=("$handler_id")
-      z::log::debug "Removing one-time handler" handler "$handler_func"
-    fi
-  done
-
-  local remove_id
-  for remove_id in "${handlers_to_remove[@]}"; do
-    __z::event::remove_handler_by_id "$remove_id"
-  done
-
-  z::log::debug "Event dispatch complete" \
-    event "$event_name" handled "$handled" failed "$failed"
-
-  (( failed == 0 ))
-}
-
-###
-# Emit an event with per-handler subshell isolation and hard timeout.
-#
-# Each handler runs in its own subshell wrapped by the `timeout` command.
-# Handlers cannot modify parent-scope variables.
-# Use for untrusted or potentially blocking handlers.
-#
-# @param 1  Event name
-# @param …  Arguments forwarded to every handler
-# @return 0 all succeeded | 1 failures | ZCORE_ERROR_TIMEOUT on timeout
-###
-z::event::emit_safe() {
-  emulate -L zsh
-  setopt localoptions no_unset warn_create_global
-
-  local event_name="$1"
-  shift
-
-  __z::event::validate_event_name "$event_name" || return $?
-
-  z::log::debug "Emitting safe event" event "$event_name" argc "$#"
-
-  __z::event::update_stats "$event_name" emitted
-  __z::event::add_to_history "$event_name" "$@"
-
-  local -a all_handler_ids
-  __z::event::collect_handlers "$event_name" all_handler_ids
-
-  if (( ${#all_handler_ids} == 0 )); then
-    z::log::debug "No handlers for event" event "$event_name"
-    return 0
-  fi
-
-  __z::event::sort_handlers_by_priority all_handler_ids
-
-  typeset -i failed=0 handled=0 exit_code timeout_val
-  local _timeout_raw
-  _timeout_raw="$(z::config::get event_handler_timeout 2>/dev/null)"
-  (( timeout_val = ${_timeout_raw:-$ZCORE_EVENT_HANDLER_TIMEOUT} ))
-  local -a handlers_to_remove
-  local handler_id handler_func once_flag
-
-  z::log::debug "Dispatching safe event" \
-    event "$event_name" handlers "${#all_handler_ids}" timeout "${timeout_val}s"
-
-  for handler_id in "${all_handler_ids[@]}"; do
-    handler_func="${_zcore_event_handler_meta[${handler_id}.function]:-}"
-    once_flag="${_zcore_event_handler_meta[${handler_id}.once]:-false}"
-
-    if [[ -z $handler_func ]]; then
-      z::log::warn "Missing handler metadata" id "$handler_id"
-      continue
-    fi
-
-    if ! z::probe::func "$handler_func"; then
-      z::log::warn "Handler no longer defined" handler "$handler_func" id "$handler_id"
-      handlers_to_remove+=("$handler_id")
-      continue
-    fi
-
-    z::log::debug "Calling handler (safe)" \
-      handler "$handler_func" id "$handler_id" timeout "${timeout_val}s"
-
-    exit_code=0
-    # Run handler in a subshell with a hard wall-clock timeout.
-    # Strategy: background the subshell, then wait with a watchdog.
-    #   - If handler finishes in time: kill the watchdog, capture exit code.
-    #   - If watchdog fires first:     kill the handler, report timeout.
-    local __bg_pid __wdog_pid
-    ( "$handler_func" "$event_name" "$@" ) &
-    __bg_pid=$!
-    ( sleep "$timeout_val" && kill "$__bg_pid" 2>/dev/null ) &
-    __wdog_pid=$!
-
-    wait "$__bg_pid" 2>/dev/null
-    exit_code=$?
-
-    # Handler finished — cancel watchdog if still alive
-    kill "$__wdog_pid" 2>/dev/null && wait "$__wdog_pid" 2>/dev/null || true
-
-    if (( exit_code == ZCORE_ERROR_TIMEOUT || exit_code == 143 )); then
-      # 143 = 128+15 = killed by SIGTERM from watchdog
-      (( failed += 1 ))
-      z::log::error "Handler timed out" \
-        handler "$handler_func" event "$event_name" timeout "${timeout_val}s"
-      __z::event::update_stats "$event_name" failed
-    elif (( exit_code != 0 )); then
-      (( failed += 1 ))
-      z::log::warn "Handler failed" \
-        handler "$handler_func" event "$event_name" exit_code "$exit_code"
-      __z::event::update_stats "$event_name" failed
-    else
-      (( handled += 1 ))
-      __z::event::update_stats "$event_name" handled
-    fi
-
-    if [[ $once_flag == true ]]; then
-      handlers_to_remove+=("$handler_id")
-      z::log::debug "Removing one-time handler" handler "$handler_func"
-    fi
-  done
-
-  local remove_id
-  for remove_id in "${handlers_to_remove[@]}"; do
-    __z::event::remove_handler_by_id "$remove_id"
-  done
-
-  z::log::debug "Safe event dispatch complete" \
-    event "$event_name" handled "$handled" failed "$failed"
-
-  (( failed == 0 ))
-}
-
-###
-# Emit an event asynchronously (fire-and-forget).
-#
-# The emission runs in a detached background job.
-# No error feedback; no job tracking. Use sparingly for non-critical
-# notifications where latency matters more than delivery guarantees.
-#
-# @param 1  Event name
-# @param …  Arguments forwarded to handlers
-# @return 0 always (does not wait for handlers)
-###
-z::event::emit_async() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local event_name="$1"
-  shift
-
-  __z::event::validate_event_name "$event_name" || return $?
-
-  z::log::debug "Emitting async event" event "$event_name"
-
-  { z::event::emit "$event_name" "$@" } &!
-}
-
-################################################################################
-# PUBLIC API — SUBSCRIPTION MANAGEMENT
-################################################################################
-
-###
-# Unsubscribe from one or more events.
-#
-# Usage:
-#   z::event::unsubscribe "plugin:loaded" my_handler   # specific handler
-#   z::event::unsubscribe "plugin:loaded"              # all handlers on event
-#   z::event::unsubscribe "*"              my_handler  # handler from all events
-#
-# @param 1  Event name / pattern
-# @param 2  Handler function name (optional; omit to remove all on the event)
-# @return 0 success | ZCORE_ERROR_* on failure
-###
-z::event::unsubscribe() {
-  emulate -L zsh
-  setopt localoptions no_unset
-
-  local event_pattern="$1"
-  local handler_func="${2:-}"
-
-  __z::event::validate_event_name "$event_pattern" || return $?
+  _z::bus::ensure_init                     || return $?
+  _z::bus::validate_event "$event_pattern" || return $?
 
   typeset -i removed=0
-  local pattern handler_list
 
-  local -a all_patterns
-  all_patterns=(
-    "${(@k)_zcore_event_handlers_exact}"
-    "${(@k)_zcore_event_handlers_wildcard}"
+  # Iterate both registries; match_pattern handles exact vs. glob.
+  local -a all_patterns=(
+    "${(@k)_zbus_handlers_exact}"
+    "${(@k)_zbus_handlers_wildcard}"
   )
 
+  local pattern hid stored_func handler_list
+  local -a handlers
+
   for pattern in "${all_patterns[@]}"; do
-    __z::event::match_pattern "$pattern" "$event_pattern" || continue
+    _z::bus::match_pattern "$pattern" "$event_pattern" || continue
 
     if [[ $pattern == *'*'* ]]; then
-      handler_list="${_zcore_event_handlers_wildcard[$pattern]:-}"
+      handler_list="${_zbus_handlers_wildcard[$pattern]:-}"
     else
-      handler_list="${_zcore_event_handlers_exact[$pattern]:-}"
+      handler_list="${_zbus_handlers_exact[$pattern]:-}"
     fi
-
     [[ -z $handler_list ]] && continue
 
-    local -a handlers
-    __z::event::parse_handler_list "$handler_list" handlers
+    handlers=()
+    _z::bus::parse_handler_list "$handler_list" handlers
 
-    local handler_id stored_func
-    for handler_id in "${handlers[@]}"; do
-      stored_func="${_zcore_event_handler_meta[${handler_id}.function]:-}"
-
+    for hid in "${handlers[@]}"; do
+      stored_func="${_zbus_handler_meta[${hid}.function]:-}"
+      # Remove all handlers when no func filter is given, or only the matching one.
       if [[ -z $handler_func || $stored_func == $handler_func ]]; then
-        __z::event::remove_handler_by_id "$handler_id"
+        _z::bus::remove_handler_by_id "$hid"
         (( removed += 1 ))
-        z::log::debug "Handler unsubscribed" \
-          handler "$stored_func" id "$handler_id" event "$pattern"
       fi
     done
   done
 
-  z::log::debug "Unsubscribe complete" \
-    pattern "$event_pattern" removed "$removed"
+  REPLY=$removed
+  z::log::debug "zbus: off complete" pattern "$event_pattern" removed "$removed"
+  (( removed > 0 )) && return 0 || return $ZBASE_ERROR_NOT_FOUND
 }
 
-################################################################################
-# PUBLIC API — INTROSPECTION
-################################################################################
-
-###
-# Return 0 if the event has at least one registered handler.
-#
-# @param 1  Event name (supports wildcards)
-# @return 0 handlers exist | 1 none
-###
-z::event::has_handlers() {
+# z::bus::off_id <handler-id>
+# Removes a single handler by its opaque ID (as returned by z::bus::on).
+z::bus::off_id() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local event_name="$1"
-  __z::event::validate_event_name "$event_name" || return 1
+  local hid="$1"
+  z::validate::nonempty "$hid" "handler_id" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::bus::ensure_init || return $?
 
-  [[ -n ${_zcore_event_handlers_exact[$event_name]:-} ]] && return 0
-
-  if { __z::event::cfg_flag event_enable_wildcards true; [[ $REPLY == true ]] }; then
-    local pattern
-    for pattern in "${(@k)_zcore_event_handlers_wildcard}"; do
-      __z::event::match_pattern "$event_name" "$pattern" &&
-        [[ -n ${_zcore_event_handlers_wildcard[$pattern]:-} ]] && return 0
-    done
+  if [[ -z ${_zbus_handler_meta[${hid}.function]:-} ]]; then
+    z::log::warn "zbus: handler ID not found" id "$hid"
+    return $ZBASE_ERROR_NOT_FOUND
   fi
 
+  _z::bus::remove_handler_by_id "$hid"
+  z::log::debug "zbus: handler removed by id" id "$hid"
+  return 0
+}
+
+
+# =============================================================================
+# EMIT
+# =============================================================================
+
+# z::bus::emit <event> [args ...]
+# Synchronous dispatch: handlers run in the current shell in priority order.
+# Handler side effects (variable mutations) ARE visible to the caller.
+z::bus::emit() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  local event="$1"; shift
+  _z::bus::dispatch "$event" "sync" "$@"
+}
+
+# z::bus::emit_safe <event> [args ...]
+# Safe dispatch: each handler runs in a forked subshell with a watchdog timer.
+# Handler side effects do NOT propagate to the caller.
+z::bus::emit_safe() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  local event="$1"; shift
+  _z::bus::dispatch "$event" "safe" "$@"
+}
+
+# z::bus::emit_async <event> [args ...]
+# Backgrounds the entire dispatch as a forked job and tracks its PID.
+# Sets REPLY = PID of the background dispatcher.
+# The background job runs with a snapshot of the current handler registry;
+# handler side effects and exit codes are NOT observable by the caller.
+z::bus::emit_async() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local event_name="$1"; shift
+  REPLY=""
+
+  _z::bus::ensure_init                  || return $?
+  _z::bus::validate_event "$event_name" || return $?
+
+  _z::bus::prune_async_pids
+
+  if (( ${#_zbus_async_pids} >= _ZBUS_ASYNC_PID_CAP )); then
+    z::log::error "zbus: async PID cap reached" \
+      cap "$_ZBUS_ASYNC_PID_CAP" event "$event_name"
+    return $ZBASE_ERROR_PERMISSION
+  fi
+
+  z::log::debug "zbus: emit_async" event "$event_name"
+
+  # Use & (not &!) so we can capture the PID for tracking.
+  # The job runs in a forked subshell with a snapshot of the handler registry.
+  { z::bus::emit "$event_name" "$@" } &
+  local pid=$!
+  _zbus_async_pids+=("$pid")
+  REPLY="$pid"
+  return 0
+}
+
+# z::bus::wait_all_async
+# Blocks until all tracked async dispatchers have completed.
+# Returns 0 if all succeeded; returns the exit code of the last failed job
+# otherwise.  Exit code 127 (already reaped) is not counted as a failure.
+z::bus::wait_all_async() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+
+  typeset -i last_fail=0
+  local pid
+
+  for pid in "${_zbus_async_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null
+      local rc=$?
+      # 127 = already reaped by the shell; not a handler failure.
+      if (( rc != 0 && rc != 127 )); then
+        last_fail=$rc
+      fi
+    fi
+  done
+
+  _zbus_async_pids=()
+  return $last_fail
+}
+
+
+# =============================================================================
+# INTROSPECTION
+# =============================================================================
+
+# z::bus::has <event-name>
+# Returns 0 if at least one handler is registered for <event-name>
+# (including matching wildcard patterns), 1 otherwise.
+z::bus::has() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local event_name="$1"
+  _z::bus::validate_event "$event_name" || return $?
+  _z::bus::ensure_init || return $?
+
+  [[ -n ${_zbus_handlers_exact[$event_name]:-} ]] && return 0
+
+  if (( _zbus_flag_wildcards )); then
+    local pattern
+    for pattern in "${(@k)_zbus_handlers_wildcard}"; do
+      _z::bus::match_pattern "$event_name" "$pattern" && \
+        [[ -n ${_zbus_handlers_wildcard[$pattern]:-} ]] && return 0
+    done
+  fi
   return 1
 }
 
-###
-# Print the total number of handlers registered for an event.
-#
-# @param 1  Event name (supports wildcards)
-# @stdout   Integer count
-###
-z::event::count() {
+# z::bus::count <event-name>
+# Returns the total number of handlers applicable to <event-name> via REPLY.
+z::bus::count() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local event_name="$1"
-  __z::event::validate_event_name "$event_name" || { print 0; return 1; }
+  REPLY=0
+
+  _z::bus::validate_event "$event_name" || return $?
+  _z::bus::ensure_init || return $?
 
   typeset -i total=0
-  local handler_list pattern
   local -a handlers
 
-  handler_list="${_zcore_event_handlers_exact[$event_name]:-}"
-  if [[ -n $handler_list ]]; then
-    __z::event::parse_handler_list "$handler_list" handlers
+  local exact_list="${_zbus_handlers_exact[$event_name]:-}"
+  if [[ -n $exact_list ]]; then
+    _z::bus::parse_handler_list "$exact_list" handlers
     (( total += ${#handlers} ))
   fi
 
-  if { __z::event::cfg_flag event_enable_wildcards true; [[ $REPLY == true ]] }; then
-    for pattern in "${(@k)_zcore_event_handlers_wildcard}"; do
-      if __z::event::match_pattern "$event_name" "$pattern"; then
-        handlers=()
-        handler_list="${_zcore_event_handlers_wildcard[$pattern]:-}"
-        if [[ -n $handler_list ]]; then
-          __z::event::parse_handler_list "$handler_list" handlers
+  if (( _zbus_flag_wildcards )); then
+    local pattern wc_list
+    for pattern in "${(@k)_zbus_handlers_wildcard}"; do
+      if _z::bus::match_pattern "$event_name" "$pattern"; then
+        wc_list="${_zbus_handlers_wildcard[$pattern]:-}"
+        if [[ -n $wc_list ]]; then
+          handlers=()
+          _z::bus::parse_handler_list "$wc_list" handlers
           (( total += ${#handlers} ))
         fi
       fi
     done
   fi
 
-  print $total
+  REPLY=$total
+  return 0
 }
 
-###
-# List all registered event handlers (optionally filtered by pattern).
-#
-# Usage:
-#   z::event::list
-#   z::event::list "plugin:*"
-#
-# @param 1  Optional event pattern filter (default: * = all)
-###
-z::event::list() {
+# z::bus::handlers <event-name>
+# Populates the reply array with handler IDs for <event-name>, sorted by
+# priority descending.
+z::bus::handlers() {
   emulate -L zsh
-  setopt localoptions no_unset no_xtrace no_verbose
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local filter_pattern="${1:-*}"
-  local event_pattern handler_list
-  local -a all_events handlers
-  typeset -i total=0 i
+  local event_name="$1"
+  reply=()
 
-  print "\nRegistered Event Handlers:"
-  print "========================="
+  _z::bus::validate_event "$event_name" || return $?
+  _z::bus::ensure_init || return $?
 
-  all_events=(
-    "${(@k)_zcore_event_handlers_exact}"
-    "${(@k)_zcore_event_handlers_wildcard}"
+  local -a all_ids
+  _z::bus::collect_handlers "$event_name" all_ids
+  _z::bus::sort_by_priority all_ids
+  reply=("${all_ids[@]}")
+  return 0
+}
+
+# z::bus::list [<glob-filter>]
+# Prints a formatted table of all registered event handlers, optionally
+# filtered by a glob pattern.  Handlers are shown in priority order per event.
+z::bus::list() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  _z::bus::ensure_init || return $?
+  local filter="${1:-*}"
+
+  local -a all_events=(
+    "${(@k)_zbus_handlers_exact}"
+    "${(@k)_zbus_handlers_wildcard}"
   )
 
+  print "\nRegistered Event Handlers:"
+  print "=========================="
+
   if (( ${#all_events} == 0 )); then
-    print "No handlers registered."
-    print ""
+    print "  No handlers registered.\n"
     return 0
   fi
 
-  for event_pattern in "${all_events[@]}"; do
-    __z::event::match_pattern "$event_pattern" "$filter_pattern" || continue
+  typeset -i total=0
+  local event_pattern handler_list hid colored_event line
+  local -a handlers
+
+  for event_pattern in "${(@o)all_events}"; do
+    _z::bus::match_pattern "$event_pattern" "$filter" || continue
 
     if [[ $event_pattern == *'*'* ]]; then
-      handler_list="${_zcore_event_handlers_wildcard[$event_pattern]:-}"
+      handler_list="${_zbus_handlers_wildcard[$event_pattern]:-}"
     else
-      handler_list="${_zcore_event_handlers_exact[$event_pattern]:-}"
+      handler_list="${_zbus_handlers_exact[$event_pattern]:-}"
     fi
-
     [[ -z $handler_list ]] && continue
 
-    __z::event::parse_handler_list "$handler_list" handlers
+    handlers=()
+    _z::bus::parse_handler_list "$handler_list" handlers
+    _z::bus::sort_by_priority handlers
 
-    local colored_event
-    z::log::colorize blue "$event_pattern"; colored_event="$REPLY"
-    print "\nEvent: ${colored_event}"
-    print "  Handlers: ${#handlers}"
+    z::log::colorize blue "$event_pattern"
+    colored_event="$REPLY"
+    print "\nEvent: ${colored_event}  (${#handlers} handler(s))"
 
-    for (( i = 1; i <= ${#handlers}; i++ )); do
-      local hid="${handlers[i]}"
-      local func_name="${_zcore_event_handler_meta[${hid}.function]:-unknown}"
-      local prio="${_zcore_event_handler_meta[${hid}.priority]:-50}"
-      local once="${_zcore_event_handler_meta[${hid}.once]:-false}"
-      local line="    - ${func_name} (priority: ${prio})"
-      if [[ $once == true ]]; then
-        local colored_once; z::log::colorize yellow "[once]"; colored_once="$REPLY"
-        line+= " ${colored_once}"
+    for hid in "${handlers[@]}"; do
+      local func="${_zbus_handler_meta[${hid}.function]:-unknown}"
+      local prio="${_zbus_handler_meta[${hid}.priority]:-50}"
+      local once="${_zbus_handler_meta[${hid}.once]:-false}"
+      line="  • ${func}  [id=${hid} priority=${prio}]"
+      if [[ $once == "true" ]]; then
+        z::log::colorize yellow "[once]"
+        line+=" $REPLY"
       fi
       print "$line"
       (( total += 1 ))
     done
   done
 
-  print "\nTotal handlers: $total"
-  print ""
+  print "\nTotal handlers: ${total}\n"
+  return 0
 }
 
-###
-# Show aggregated emission statistics.
-#
-# Usage:
-#   z::event::stats
-#   z::event::stats "plugin:loaded"
-#
-# @param 1  Optional event name filter substring
-###
-z::event::stats() {
+
+# =============================================================================
+# HISTORY
+# =============================================================================
+
+# z::bus::history [<limit>] [<glob-filter>]
+# Prints the most recent <limit> history entries (default: 20), optionally
+# filtered by a glob pattern on the event name.
+z::bus::history() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  typeset -i limit=${1:-20}
+  local filter="${2:-}"
+
+  _z::bus::ensure_init || return $?
+
+  print "\nEvent History (last ${limit}):"
+  print "================================"
+
+  if (( ! _zbus_flag_history )); then
+    print "  History disabled.\n"
+    return 0
+  fi
+  if (( _zbus_history_count == 0 )); then
+    print "  No history available.\n"
+    return 0
+  fi
+
+  _z::bus::history_snapshot
+  local -a entries=("${reply[@]}")
+
+  typeset -i show_from=${#entries}
+  (( show_from > limit )) && show_from=$limit
+
+  typeset -i display_idx=$show_from
+  local e ts event_name rest args formatted colored_event
+
+  # (@Oa) = reverse array order — iterate newest-first.
+  for e in "${(@Oa)entries[-show_from,-1]}"; do
+    ts="${e%%${_ZBUS_RECSEP}*}"
+    rest="${e#*${_ZBUS_RECSEP}}"
+    event_name="${rest%%${_ZBUS_RECSEP}*}"
+    args="${rest#*${_ZBUS_RECSEP}}"
+    [[ $args == $event_name ]] && args=""   # no args were recorded
+
+    if [[ -n $filter ]]; then
+      _z::bus::match_pattern "$event_name" "$filter" || {
+        (( display_idx -= 1 ))
+        continue
+      }
+    fi
+
+    formatted="$ts"
+    if [[ $ts =~ '^[0-9]+$' ]]; then
+      z::log::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
+      formatted="$REPLY"
+    fi
+
+    z::log::colorize blue "$event_name"
+    colored_event="$REPLY"
+
+    print "${display_idx}. [${formatted}] ${colored_event}"
+    if [[ -n $args ]]; then
+      # Args were stored SEP-joined; display as space-separated for readability.
+      local args_display="${args//${_ZBUS_SEP}/ }"
+      print "   args: ${args_display}"
+    fi
+    (( display_idx -= 1 ))
+  done
+
+  print ""
+  return 0
+}
+
+
+# =============================================================================
+# STATS
+# =============================================================================
+
+# z::bus::stats [<substring-filter>]
+# Prints per-event operation counters (emitted / handled / failed / timeout).
+z::bus::stats() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local filter="${1:-}"
+  _z::bus::ensure_init || return $?
 
   print "\nEvent Statistics:"
   print "================="
 
-  if { __z::event::cfg_flag event_enable_stats true; [[ $REPLY != true ]] }; then
-    print "Statistics disabled."
-    print ""
+  if (( ! _zbus_flag_stats )); then
+    print "  Statistics disabled.\n"
     return 0
   fi
 
-  if (( ${#_zcore_event_stats} == 0 )); then
-    print "No statistics collected."
-    print ""
+  local -a fields=("${(@k)_zbus_stats}")
+  if (( ${#fields} == 0 )); then
+    print "  No statistics collected.\n"
     return 0
   fi
 
-  local -a unique_events
-  local key event_name
+  # Extract unique event names from stat keys.
+  # Key format: "${event}.${counter}" where counter ∈ emitted/handled/failed/timeout.
+  # Event names may themselves contain dots, so we strip only the last dot-segment.
+  local -a unique
+  local field event counter
+  local -A seen
 
-  for key in "${(@k)_zcore_event_stats}"; do
-    event_name="${key%.*}"
-    [[ -n $filter && $event_name != *${filter}* ]] && continue
-    (( ${unique_events[(Ie)$event_name]} )) && continue
-    unique_events+=("$event_name")
+  for field in "${fields[@]}"; do
+    counter="${field##*.}"
+    event="${field%.${counter}}"
+    [[ -n $filter && $event != *${filter}* ]] && continue
+    if (( ! ${+seen[$event]} )); then
+      seen[$event]=1
+      unique+=("$event")
+    fi
   done
 
-  if (( ${#unique_events} == 0 )); then
-    print "No matching statistics."
-    print ""
+  if (( ${#unique} == 0 )); then
+    print "  No matching statistics.\n"
     return 0
   fi
 
-  for event_name in "${unique_events[@]}"; do
-    local emitted="${_zcore_event_stats[${event_name}.emitted]:-0}"
-    local handled="${_zcore_event_stats[${event_name}.handled]:-0}"
-    local failed="${_zcore_event_stats[${event_name}.failed]:-0}"
-    local colored_name; z::log::colorize blue "$event_name"; colored_name="$REPLY"
+  local colored_name emitted handled failed timeout
+
+  for event in "${(@o)unique}"; do
+    emitted=${_zbus_stats[${event}.emitted]:-0}
+    handled=${_zbus_stats[${event}.handled]:-0}
+    failed=${_zbus_stats[${event}.failed]:-0}
+    timeout=${_zbus_stats[${event}.timeout]:-0}
+
+    z::log::colorize blue "$event"
+    colored_name="$REPLY"
+
     print "\n${colored_name}"
-    print "  Emitted: $emitted"
-    print "  Handled: $handled"
-    print "  Failed:  $failed"
+    print "  Emitted:  ${emitted}"
+    print "  Handled:  ${handled}"
+    print "  Failed:   ${failed}"
+    print "  Timeout:  ${timeout}"
   done
+
   print ""
+  return 0
 }
 
-###
-# Display recent event history.
-#
-# Usage:
-#   z::event::history
-#   z::event::history 20
-#   z::event::history 10 "plugin:*"
-#
-# @param 1  Number of entries to show (default 20)
-# @param 2  Optional event name filter pattern
-###
-z::event::history() {
+# z::bus::clear_history
+# Resets the history ring buffer to empty.
+z::bus::clear_history() {
   emulate -L zsh
-  setopt localoptions no_unset no_xtrace no_verbose
-
-  typeset -i limit
-  (( limit = 10#${1:-20} ))
-  local filter="${2:-}"
-
-  print "\nEvent History (last $limit):"
-  print "============================"
-
-  if { __z::event::cfg_flag event_enable_history true; [[ $REPLY != true ]] }; then
-    print "History disabled."
-    print ""
-    return 0
-  fi
-
-  if (( ${#_zcore_event_history} == 0 )); then
-    print "No history available."
-    print ""
-    return 0
-  fi
-
-  typeset -i start display_idx
-  (( start = ${#_zcore_event_history} - limit + 1 ))
-  (( start < 1 )) && (( start = 1 ))
-
-  local -a recent
-  recent=("${(@)_zcore_event_history[start,-1]}")
-
-  local entry ts remainder evt arg formatted_time
-  (( display_idx = ${#recent} ))
-
-  for entry in "${(@Oa)recent}"; do
-    ts="${entry%%|*}"
-    remainder="${entry#*|}"
-    evt="${remainder%%|*}"
-    arg="${remainder#*|}"
-
-    if [[ -n $filter ]]; then
-      __z::event::match_pattern "$evt" "$filter" || { (( display_idx -= 1 )); continue; }
-    fi
-
-    # Format timestamp portably via zlog
-    formatted_time="$ts"
-    if [[ $ts == <-> ]]; then
-      z::log::format_epoch "$ts" human
-      formatted_time="$REPLY"
-    fi
-
-    local colored_evt; z::log::colorize blue "$evt"; colored_evt="$REPLY"
-    print "${display_idx}. [${formatted_time}] ${colored_evt}"
-    [[ -n $arg && $arg != "$evt" ]] && print "   Args: $arg"
-    (( display_idx -= 1 ))
-  done
-  print ""
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+  _zbus_history_ring=()
+  _zbus_history_head=0
+  _zbus_history_count=0
+  z::log::debug "zbus: history cleared"
+  return 0
 }
 
-################################################################################
-# PUBLIC API — MAINTENANCE
-################################################################################
-
-###
-# Clear all recorded event history.
-###
-z::event::clear_history() {
+# z::bus::clear_stats
+# Resets all per-event operation counters to zero.
+z::bus::clear_stats() {
   emulate -L zsh
-  setopt localoptions no_unset
-  _zcore_event_history=()
-  z::log::debug "Event history cleared"
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+  _zbus_stats=()
+  z::log::debug "zbus: stats cleared"
+  return 0
 }
 
-###
-# Clear all emission statistics.
-###
-z::event::clear_stats() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  _zcore_event_stats=()
-  z::log::debug "Event statistics cleared"
-}
 
-###
-# Full reset — remove all handlers, history, and statistics.
-# Uses z::log::always so the reset is always audited regardless of log level.
-###
-z::event::reset() {
-  emulate -L zsh
-  setopt localoptions no_unset
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-  _zcore_event_handlers_exact=()
-  _zcore_event_handlers_wildcard=()
-  _zcore_event_handler_meta=()
-  _zcore_event_history=()
-  _zcore_event_stats=()
-  (( _zcore_event_handler_id = 0 ))
-
-  z::log::always "Event bus reset" component "zbus"
-}
-
-################################################################################
-# PUBLIC API — RUNTIME CONFIGURATION
-################################################################################
-
-###
-# Update a runtime configuration key for the event bus.
+# z::bus::config <key> <value>
+# Updates a single configuration parameter.  Validates the value, persists it
+# to the zkv store, and refreshes the in-memory cache.
 #
-# Supported keys:
-#   max_history              (integer)
-#   handler_timeout          (integer, seconds)
-#   max_handlers_per_event   (integer)
-#   enable_history           (true|false)
-#   enable_stats             (true|false)
-#   enable_wildcards         (true|false)
-#
-# Usage:
-#   z::event::configure max_history 200
-#   z::event::configure enable_wildcards false
-#
-# @param 1  Config key (without "event_" prefix)
-# @param 2  New value
-# @return 0 success | 1 unknown key
-###
-z::event::configure() {
+# Keys:
+#   max_history            <0..1000000>
+#   handler_timeout        <1..86400>
+#   max_handlers_per_event <1..100000>
+#   enable_history         <bool>
+#   enable_stats           <bool>
+#   enable_wildcards       <bool>
+z::bus::config() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  local key="$1"
-  local value="$2"
+  local key="$1" value="$2"
+  z::validate::nonempty "$key"   "key"   || return $ZBASE_ERROR_INVALID_INPUT
+  z::validate::nonempty "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::bus::ensure_init || return $?
 
-  # Map the public key to the z::config namespace key
-  local cfg_key="event_${key}"
-
-  # Verify the key is one we own by checking the initial defaults
+  local cfg_key
   case "$key" in
-    max_history|handler_timeout|max_handlers_per_event| \
-    enable_history|enable_stats|enable_wildcards) ;;
+    max_history)
+      z::validate::integer::range "$value" 0 1000000 "$key" \
+        || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_MAX_HISTORY"
+      ;;
+    handler_timeout)
+      z::validate::integer::range "$value" 1 86400 "$key" \
+        || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_HANDLER_TIMEOUT"
+      ;;
+    max_handlers_per_event)
+      z::validate::integer::range "$value" 1 100000 "$key" \
+        || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_MAX_HANDLERS"
+      ;;
+    enable_history)
+      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_ENABLE_HISTORY"
+      ;;
+    enable_stats)
+      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_ENABLE_STATS"
+      ;;
+    enable_wildcards)
+      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      cfg_key="$ZBUS_CFG_ENABLE_WILDCARDS"
+      ;;
     *)
-      z::log::error "Unknown event configuration key" key "$key"
-      return 1
+      z::log::error "zbus: unknown config key" key "$key"
+      return $ZBASE_ERROR_NOT_FOUND
       ;;
   esac
 
-  z::config::set "$cfg_key" "$value" || return $?
-  z::log::debug "Event config updated" key "$cfg_key" value "$value"
+  z::kv::set "$_ZBUS_STORE" "$cfg_key" "$value" || return $?
+  _z::bus::cache_config
+
+  # If max_history was reduced below the current count, clear the ring rather
+  # than attempting a partial trim here.
+  if [[ $key == "max_history" ]] && (( _zbus_history_count > _zbus_cfg_max_history )); then
+    z::bus::clear_history
+  fi
+
+  z::log::debug "zbus: config updated" key "$key" value "$value"
+  return 0
 }
 
-###
-# Retrieve a runtime configuration value.
-#
-# @param 1  Config key (without "event_" prefix)
-# @stdout   Current value
-# @return 0 success | 1 unknown key
-###
-z::event::get_config() {
+# z::bus::get_config <key>
+# Returns the current value of a configuration parameter via REPLY.
+z::bus::get_config() {
   emulate -L zsh
-  setopt localoptions no_unset
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local key="$1"
+  REPLY=""
+
+  z::validate::nonempty "$key" "key" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::bus::ensure_init || return $?
 
   case "$key" in
-    max_history|handler_timeout|max_handlers_per_event| \
-    enable_history|enable_stats|enable_wildcards) ;;
+    max_history)            REPLY=$_zbus_cfg_max_history ;;
+    handler_timeout)        REPLY=$_zbus_cfg_handler_timeout ;;
+    max_handlers_per_event) REPLY=$_zbus_cfg_max_handlers ;;
+    enable_history)         (( _zbus_flag_history ))   && REPLY="true" || REPLY="false" ;;
+    enable_stats)           (( _zbus_flag_stats ))     && REPLY="true" || REPLY="false" ;;
+    enable_wildcards)       (( _zbus_flag_wildcards )) && REPLY="true" || REPLY="false" ;;
     *)
-      z::log::error "Unknown event configuration key" key "$key"
-      return 1
+      z::log::error "zbus: unknown config key" key "$key"
+      return $ZBASE_ERROR_NOT_FOUND
       ;;
   esac
+  return 0
+}
 
-  z::config::get "event_${key}"
+# z::bus::show_config
+# Prints all configuration parameters and runtime state in a formatted table.
+z::bus::show_config() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  _z::bus::ensure_init || return $?
+
+  local key
+  local -a keys=(
+    max_history
+    handler_timeout
+    max_handlers_per_event
+    enable_history
+    enable_stats
+    enable_wildcards
+  )
+
+  print "\nzbus Configuration:"
+  print "==================="
+
+  for key in "${keys[@]}"; do
+    z::bus::get_config "$key"
+    printf "  %-28s %s\n" "${key}:" "$REPLY"
+  done
+
+  local perf_str="no"
+  (( _zbus_perf_mode )) && perf_str="yes"
+  printf "  %-28s %s\n" "performance_mode:" "$perf_str"
+  printf "  %-28s %d / %d\n" "async_pids_in_flight:" \
+    "${#_zbus_async_pids}" "$_ZBUS_ASYNC_PID_CAP"
+
+  print ""
+  return 0
+}
+
+# z::bus::reset
+# Clears all handlers, channels, history, stats, and async state, then marks
+# the bus as uninitialised so the next public call triggers a fresh init.
+z::bus::reset() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  _zbus_handlers_exact=()
+  _zbus_handlers_wildcard=()
+  _zbus_channels=()
+  _zbus_handler_meta=()
+  _zbus_handler_id=0
+  _zbus_async_pids=()
+  _zbus_perf_mode=0
+  _zbus_initialized=0
+
+  z::bus::clear_history 2>/dev/null || true
+  z::bus::clear_stats   2>/dev/null || true
+
+  z::log::always "zbus: bus reset" component "zbus"
+  return 0
+}
+
+
+# =============================================================================
+# PERFORMANCE MODE
+#
+# Disables history recording and stats updates on the emit hot path.
+# Intended for high-frequency event loops where those features are not needed.
+# The flags are modified only in the in-memory cache; the zkv store is NOT
+# updated, so the original values are restored when performance mode is
+# disabled via _z::bus::cache_config.
+# =============================================================================
+
+# z::bus::enable_performance_mode
+# Suspends history and stats; does not affect handler dispatch or wildcards.
+z::bus::enable_performance_mode() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+  _zbus_perf_mode=1
+  typeset -gi _zbus_flag_history=0
+  typeset -gi _zbus_flag_stats=0
+  z::log::info "zbus: performance mode enabled" \
+    note "history and stats suspended"
+  return 0
+}
+
+# z::bus::disable_performance_mode
+# Restores history and stats flags from the persisted zkv configuration.
+z::bus::disable_performance_mode() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+  _z::bus::ensure_init || return $?
+  _zbus_perf_mode=0
+  _z::bus::cache_config   # restore persisted flag values from zkv
+  z::log::info "zbus: performance mode disabled"
+  return 0
+}
+
+
+# =============================================================================
+# PUB/SUB CHANNELS
+#
+# Lightweight synchronous message passing distinct from the event handler
+# system.  No priority ordering, no history, no stats.  Process-scoped only.
+# Duplicate subscriptions for the same (channel, handler) pair are silently
+# ignored.
+# =============================================================================
+
+# z::bus::subscribe <channel> <handler-func>
+# Registers <handler-func> to receive messages published to <channel>.
+z::bus::subscribe() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local channel="$1" handler="$2"
+
+  _z::bus::ensure_init                        || return $?
+  z::validate::nonempty     "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::bus::validate_handler "$handler"           || return $?
+
+  local existing="${_zbus_channels[$channel]:-}"
+  if [[ -n $existing ]]; then
+    local -a current=("${(@ps:$_ZBUS_SEP:)existing}")
+    if (( ${current[(Ie)$handler]} )); then
+      # (Ie) = case-sensitive exact-match index; non-zero means already present.
+      z::log::debug "zbus: subscribe duplicate ignored" \
+        channel "$channel" handler "$handler"
+      return 0
+    fi
+    _zbus_channels[$channel]="${existing}${_ZBUS_SEP}${handler}"
+  else
+    _zbus_channels[$channel]="$handler"
+  fi
+
+  z::log::debug "zbus: subscribed" channel "$channel" handler "$handler"
+  return 0
+}
+
+# z::bus::unsubscribe <channel> [handler-func]
+# Removes <handler-func> from <channel>, or all handlers if no func is given.
+z::bus::unsubscribe() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local channel="$1" handler="${2:-}"
+
+  _z::bus::ensure_init                       || return $?
+  z::validate::nonempty "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+
+  if [[ -z $handler ]]; then
+    unset "_zbus_channels[$channel]"
+    z::log::debug "zbus: all subscribers removed" channel "$channel"
+    return 0
+  fi
+
+  local existing="${_zbus_channels[$channel]:-}"
+  if [[ -z $existing ]]; then
+    return $ZBASE_ERROR_NOT_FOUND
+  fi
+
+  local -a current=("${(@ps:$_ZBUS_SEP:)existing}")
+  current=("${(@)current:#$handler}")   # remove the target handler
+
+  if (( ${#current} > 0 )); then
+    _zbus_channels[$channel]="${(pj:$_ZBUS_SEP:)current}"
+  else
+    unset "_zbus_channels[$channel]"
+  fi
+
+  z::log::debug "zbus: unsubscribed" channel "$channel" handler "$handler"
+  return 0
+}
+
+# z::bus::publish <channel> <message>
+# Delivers <message> to all handlers subscribed to <channel>.
+# Stale handlers (no longer defined) are logged once and skipped.
+z::bus::publish() {
+  emulate -L zsh
+  setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
+
+  local channel="$1" message="$2"
+
+  _z::bus::ensure_init                       || return $?
+  z::validate::nonempty "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+
+  local list="${_zbus_channels[$channel]:-}"
+  if [[ -z $list ]]; then
+    z::log::debug "zbus: publish no subscribers" channel "$channel"
+    return 0
+  fi
+
+  local -a handlers=("${(@ps:$_ZBUS_SEP:)list}")
+  local h rc
+
+  for h in "${handlers[@]}"; do
+    if z::probe::func "$h"; then
+      rc=0
+      "$h" "$channel" "$message" 2>/dev/null || rc=$?
+      if (( rc != 0 )); then
+        z::log::rate_limit "zbus-pub-fail-${h}" 5 60 warn \
+          "zbus: publish handler returned non-zero" \
+          channel "$channel" handler "$h" rc "$rc"
+      fi
+    else
+      z::log::once "zbus-pub-missing-${h}" warn \
+        "zbus: publish handler no longer defined" \
+        channel "$channel" handler "$h"
+    fi
+  done
+
+  z::log::debug "zbus: published" channel "$channel"
+  return 0
 }
