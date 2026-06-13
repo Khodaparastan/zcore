@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 #
 # Prompt Configuration Module
-# Sets up the shell prompt, preferring Starship but with robust fallbacks.
+# Prefers Starship; falls back to a robust custom prompt.
 #
 
 # ==============================================================================
@@ -9,80 +9,67 @@
 # ==============================================================================
 
 ###
-# Generates a git status string for use in prompts.
+# Generate a git status string for the fallback prompt.
 ###
-__z::mod::prompt::git_info()
-{
+__z::mod::prompt::git_info() {
   emulate -L zsh
-  # Check if we're in a git repo. `git rev-parse` is the fastest way.
-  command git rev-parse --is-inside-work-tree &> /dev/null \
-    || return
+  command git rev-parse --is-inside-work-tree &>/dev/null || return
 
   local branch git_status status_color
-  branch=$(
-    command git symbolic-ref --short HEAD 2> /dev/null \
-      || command git rev-parse --short HEAD 2> /dev/null
-  )
-  git_status=$(command git status --porcelain=v1 2> /dev/null)
+  branch=$(command git symbolic-ref --short HEAD 2>/dev/null \
+        || command git rev-parse  --short HEAD 2>/dev/null)
+  git_status=$(command git status --porcelain=v1 2>/dev/null)
 
   if [[ -n "$git_status" ]]; then
-    status_color='%F{yellow}' # Dirty repo
+    status_color='%F{yellow}'
   else
-    status_color='%F{green}' # Clean repo
+    status_color='%F{green}'
   fi
-
   printf " %s(%s)%f" "$status_color" "$branch"
 }
 
 ###
-# Tries to initialize the Starship prompt.
+# Try to initialize Starship.  Output cached on disk to avoid `starship init`
+# subshell on every shell start.
 ###
-__z::mod::prompt::setup_starship()
-{
+__z::mod::prompt::setup_starship() {
   emulate -L zsh
-  if ! z::probe::cmd "starship"; then
-    return 1
-  fi
+  z::probe::cmd "starship" || return 1
 
-  z::log::debug "Attempting to initialize Starship prompt..."
-  z::exec::eval "$(starship init zsh)" 10 true
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/starship-init.zsh"
+  if [[ ! -s "$cache" || "$(command -v starship)" -nt "$cache" ]]; then
+    command mkdir -p -- "${cache:h}" 2>/dev/null
+    starship init zsh > "$cache" 2>/dev/null || return 1
+  fi
+  z::file::source --global "$cache"
 }
 
 ###
-# Sets up a robust, custom fallback prompt if Starship is not used.
+# Configure a robust, custom fallback prompt.
 ###
-__z::mod::prompt::setup_fallback()
-{
+__z::mod::prompt::setup_fallback() {
   emulate -L zsh
   setopt PROMPT_SUBST
 
-  # Colors for readability
-  local C_CYAN='%F{cyan}'
-  local C_BLUE='%F{blue}'
-  local C_RESET='%f'
-  local C_RED='%F{red}'
-  local C_GREEN='%F{green}'
-
+  local C_CYAN='%F{cyan}' C_BLUE='%F{blue}' C_RESET='%f'
+  local C_RED='%F{red}'   C_GREEN='%F{green}'
   local prompt_char='❯'
-  # Use a different character and color for root
-  if ((EUID == 0)); then
+
+  if (( EUID == 0 )); then
     prompt_char='#'
     C_CYAN='%F{red}'
   fi
 
   PS1="${C_CYAN}%n@%m${C_RESET}:${C_BLUE}%~${C_RESET}\$(__z::mod::prompt::git_info) ${C_GREEN}${prompt_char}${C_RESET} "
-  RPS1="%(?..${C_RED}✗ %?${C_RESET} )" # Show exit code on error
+  RPS1="%(?..${C_RED}✗ %?${C_RESET} )"
   PS2="${C_GREEN}❯${C_RESET} "
 
-  # --- Set Terminal Title ---
-  # Use add-zsh-hook for safety if available, otherwise append to array
-  autoload -Uz add-zsh-hook 2> /dev/null
-  _z_update_title()
-  {
-    print -Pn '\e]0;%n@%m:%~\a'
-  }
+  autoload -Uz add-zsh-hook 2>/dev/null
+  _z_update_title() { print -Pn '\e]0;%n@%m:%~\a'; }
+
   if z::probe::func "add-zsh-hook"; then
-    add-zsh-hook precmd _z_update_title
+    add-zsh-hook -D precmd _z_update_title 2>/dev/null
+    add-zsh-hook    precmd _z_update_title
   elif [[ -z ${(M)precmd_functions:#_z_update_title} ]]; then
     precmd_functions+=_z_update_title
   fi
@@ -94,8 +81,8 @@ __z::mod::prompt::setup_fallback()
 # ==============================================================================
 # MAIN INITIALIZATION
 # ==============================================================================
-__z::mod::prompt::init()
-{
+
+__z::mod::prompt::init() {
   emulate -L zsh
 
   z::log::info "Initializing shell prompt..."

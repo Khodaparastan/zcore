@@ -9,24 +9,19 @@
 # ==============================================================================
 
 ###
-# Adds a directory to FPATH if it exists (no framework function for this yet)
+# Adds a directory to FPATH if it exists and isn't already present.
 ###
-__z::mod::path_setup::fpath_add()
-{
+__z::mod::path_setup::fpath_add() {
   emulate -L zsh
   local dir="$1"
 
-
-  # Check existence
   z::probe::path "$dir" || return 1
 
-  # Check if already in fpath
-  if (( ${fpath[(Ie)$dir]} )); then
+  if ((${fpath[(Ie)$dir]})); then
     z::log::debug "Directory already in FPATH: $dir"
     return 0
   fi
 
-  # Add to beginning of fpath
   fpath=("$dir" $fpath)
   z::log::debug "Added to FPATH: $dir"
   return 0
@@ -36,89 +31,71 @@ __z::mod::path_setup::fpath_add()
 # MAIN INITIALIZATION
 # ==============================================================================
 
-__z::mod::path_setup::init()
-{
+__z::mod::path_setup::init() {
   emulate -L zsh
   z::log::info "Building PATH and FPATH..."
 
-  # Make fpath unique (PATH is handled by z::env::path_add)
-  typeset -gU fpath
+  # Ensure uniqueness on both path & fpath.
+  typeset -gU path fpath
 
-  # --- PATH Construction (using framework function) ---
-  # Add in reverse order of priority (last = highest priority)
-  # System paths (lowest priority)
-
-
-  # Homebrew (varies by platform)
-  if (( $IS_LINUX )); then
-    z::log::silent z::env::path_add "/sbin" prepend
-    z::log::silent z::env::path_add "/usr/sbin" prepend
-    z::log::silent z::log::silent z::env::path_add "/usr/local/sbin" prepend
-    z::log::silent z::env::path_add "/bin" prepend
-    z::log::silent z::env::path_add "/usr/bin" prepend
-    z::log::silent z::env::path_add "/usr/local/bin" prepend
-    z::log::silent z::env::path_add "/home/linuxbrew/.linuxbrew/sbin" prepend
-    z::log::silent z::env::path_add "/home/linuxbrew/.linuxbrew/bin" prepend
-    z::log::silent z::env::path_add "/snap/bin" prepend
+  # ── System base paths (lowest priority via prepend ordering) ────────────
+  local -a system_paths
+  if ((IS_LINUX)); then
+    system_paths=(
+      /snap/bin
+      /home/linuxbrew/.linuxbrew/bin /home/linuxbrew/.linuxbrew/sbin
+      /usr/local/bin /usr/bin /bin
+      /usr/local/sbin /usr/sbin /sbin
+    )
+  elif ((IS_MACOS)); then
+    system_paths=(
+      /usr/local/bin /usr/bin /bin
+      /usr/local/sbin /usr/sbin /sbin
+      /opt/homebrew/sbin /opt/homebrew/bin
+    )
   fi
-  # elif (( $IS_MACOS )); then
-  # z::env::path_add "/usr/local/opt/brew/bin" prepend
-  # z::env::path_add "/opt/homebrew/sbin" prepend
-  z::log::silent z::env::path_add "/opt/homebrew/bin" prepend
-  z::log::silent z::exec::from_hook brew shellenv
 
-  # z::env::path_add "${HOMEBREW_PREFIX}/sbin" prepend
-  # z::env::path_add "${HOMEBREW_PREFIX}/bin" prepend
+  local p
+  for p in "${system_paths[@]}"; do
+    z::log::silent z::env::path_add "$p" prepend
+  done
 
-  # Additional development tools
-  # z::env::path_add "$HOME/.rye/shims" prepend
-  z::log::silent z::env::path_add "$HOME/.poetry/bin" prepend
-  z::log::silent z::env::path_add "${PDTM:-$HOME/.pdtm/go}/bin" prepend
-  z::log::silent z::env::path_add "${LMSTUDIO:-$HOME/.lmstudio}/bin" prepend
+  # Let brew populate HOMEBREW_PREFIX / MANPATH / INFOPATH on macOS.
+  ((IS_MACOS)) && z::log::silent z::exec::from_hook brew shellenv
 
-  # Language toolchains
-  # z::env::path_add "$HOME/.yarn/bin" prepend
-  # z::env::path_add "${DENO_INSTALL:-$HOME/.deno}/bin" prepend
-  z::log::silent z::env::path_add "${BUN_INSTALL:-$HOME/.bun}/bin" prepend
-  # z::env::path_add "${PNPM_HOME:-$HOME/.local/share/pnpm}" prepend
-  z::log::silent z::env::path_add "${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin" prepend
-  z::log::silent z::env::path_add "${RUSTUP_HOME:-$HOME/.rustup}/bin" prepend
-  z::log::silent z::env::path_add "${CARGO_HOME:-$HOME/.cargo}/bin" prepend
-  z::log::silent z::env::path_add "${GOBIN:-${GOPATH:-$HOME/go}/bin}" prepend
+  # ── Developer toolchains (higher priority) ──────────────────────────────
+  local -a dev_paths=(
+    "$HOME/.poetry/bin"
+    "${PDTM:-$HOME/.pdtm/go}/bin"
+    "${LMSTUDIO:-$HOME/.lmstudio}/bin"
+    "${BUN_INSTALL:-$HOME/.bun}/bin"
+    "${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin"
+    "${RUSTUP_HOME:-$HOME/.rustup}/bin"
+    "${CARGO_HOME:-$HOME/.cargo}/bin"
+    "${GOBIN:-${GOPATH:-$HOME/go}/bin}"
+    "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+    "$HOME/.config/composer/vendor/bin"
+    /opt/metasploit-framework/bin
+    "$HOME/bin"
+    "$HOME/.local/bin"
+    "$HOME/.luarocks/bin"
+  )
+  for p in "${dev_paths[@]}"; do
+    z::log::silent z::env::path_add "$p" prepend
+  done
 
-  # Version managers (check these before language toolchains)
-  # z::env::path_add "${ASDF_DATA_DIR:-$HOME/.asdf}/shims" prepend
-  z::log::silent z::env::path_add "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims" prepend
-  # z::env::path_add "$HOME/.nodenv/shims" prepend
-  # z::env::path_add "$HOME/.rbenv/shims" prepend
-  # z::env::path_add "$HOME/.pyenv/shims" prepend
-
-  # User-specific bins (highest priority)
-  z::log::silent z::env::path_add "$HOME/bin" prepend
-  z::log::silent z::env::path_add "$HOME/.local/bin" prepend
-
-  # RedTeaming Tolls
-  z::log::silent z::env::path_add "/opt/metasploit-framework/bin" prepend
-
-  # --- FPATH Construction (manual, no framework function yet) ---
+  # ── FPATH ───────────────────────────────────────────────────────────────
   local -a fpath_candidates=(
-    # Additional sources
     "${ASDF_DIR:-$HOME/.asdf}/completions"
-
-    # System completions
-    "/usr/share/zsh/vendor-completions"
+    /usr/share/zsh/vendor-completions
     "/usr/share/zsh/$ZSH_VERSION/functions"
-    "/usr/share/zsh/site-functions"
-
-    # Homebrew completions
-    "${HOMEBREW_PREFIX}/share/zsh/site-functions"
-
-    # User-specific (highest priority)
+    /usr/share/zsh/site-functions
     "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/completions"
     "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
   )
+  [[ -n "${HOMEBREW_PREFIX:-}" ]] &&
+    fpath_candidates+=("${HOMEBREW_PREFIX}/share/zsh/site-functions")
 
-  # Add FPATH entries (in reverse order for proper precedence)
   local dir
   for dir in "${fpath_candidates[@]}"; do
     z::log::silent __z::mod::path_setup::fpath_add "$dir"
