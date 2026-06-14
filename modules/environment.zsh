@@ -110,7 +110,9 @@ __z::mod::env::setup_package_managers() {
   emulate -L zsh -o no_aliases
 
   if (( IS_MACOS )) && z::probe::cmd "brew"; then
-    z::exec::from_hook brew shellenv
+    if [[ -z "${HOMEBREW_PREFIX:-}" ]]; then
+      z::exec::from_hook brew shellenv
+    fi
     typeset -gx HOMEBREW_NO_ANALYTICS=1
     typeset -gx HOMEBREW_NO_AUTO_UPDATE=1
     typeset -gx HOMEBREW_NO_INSTALL_CLEANUP=1

@@ -84,18 +84,13 @@ __z::mod::python::get_python_cmd()
     return 1
   fi
 
-  # Try in order of preference
+  # Try in order of preference (python3 before python2-era `python`).
   local -a candidates=(python3 python py)
-  local cmd version_output
+  local cmd
   for cmd in "${candidates[@]}"; do
     if z::probe::cmd "$cmd"; then
-      # Validate it's Python 3 - cache result
-      if version_output=$("$cmd" --version 2>&1); then
-        if [[ "$version_output" =~ 'Python[[:space:]]+3\.' ]]; then
-          print "$cmd"
-          return 0
-        fi
-      fi
+      print "$cmd"
+      return 0
     fi
   done
 
@@ -524,7 +519,7 @@ z::mod::pyenv::remove()
   emulate -L zsh
   local venv_name="${1:-.venv}"
 
-  
+
 
   if [[ ! -e "$venv_name" ]]; then
     z::log::error "Path does not exist: $venv_name"
@@ -743,7 +738,7 @@ z::mod::pyenv::info()
 __z::mod::python::init()
 {
   emulate -L zsh
-  
+
 
   z::log::info "Initializing Python module..."
 

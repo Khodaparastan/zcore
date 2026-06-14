@@ -62,6 +62,16 @@ z::log::get_level()
 z::log::toggle_progress()
 {
   emulate -L zsh
+  if (( ${+functions[z::progress::enable]} )); then
+    if z::config::get show_progress 2>/dev/null && [[ $REPLY == true ]]; then
+      z::progress::disable
+      z::log::info "Progress bars disabled"
+    else
+      z::progress::enable
+      z::log::info "Progress bars enabled"
+    fi
+    return 0
+  fi
   if [[ "${_z_config[show_progress]:-}" == "true" ]]; then
     _z_config[show_progress]=false
     z::log::info "Progress bars disabled"
@@ -71,11 +81,12 @@ z::log::toggle_progress()
   fi
 }
 
-# Function to clear any lingering progress output
-z::ui::progress::clear()
+__z::runtime::clear_progress_line()
 {
   emulate -L zsh
-  if [[ -t 2 ]]; then
+  if (( ${+functions[z::progress::clear]} )); then
+    z::progress::clear
+  elif [[ -t 2 ]]; then
     printf '\r\e[K' >&2
   fi
 }
@@ -93,8 +104,6 @@ fi
 # Global state variables
 typeset -gi _z_config_interrupted=0
 typeset -gi _log_depth=0
-typeset -gi _cached_term_width=0
-typeset -gi _z_prev_columns=0
 
 # Function existence cache
 typeset -gA _func_cache
@@ -224,14 +233,20 @@ z::runtime::handle_interrupt()
 
   # Only handle actual interrupts, not normal editing
   if [[ -n ${ZLE_STATE:-} ]]; then
-    return 0 # Don't handle interrupts during ZLE (line editing)
+    zle send-break
+    return $?
+  fi
+
+  if (( _z_config_interrupted )); then
+    exit 130
   fi
 
   if (( _z_config_interrupted == 0 )); then
     _z_config_interrupted=1
-    z::ui::progress::clear
+    __z::runtime::clear_progress_line
     z::log::warn "Interrupt received. Gracefully shutting down..."
   fi
+  return 130
 }
 
 z::sys::interrupted()
@@ -292,7 +307,7 @@ z::runtime::die()
   local message="${1-}"
   local -i exit_code=${2:-${_z_config[exit_general_error]}}
 
-  z::ui::progress::clear
+  __z::runtime::clear_progress_line
   z::log::error "FATAL: $message"
 
   # Return in sourced context, exit otherwise
@@ -311,7 +326,7 @@ z::sys::platform()
   emulate -L zsh
   setopt no_unset typeset_silent
 
-  
+
 
   if [[ -n "${_PLATFORM_DETECTED:-}" ]]; then
     return 0
@@ -745,7 +760,7 @@ z::exec::run()
   # Security scan
   __z::exec::scan_patterns "$input" || return 1
 
-  
+
 
   local -i exit_code=0
 
@@ -779,7 +794,7 @@ z::exec::eval()
 
   if [[ "$force_current_shell" == "true" ]]; then
     z::log::debug "Forcing eval in current shell for init script"
-    
+
     local -i exit_code=0
     eval "$input" || exit_code=$?
     if (( exit_code != 0 )); then
@@ -803,7 +818,7 @@ z::exec::eval()
     __z::exec::scan_patterns "$input" || return 1
   fi
 
-  
+
 
   if [[ "$is_shell_init" == "true" ]]; then
     z::log::debug "Detected shell init command (running in subshell): ${input}"
@@ -827,7 +842,7 @@ z::exec::from_hook()
   local subcommand="${2:-init}"
   local shell_arg="${3:-zsh}"
 
-  
+
 
   if ! z::probe::cmd "$tool_name"; then
     z::log::debug "$tool_name not found, skipping"
@@ -961,7 +976,7 @@ z::file::source()
     return 1
   fi
 
-  
+
 
   local -i exit_code=0
   source "$resolved_file" "$@" || exit_code=$?
@@ -1126,7 +1141,7 @@ z::func::call()
     esac
   fi
 
-  
+
 
   local -i exit_code=0
   "$func" "$@" || exit_code=$?
@@ -1251,167 +1266,7 @@ z::state::unset()
 }
 
 # ==============================================================================
-# 7. USER INTERFACE (UI)
-# ==============================================================================
-z::ui::term::width()
-{
-  emulate -L zsh
-  local -i width tput_width
-
-  # Use cached width if COLUMNS hasn't changed and cache is valid
-  if (( _cached_term_width > 0 && _z_prev_columns == ${COLUMNS:-0} )); then
-    print -r -- "$_cached_term_width"
-    return 0
-  fi
-
-  if [[ -n "${COLUMNS:-}" ]] &&
-    [[ "$COLUMNS" =~ ^[0-9]+$ ]] &&
-    (( COLUMNS >= 10 )); then
-    width=$COLUMNS
-  elif (( $+commands[tput] )) &&
-    tput_width=$(tput cols 2> /dev/null) &&
-    [[ "$tput_width" =~ ^[0-9]+$ ]] &&
-    (( tput_width >= 10 )); then
-    width=$tput_width
-  else
-    width=80
-  fi
-
-  _cached_term_width=$width
-  _z_prev_columns=${COLUMNS:-0}
-  print -r -- "$width"
-}
-
-z::ui::progress::_should_show()
-{
-  emulate -L zsh
-  local -i current=$1 total=$2 interval=${_z_config[progress_update_interval]:-20}
-
-  if (( current == 1 || current == total )); then
-    return 0
-  fi
-
-  if (( total <= 10 )); then
-    return 1
-  fi
-
-  if (( total <= 50 )); then
-    (( current % 5 == 0 )) && return 0
-    return 1
-  fi
-
-  if (( current % interval == 0 )) || (( total - current < interval )); then
-    return 0
-  fi
-
-  return 1
-}
-
-z::util::comma()
-{
-  emulate -L zsh
-  setopt localoptions typeset_silent
-  local n="${1:-0}"
-  # Normalize sign and digits
-  local sign=''
-  if [[ $n == -* ]]; then
-    sign='-'
-    n="${n#-}"
-  fi
-  # Non-digit input: return as-is
-  if [[ $n != <-> ]]; then
-    print -r -- "${sign}${n}"
-    return 0
-  fi
-  local -a groups=()
-  local s="$n"
-  while (( ${#s} > 3 )); do
-    groups=("${s[-3,-1]}" "${(@)groups}")
-    s="${s[1,-4]}"
-  done
-  local out="$s"
-  if (( ${#groups} )); then
-    out+=",${(j:,:)groups}"
-  fi
-  print -r -- "${sign}${out}"
-}
-
-z::progress::show()
-{
-  emulate -L zsh
-  setopt typeset_silent
-
-  if [[ ${1-} != <-> || ${2-} != <-> ]]; then
-    z::log::debug "Invalid progress params: must be integers."
-    return 1
-  fi
-  local -i current=$1 total=$2
-
-  local label="${3:-items}"
-  if (( total <= 0 || current < 0 || current > total )); then
-    z::log::debug "Invalid progress range: $current/$total."
-    return 1
-  fi
-
-  if (( _z_verbose_level < _z_config[log_info] )) ||
-    [[ ! -t 2 ]] ||
-    [[ "${_z_config[show_progress]:-true}" == "false" ]]; then
-    return 0
-  fi
-
-  z::ui::progress::_should_show "$current" "$total" || return 0
-
-  local -i term_width
-  term_width=$(z::ui::term::width)
-
-  local -F percent
-  if (( total > 0 )); then
-    (( percent = (current * 100.0) / total ))
-  else
-    percent=0.0
-  fi
-
-  local -i bar_width
-  if (( term_width > 40 )); then
-    bar_width=20
-  else
-    bar_width=10
-  fi
-  local -i filled=$(( (percent * bar_width) / 100 ))
-  (( filled < 0 )) && filled=0
-  (( filled > bar_width )) && filled=$bar_width
-  local -i empty_len=$(( bar_width - filled ))
-
-  local bar_fill bar_empty
-  if (( filled > 0 )); then
-    print -v bar_fill -f "%${filled}s" ""
-    bar_fill=${bar_fill// /█}
-  else
-    bar_fill=""
-  fi
-  if (( empty_len > 0 )); then
-    print -v bar_empty -f "%${empty_len}s" ""
-    bar_empty=${bar_empty// /░}
-  else
-    bar_empty=""
-  fi
-  local progress_bar="${bar_fill}${bar_empty}"
-
-  local current_fmt total_fmt
-  current_fmt=$(z::util::comma "$current")
-  total_fmt=$(z::util::comma "$total")
-
-  if (( term_width > 70 )); then
-    printf '\r[%s] %3.0f%% | %s: %s / %s ' "$progress_bar" "$percent" "$label" "$current_fmt" "$total_fmt" >&2
-  else
-    printf '\r[%s] %3.0f%% (%s/%s)' "$progress_bar" "$percent" "$current_fmt" "$total_fmt" >&2
-  fi
-
-  (( current == total )) && printf '\n' >&2
-}
-
-# ==============================================================================
-# 8. INITIALIZATION
+# 7. INITIALIZATION
 # ==============================================================================
 
 # Install interrupt handlers

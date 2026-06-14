@@ -73,12 +73,18 @@ __z::mod::keybindings::init() {
   bindkey '^[[127;5u' backward-kill-word         # Ctrl+Backspace (CSI u)
   bindkey '^[[3;5~'   kill-word                  # Ctrl+Delete
 
+  # ── Interrupt (must beat vi-mode self-insert and CSI-u motion binds) ───
+  bindkey -M viins '^C' send-break
+  bindkey -M vicmd '^C' send-break
+  bindkey -M viins '^[[67;5u' send-break  # CSI-u Ctrl+C
+  bindkey -M vicmd '^[[67;5u' send-break
+  bindkey '^[[67;5u' send-break
+
   # ── Word navigation ─────────────────────────────────────────────────────
   bindkey '^[[1;5C'  forward-word                # Ctrl+Right
   bindkey '^[[1;5D'  backward-word               # Ctrl+Left
   bindkey '^[f'      forward-word                # Alt+F
   bindkey '^[b'      backward-word               # Alt+B
-  bindkey '^[[67;5u' forward-word                # Ctrl+C as motion (CSI u)
   bindkey '^[[66;5u' backward-word               # Ctrl+B as motion (CSI u)
   bindkey '^[[1;2C'  forward-word                # Shift+Right
   bindkey '^[[1;2D'  backward-word               # Shift+Left

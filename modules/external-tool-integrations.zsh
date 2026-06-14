@@ -36,7 +36,7 @@ __z::ext::setup_fzf() {
   local -i found_keys=0 found_comp=0
   for fzf_file in "${key_paths[@]}"; do
     [[ -f "$fzf_file" ]] || continue
-    if z::file::source --global "$fzf_file"; then
+    if builtin source "$fzf_file" 2>/dev/null; then
       z::log::debug "Loaded fzf key-bindings: $fzf_file"
       found_keys=1
       break
@@ -46,7 +46,7 @@ __z::ext::setup_fzf() {
 
   for fzf_file in "${comp_paths[@]}"; do
     [[ -f "$fzf_file" ]] || continue
-    if z::file::source --global "$fzf_file"; then
+    if builtin source "$fzf_file" 2>/dev/null; then
       z::log::debug "Loaded fzf completion: $fzf_file"
       found_comp=1
       break
@@ -91,8 +91,8 @@ __z::ext::setup_gcloud_sdk() {
     path_script="${sdk_path}/path.zsh.inc"
     comp_script="${sdk_path}/completion.zsh.inc"
 
-    [[ -f "$path_script" ]] && z::file::source --global "$path_script"
-    [[ -f "$comp_script" ]] && z::file::source --global "$comp_script" \
+    [[ -f "$path_script" ]] && builtin source "$path_script" 2>/dev/null
+    [[ -f "$comp_script" ]] && builtin source "$comp_script" 2>/dev/null \
       && z::log::debug "gcloud completions sourced."
 
     z::log::info "Google Cloud SDK initialized from: $sdk_path"

@@ -257,11 +257,11 @@ __z::mod::completions::configure_styles() {
     '(*/)#lost+found' '(*/)#.cache' '*.log' '*.pid'
 
   # ── Process completion ────────────────────────────────────────────────
-  local uname_s="${_Z_UNAME_S:-$(uname -s 2>/dev/null)}"
+  local uname_s="${_Z_UNAME_S:-Unknown}"
   local -i is_bsd=0
   [[ "$uname_s" == (Darwin|FreeBSD|OpenBSD|NetBSD) ]] && is_bsd=1
 
-  local current_user="${USER:-$(id -un 2>/dev/null || print nobody)}"
+  local current_user="${USER:-${LOGNAME:-nobody}}"
   local ps_cmd ps_kill_cmd
   if (( is_bsd )); then
     ps_cmd="ps -u ${current_user} -o pid,ppid,state,start,pcpu,pmem,command"
@@ -299,7 +299,13 @@ __z::mod::completions::init() {
 
   z::log::info "Initializing completions module..."
 
-  typeset -g _Z_UNAME_S="${_Z_UNAME_S:-$(uname -s 2>/dev/null || print Unknown)}"
+  if (( IS_MACOS )); then
+    typeset -g _Z_UNAME_S=Darwin
+  elif (( IS_LINUX )); then
+    typeset -g _Z_UNAME_S=Linux
+  else
+    typeset -g _Z_UNAME_S="${_Z_UNAME_S:-$(uname -s 2>/dev/null || print Unknown)}"
+  fi
 
   local compcache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/compcache"
   if [[ ! -d "$compcache_dir" ]]; then

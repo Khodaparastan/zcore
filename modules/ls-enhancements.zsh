@@ -37,20 +37,8 @@ __z::mod::ls::setup_colors() {
 __z::mod::ls::setup_ls_aliases() {
   emulate -L zsh
 
-  if z::probe::cmd "eza" && eza --version >/dev/null 2>&1; then
-    local -a base_opts=(--group-directories-first --color=always --classify)
-
-    if [[ -z ${_z_eza_icons_checked:-} ]]; then
-      typeset -g _z_eza_icons_checked=1
-      if eza --help 2>&1 | command grep -q -- '--icons'; then
-        typeset -g _z_eza_has_icons=1
-      else
-        typeset -g _z_eza_has_icons=0
-      fi
-      z::log::debug "eza icon support: ${_z_eza_has_icons}"
-    fi
-    (( _z_eza_has_icons )) && base_opts+=('--icons')
-
+  if z::probe::cmd "eza"; then
+    local -a base_opts=(--group-directories-first --color=always --classify --icons)
     local eza_base="eza ${(j: :)base_opts}"
     z::env::alias_set ls  "$eza_base"
     z::env::alias_set ll  "$eza_base --long --header --git --time-style=long-iso"
@@ -71,11 +59,8 @@ __z::mod::ls::setup_ls_aliases() {
 __z::mod::ls::setup_lsd_or_fallback() {
   emulate -L zsh
 
-  if z::probe::cmd "lsd" && lsd --version >/dev/null 2>&1; then
-    local lsd_base='lsd --group-directories-first --color=always'
-    if lsd --help 2>&1 | command grep -q -- '--icon'; then
-      lsd_base+=' --icon=auto'
-    fi
+  if z::probe::cmd "lsd"; then
+    local lsd_base='lsd --group-directories-first --color=always --icon=auto'
     z::env::alias_set ls "$lsd_base"
     z::env::alias_set ll "$lsd_base --long"
     z::env::alias_set la "$lsd_base --all"
@@ -97,7 +82,7 @@ __z::mod::ls::setup_system_ls() {
   local ls_base="command ls -F"
   if (( IS_MACOS )); then
     ls_base+=" -G"
-  elif command ls --color=auto --version >/dev/null 2>&1; then
+  elif (( IS_LINUX )); then
     ls_base+=" --color=auto --group-directories-first"
   fi
 

@@ -37,11 +37,12 @@ __z::mod::prompt::setup_starship() {
   z::probe::cmd "starship" || return 1
 
   local cache="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/starship-init.zsh"
-  if [[ ! -s "$cache" || "$(command -v starship)" -nt "$cache" ]]; then
+  local tool_path="${commands[starship]}"
+  if [[ ! -s "$cache" || ( -n "$tool_path" && "$tool_path" -nt "$cache" ) ]]; then
     command mkdir -p -- "${cache:h}" 2>/dev/null
     starship init zsh > "$cache" 2>/dev/null || return 1
   fi
-  z::file::source --global "$cache"
+  builtin source "$cache"
 }
 
 ###
