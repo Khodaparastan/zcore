@@ -1,16 +1,97 @@
 # =============================================================================
 # z::ui / z::progress / z::util — Terminal UI Primitives
 # =============================================================================
-# Description: Provides terminal dimension queries, line/screen clearing,
-#              progress bar rendering, spinner animation, comma-formatting
-#              for integers, and progress visibility throttling logic.
+# Description: Terminal introspection, progress bars, spinners, formatting.
 #
-# Usage:       Sourced as part of the z-framework; functions are not intended
-#              to be called directly from the command line.
+# Usage:       Sourced as part of the z-framework; not for direct CLI use.
 #
 # Requires:    z::cache, z::config, z::log (internal framework modules)
 #              tput (optional, fallback for terminal dimension detection)
 # =============================================================================
+
+# ---------------------------------------------------------------------------
+# CAPABILITY DETECTION
+# ---------------------------------------------------------------------------
+
+typeset -gi _zui_unicode=-1 _zui_color=-1
+typeset -g _zui_glyphs_done="" _zui_glyphs_active_a="" _zui_glyphs_active_b=""
+typeset -g _zui_glyphs_pending="" _zui_glyphs_fail="" _zui_glyphs_skip="" _zui_glyphs_ok=""
+typeset -g _zui_glyphs_fill="" _zui_glyphs_edge="" _zui_glyphs_head="" _zui_glyphs_track=""
+typeset -g _zui_glyphs_frame_l="" _zui_glyphs_frame_r="" _zui_glyphs_sep="" _zui_glyphs_arrow=""
+typeset -g _zui_glyphs_block_fill="" _zui_glyphs_block_empty=""
+
+__z::ui::init_glyphs() {
+  emulate -L zsh
+
+  if z::ui::supports_unicode; then
+    _zui_glyphs_done='●' _zui_glyphs_active_a='◉' _zui_glyphs_active_b='◎'
+    _zui_glyphs_pending='○' _zui_glyphs_fail='✗' _zui_glyphs_skip='◌' _zui_glyphs_ok='✓'
+    _zui_glyphs_fill='━' _zui_glyphs_edge='▓' _zui_glyphs_head='╸' _zui_glyphs_track='─'
+    _zui_glyphs_frame_l='⟨' _zui_glyphs_frame_r='⟩' _zui_glyphs_sep='│' _zui_glyphs_arrow='▸'
+    _zui_glyphs_block_fill='█' _zui_glyphs_block_empty='░'
+  else
+    _zui_glyphs_done='#' _zui_glyphs_active_a='*' _zui_glyphs_active_b='*'
+    _zui_glyphs_pending='.' _zui_glyphs_fail='x' _zui_glyphs_skip='-' _zui_glyphs_ok='v'
+    _zui_glyphs_fill='=' _zui_glyphs_edge='=' _zui_glyphs_head='>' _zui_glyphs_track='-'
+    _zui_glyphs_frame_l='[' _zui_glyphs_frame_r=']' _zui_glyphs_sep='|' _zui_glyphs_arrow='>'
+    _zui_glyphs_block_fill='#' _zui_glyphs_block_empty='.'
+  fi
+}
+
+z::ui::is_tty() {
+  emulate -L zsh
+  local stream="${1:-2}"
+  case $stream in
+    1) [[ -t 1 ]] ;;
+    2) [[ -t 2 ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+z::ui::supports_color() {
+  emulate -L zsh
+
+  if (( _zui_color >= 0 )); then
+    (( _zui_color )) && return 0
+    return 1
+  fi
+
+  if [[ -n ${NO_COLOR-} ]] || [[ ${TERM:-} == dumb ]] || ! z::ui::is_tty 2; then
+    _zui_color=0
+    return 1
+  fi
+
+  if [[ -n ${_zlog_color_cache[mode]:-} && ${_zlog_color_cache[mode]} == none ]]; then
+    _zui_color=0
+    return 1
+  fi
+
+  if (( $+commands[tput] )) && tput setaf 1 >/dev/null 2>&1; then
+    _zui_color=1
+    return 0
+  fi
+
+  _zui_color=1
+  return 0
+}
+
+z::ui::supports_unicode() {
+  emulate -L zsh
+
+  if (( _zui_unicode >= 0 )); then
+    (( _zui_unicode )) && return 0
+    return 1
+  fi
+
+  if [[ ${LANG:-}${LC_ALL:-}${LC_CTYPE:-} == *[Uu][Tt][Ff]-8* ]] &&
+     [[ ${TERM:-} != dumb ]]; then
+    _zui_unicode=1
+    return 0
+  fi
+
+  _zui_unicode=0
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # TERMINAL DIMENSIONS
@@ -19,9 +100,8 @@
 z::ui::width() {
   emulate -L zsh
 
-  # Return cached width if available (TTL: 1 second)
   local cached
-  if cached=$(z::cache::get "ui:term_width"); then
+  if cached=$(z::cache::get "ui:term_width" 2>/dev/null); then
     print -r -- "$cached"
     return 0
   fi
@@ -29,18 +109,16 @@ z::ui::width() {
   typeset -i width=80
   local columns_current=${COLUMNS:-}
 
-  # Prefer $COLUMNS if it is a valid integer
   if [[ $columns_current == <-> ]]; then
     ((width = 10#$columns_current))
   elif (($+commands[tput])); then
-    # Fall back to tput when $COLUMNS is unset or non-numeric
     local tput_width
     if tput_width=$(tput cols 2>/dev/null) && [[ $tput_width == <-> ]]; then
       ((width = 10#$tput_width))
     fi
   fi
 
-  z::cache::set "ui:term_width" "$width" --ttl 1
+  z::cache::set "ui:term_width" "$width" --ttl 1 2>/dev/null
   print -r -- "$width"
   return 0
 }
@@ -48,21 +126,40 @@ z::ui::width() {
 z::ui::height() {
   emulate -L zsh
 
+  local cached
+  if cached=$(z::cache::get "ui:term_height" 2>/dev/null); then
+    print -r -- "$cached"
+    return 0
+  fi
+
   typeset -i rows=24
   local lines_current=${LINES:-}
 
-  # Prefer $LINES if it is a valid integer
   if [[ $lines_current == <-> ]]; then
     ((rows = 10#$lines_current))
   elif (($+commands[tput])); then
-    # Fall back to tput when $LINES is unset or non-numeric
     local tput_height
     if tput_height=$(tput lines 2>/dev/null) && [[ $tput_height == <-> ]]; then
       ((rows = 10#$tput_height))
     fi
   fi
 
+  z::cache::set "ui:term_height" "$rows" --ttl 1 2>/dev/null
   print -r -- "$rows"
+  return 0
+}
+
+z::ui::watch_resize() {
+  emulate -L zsh
+
+  if (( ${+functions[TRAPWINCH]} )); then
+    return 0
+  fi
+
+  TRAPWINCH() {
+    z::cache::del "ui:term_width" 2>/dev/null
+    z::cache::del "ui:term_height" 2>/dev/null
+  }
   return 0
 }
 
@@ -93,10 +190,9 @@ z::ui::clear_line() {
     esac
   done
 
-  # Skip output when stderr is not a terminal, unless --force is passed
   ((force == 0)) && [[ ! -t 2 ]] && return 0
 
-  printf '\r\e[K' >&2 # CR + erase to end of line
+  printf '\r\e[K' >&2
   ((newline)) && printf '\n' >&2
   return 0
 }
@@ -104,8 +200,9 @@ z::ui::clear_line() {
 z::ui::clear() {
   emulate -L zsh
 
-  # Only clear when stdout is an interactive terminal
-  if [[ -t 1 ]]; then
+  if [[ -t 2 ]]; then
+    printf '\e[H\e[2J' >&2
+  elif [[ -t 1 ]]; then
     clear
   fi
 
@@ -113,62 +210,7 @@ z::ui::clear() {
 }
 
 # ---------------------------------------------------------------------------
-# PROGRESS VISIBILITY THROTTLE
-# ---------------------------------------------------------------------------
-
-# Determines whether a progress update should be rendered for the given
-# current/total pair, based on configurable interval and total-size tiers.
-__z::progress::should_show() {
-  emulate -L zsh
-
-  # Both arguments must be valid integers
-  [[ ${1-} == <-> && ${2-} == <-> ]] || return 1
-
-  typeset -i current total interval=10
-  local interval_raw
-
-  ((current = 10#$1))
-  ((total = 10#$2))
-
-  # Allow the update interval to be overridden via framework config
-  interval_raw=$(z::config::get progress_update_interval 2>/dev/null)
-  if [[ $interval_raw == <-> ]]; then
-    ((interval = 10#$interval_raw))
-  fi
-  ((interval < 1)) && interval=1
-
-  # Always show the first and last item
-  if ((current == 1 || current == total)); then
-    return 0
-  fi
-
-  # Show every item when the total is very small
-  if ((total <= 5)); then
-    return 0
-  fi
-
-  # Show every other item for small totals
-  if ((total <= 10)); then
-    ((current % 2 == 0)) && return 0
-    return 1
-  fi
-
-  # Show every 5th item for medium totals
-  if ((total <= 50)); then
-    ((current % 5 == 0)) && return 0
-    return 1
-  fi
-
-  # For large totals: show on interval boundaries, or when nearing the end
-  if ((current % interval == 0)) || ((total - current < interval)); then
-    return 0
-  fi
-
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# NUMBER FORMATTING
+# FORMATTING UTILITIES
 # ---------------------------------------------------------------------------
 
 z::util::comma() {
@@ -178,13 +220,11 @@ z::util::comma() {
   local n="${1:-0}"
   local sign=''
 
-  # Strip and preserve a leading minus sign
   if [[ $n == -* ]]; then
     sign='-'
     n="${n#-}"
   fi
 
-  # Pass through non-integer values unchanged
   if [[ $n != <-> ]]; then
     print -r -- "${sign}${n}"
     return 0
@@ -193,7 +233,6 @@ z::util::comma() {
   typeset -i len
   ((len = ${#n}))
 
-  # No comma needed for numbers with 3 or fewer digits
   if ((len <= 3)); then
     print -r -- "${sign}${n}"
     return 0
@@ -202,7 +241,6 @@ z::util::comma() {
   local result="" chunk
   typeset -i pos remainder
 
-  # Handle the leading chunk that is shorter than 3 digits
   ((remainder = len % 3))
   if ((remainder > 0)); then
     result="${n[1,remainder]}"
@@ -211,7 +249,6 @@ z::util::comma() {
     ((pos = 1))
   fi
 
-  # Walk through remaining digits in groups of 3
   while ((pos <= len)); do
     chunk="${n[pos,pos+2]}"
     if [[ -n $result ]]; then
@@ -226,9 +263,620 @@ z::util::comma() {
   return 0
 }
 
+z::util::truncate() {
+  emulate -L zsh
+
+  local text="${1:-}" max="${2:-12}"
+
+  if [[ $max != <-> ]]; then
+    return 1
+  fi
+
+  typeset -i max_i=${2:-12}
+  (( max_i < 1 )) && max_i=1
+
+  if (( ${#text} <= max_i )); then
+    print -r -- "$text"
+    return 0
+  fi
+
+  if (( max_i == 1 )); then
+    print -r -- "…"
+    return 0
+  fi
+
+  typeset -i keep=$(( (max_i - 1) / 2 ))
+  print -r -- "${text[1,keep]}…${text: -keep}"
+  return 0
+}
+
+z::util::duration() {
+  emulate -L zsh
+
+  local raw="${1:-0}"
+  local -F seconds=0
+
+  if [[ $raw == <-> ]]; then
+    (( seconds = raw ))
+  elif [[ $raw == *.* ]]; then
+    seconds=$raw
+  else
+    print -r -- "${raw}s"
+    return 0
+  fi
+
+  if (( seconds < 1 )); then
+    printf '%.0fms\n' $(( seconds * 1000 ))
+  elif (( seconds < 60 )); then
+    printf '%.1fs\n' "$seconds"
+  else
+    typeset -i mins secs
+    (( mins = seconds / 60 ))
+    (( secs = seconds % 60 ))
+    printf '%dm %02ds\n' "$mins" "$secs"
+  fi
+  return 0
+}
+
+# Elapsed seconds since an EPOCHREALTIME or integer epoch stamp.
+__z::ui::elapsed_since() {
+  emulate -L zsh
+  local since="${1:-}"
+  local -F now start elapsed=0
+
+  if [[ -z $since ]]; then
+    REPLY=""
+    return 1
+  fi
+
+  now=${EPOCHREALTIME:-$SECONDS}
+  if [[ $since == *.* ]]; then
+    start=$since
+  else
+    start=$since.0
+  fi
+
+  elapsed=$(( now - start ))
+  (( elapsed < 0 )) && elapsed=0
+  REPLY=$elapsed
+  return 0
+}
+
+z::ui::box() {
+  emulate -L zsh
+
+  local title="${1:-}" width="${2:-0}"
+  shift 2
+  local -a lines=("$@")
+  local line top bottom inner max_len=0
+  typeset -i box_width
+
+  if [[ $width == <-> && width -gt 0 ]]; then
+    box_width=$width
+  else
+    box_width=$(z::ui::width)
+    (( box_width > 80 )) && box_width=80
+  fi
+
+  for line in "${lines[@]}"; do
+    (( ${#line} > max_len )) && max_len=${#line}
+  done
+  (( ${#title} + 4 > max_len )) && max_len=$(( ${#title} + 4 ))
+
+  typeset -i inner_width=$(( box_width - 4 ))
+  (( inner_width < 10 )) && inner_width=10
+  (( max_len > inner_width )) && max_len=$inner_width
+
+  printf -v top '%*s' "$(( max_len + 2 ))" ''
+  top=${top// /─}
+  printf -v bottom '%*s' "$(( max_len + 2 ))" ''
+  bottom=${bottom// /─}
+
+  if [[ -n $title ]]; then
+    printf '┌ %s %s\n' "$title" "${top:${#title}+2}" >&2
+  else
+    printf '┌%s\n' "$top" >&2
+  fi
+
+  for line in "${lines[@]}"; do
+    line=$(z::util::truncate "$line" "$inner_width")
+    printf '│ %-*s │\n' "$max_len" "$line" >&2
+  done
+
+  printf '└%s\n' "$bottom" >&2
+  return 0
+}
+
 # ---------------------------------------------------------------------------
-# PROGRESS BAR
+# PROGRESS — CONFIG / STATE
 # ---------------------------------------------------------------------------
+
+typeset -gA _zprog_tracks=()
+typeset -gi _zprog_track_lines=0
+typeset -gi _z_progress_spinner_idx=0
+typeset -gi _zprog_spinner_active=0
+typeset -g _zprog_spinner_msg=""
+typeset -g _zprog_phase=""
+
+__z::progress::is_enabled() {
+  emulate -L zsh
+  local show_progress=""
+
+  if z::config::get show_progress 2>/dev/null; then
+    show_progress="$REPLY"
+  fi
+
+  [[ -z $show_progress || $show_progress == true ]]
+}
+
+__z::progress::style() {
+  emulate -L zsh
+
+  if z::config::get progress_style 2>/dev/null; then
+    case $REPLY in
+      classic | minimal | blocks) REPLY=$REPLY; return 0 ;;
+    esac
+  fi
+
+  REPLY=classic
+  return 0
+}
+
+__z::progress::should_show() {
+  emulate -L zsh
+
+  [[ ${1-} == <-> && ${2-} == <-> ]] || return 1
+
+  typeset -i current total interval=10
+  local interval_raw
+
+  ((current = 10#$1))
+  ((total = 10#$2))
+
+  interval_raw=""
+  if z::config::get progress_update_interval 2>/dev/null; then
+    interval_raw="$REPLY"
+  fi
+  if [[ $interval_raw == <-> ]]; then
+    ((interval = 10#$interval_raw))
+  fi
+  ((interval < 1)) && interval=1
+
+  if ((current == 1 || current == total)); then
+    return 0
+  fi
+
+  if ((total <= 15)); then
+    return 0
+  fi
+
+  if ((total <= 50)); then
+    ((current % 5 == 0)) && return 0
+    return 1
+  fi
+
+  if ((current % interval == 0)) || ((total - current < interval)); then
+    return 0
+  fi
+
+  return 1
+}
+
+__z::progress::bar_width_for_term() {
+  emulate -L zsh
+  typeset -i term_width="${1:-80}" style_reserved=32 bar_width
+  local style
+
+  __z::progress::style
+  style=$REPLY
+
+  if (( term_width > 100 )); then
+    (( style_reserved = 52 ))
+  elif (( term_width > 70 )); then
+    (( style_reserved = 42 ))
+  elif (( term_width > 50 )); then
+    (( style_reserved = 32 ))
+  else
+    (( style_reserved = 18 ))
+  fi
+
+  if [[ $style == minimal ]]; then
+    (( style_reserved -= 8 ))
+  fi
+
+  (( bar_width = term_width - style_reserved ))
+  (( bar_width < 8 )) && bar_width=8
+  (( bar_width > 48 )) && bar_width=48
+  REPLY=$bar_width
+}
+
+__z::progress::label_width_for_term() {
+  emulate -L zsh
+  typeset -i term_width="${1:-80}"
+
+  if (( term_width > 100 )); then
+    REPLY=24
+  elif (( term_width > 70 )); then
+    REPLY=16
+  elif (( term_width > 50 )); then
+    REPLY=12
+  else
+    REPLY=0
+  fi
+}
+
+__z::progress::pulse_glyph() {
+  emulate -L zsh
+  typeset -i tick=0
+
+  if [[ -n ${EPOCHREALTIME-} ]]; then
+    tick=$(( ${EPOCHREALTIME%%.*} % 2 ))
+  else
+    tick=$(( SECONDS % 2 ))
+  fi
+
+  if (( tick == 0 )); then
+    REPLY=$_zui_glyphs_active_a
+  else
+    REPLY=$_zui_glyphs_active_b
+  fi
+}
+
+__z::progress::segment_count() {
+  emulate -L zsh
+  typeset -i total="$1" bar_width="$2"
+
+  if (( total <= 24 && total <= bar_width )); then
+    REPLY=$total
+  else
+    REPLY=$bar_width
+  fi
+}
+
+__z::progress::render_bar() {
+  emulate -L zsh
+  typeset -i current="$1" total="$2" bar_width="$3"
+  typeset -i active="${4:-0}" fail="${5:-0}" skip="${6:-0}"
+  typeset -i segments pos tail i edge
+  local fill="" head="" empty="" done="" active_cell="" pending="" chunk style
+
+  __z::progress::style
+  style=$REPLY
+  __z::progress::segment_count "$total" "$bar_width"
+  (( segments = REPLY ))
+
+  if (( total <= 24 && total <= bar_width )); then
+    for (( i = 1; i <= segments; i++ )); do
+      if (( i <= current )); then
+        if (( fail && i == current )); then
+          done+=$_zui_glyphs_fail
+        elif (( skip && i == current )); then
+          done+=$_zui_glyphs_skip
+        else
+          done+=$_zui_glyphs_done
+        fi
+      elif (( active && current < total && i == current + 1 )); then
+        __z::progress::pulse_glyph
+        active_cell="$REPLY"
+      else
+        pending+=$_zui_glyphs_pending
+      fi
+    done
+    REPLY="${done}|${active_cell}|${pending}"
+    return 0
+  fi
+
+  if [[ $style == blocks ]]; then
+    typeset -i filled=$(( (current * segments) / total ))
+    (( filled < 0 )) && filled=0
+    (( filled > segments )) && filled=$segments
+    if (( filled > 0 )); then
+      printf -v fill '%*s' "$filled" ''
+      fill=${fill// /$_zui_glyphs_block_fill}
+    fi
+    (( tail = segments - filled ))
+    if (( tail > 0 )); then
+      printf -v empty '%*s' "$tail" ''
+      empty=${empty// /$_zui_glyphs_block_empty}
+    fi
+    REPLY="${fill}||${empty}"
+    return 0
+  fi
+
+  if (( current >= total )); then
+    printf -v fill '%*s' "$segments" ''
+    fill=${fill// /$_zui_glyphs_fill}
+    REPLY="${fill}||"
+    return 0
+  fi
+
+  if (( current == 0 )); then
+    printf -v empty '%*s' "$segments" ''
+    empty=${empty// /$_zui_glyphs_track}
+    REPLY="||${empty}"
+    return 0
+  fi
+
+  (( pos = (current * segments) / total ))
+  (( pos >= segments )) && (( pos = segments - 1 ))
+
+  if (( pos > 0 )); then
+    if (( pos >= 2 )); then
+      (( edge = pos - 1 ))
+      printf -v fill '%*s' "$edge" ''
+      fill=${fill// /$_zui_glyphs_fill}
+      fill+=$_zui_glyphs_edge
+    else
+      fill=$_zui_glyphs_edge
+    fi
+  fi
+
+  head=$_zui_glyphs_head
+  (( tail = segments - pos - 1 ))
+  if (( tail > 0 )); then
+    printf -v empty '%*s' "$tail" ''
+    empty=${empty// /$_zui_glyphs_track}
+  fi
+
+  REPLY="${fill}|${head}|${empty}"
+}
+
+__z::progress::render_indeterminate() {
+  emulate -L zsh
+  typeset -i bar_width="$1"
+  typeset -i segments window=3 pos i
+  local fill="" style
+
+  __z::progress::style
+  style=$REPLY
+  (( segments = bar_width ))
+  (( pos = SECONDS % (segments + window) ))
+  (( pos > segments - window )) && (( pos = segments - window ))
+
+  if [[ $style == blocks ]]; then
+    for (( i = 0; i < segments; i++ )); do
+      if (( i >= pos && i < pos + window )); then
+        fill+=$_zui_glyphs_block_fill
+      else
+        fill+=$_zui_glyphs_block_empty
+      fi
+    done
+    REPLY="${fill}||"
+    return 0
+  fi
+
+  for (( i = 0; i < segments; i++ )); do
+    if (( i >= pos && i < pos + window )); then
+      fill+=$_zui_glyphs_edge
+    else
+      fill+=$_zui_glyphs_track
+    fi
+  done
+  REPLY="${fill}||"
+}
+
+__z::progress::format_bar() {
+  emulate -L zsh
+  local mode="$1" a="$2" b="$3" c="$4"
+  typeset -i fail="${5:-0}"
+
+  if [[ -n $_zprog_t_done ]]; then
+    REPLY="${_zprog_t_frame}${_zui_glyphs_frame_l}${_zprog_t_reset}"
+    case $mode in
+      discrete)
+        [[ -n $a ]] && REPLY+="${_zprog_t_done}${a}"
+        [[ -n $b ]] && REPLY+="${_zprog_t_active}${b}"
+        [[ -n $c ]] && REPLY+="${_zprog_t_pending}${c}"
+        ;;
+      continuous | indeterminate)
+        if (( fail )); then
+          [[ -n $a ]] && REPLY+="${_zprog_t_fail}${a}"
+        else
+          [[ -n $a ]] && REPLY+="${_zprog_t_fill}${a}"
+        fi
+        [[ -n $b ]] && REPLY+="${_zprog_t_head}${b}${_zprog_t_edge}"
+        [[ -n $c ]] && REPLY+="${_zprog_t_track}${c}"
+        ;;
+    esac
+    REPLY+="${_zprog_t_frame}${_zui_glyphs_frame_r}${_zprog_t_reset}"
+  else
+    REPLY="${_zui_glyphs_frame_l}${a}${b}${c}${_zui_glyphs_frame_r}"
+  fi
+}
+
+__z::progress::theme() {
+  emulate -L zsh
+  typeset -i percent="$1" complete=0 fail="${2:-0}"
+
+  typeset -g _zprog_t_reset="" _zprog_t_dim="" _zprog_t_bold=""
+  typeset -g _zprog_t_fill="" _zprog_t_edge="" _zprog_t_track="" _zprog_t_head="" _zprog_t_frame=""
+  typeset -g _zprog_t_done="" _zprog_t_active="" _zprog_t_pending="" _zprog_t_fail="" _zprog_t_skip=""
+  typeset -g _zprog_t_pct="" _zprog_t_meta="" _zprog_t_sep="" _zprog_t_ok=""
+
+  (( percent >= 100 )) && complete=1
+
+  if ! z::ui::supports_color || (( ! ${+_zlog_colors[reset]} )); then
+    return 0
+  fi
+
+  _zprog_t_reset="${_zlog_colors[reset]}"
+  _zprog_t_dim="${_zlog_colors[dim]}"
+  _zprog_t_bold="${_zlog_colors[bold]}"
+  _zprog_t_sep="${_zlog_colors[bright_black]}"
+
+  _zprog_t_done="${_zlog_colors[bright_cyan]}"
+  _zprog_t_active="${_zlog_colors[bold]}${_zlog_colors[bright_yellow]}"
+  _zprog_t_pending="${_zlog_colors[bright_black]}"
+  _zprog_t_fail="${_zlog_colors[bold]}${_zlog_colors[bright_red]}"
+  _zprog_t_skip="${_zlog_colors[dim]}"
+  _zprog_t_ok="${_zlog_colors[bright_green]}"
+
+  _zprog_t_fill="${_zlog_colors[cyan]}"
+  _zprog_t_edge="${_zlog_colors[bright_cyan]}"
+  _zprog_t_track="${_zlog_colors[bright_black]}"
+  _zprog_t_head="${_zlog_colors[bold]}${_zlog_colors[white]}"
+  _zprog_t_pct="${_zlog_colors[bold]}${_zlog_colors[white]}"
+  _zprog_t_meta="${_zlog_colors[dim]}"
+  _zprog_t_frame="${_zlog_colors[dim]}"
+
+  if (( percent >= 90 && ! complete && ! fail )); then
+    _zprog_t_fill="${_zlog_colors[green]}"
+    _zprog_t_edge="${_zlog_colors[bright_green]}"
+  fi
+
+  if (( complete )); then
+    _zprog_t_done="${_zlog_colors[bright_green]}"
+    _zprog_t_fill="${_zlog_colors[bright_green]}"
+    _zprog_t_edge="${_zlog_colors[bright_green]}${_zlog_colors[bold]}"
+    _zprog_t_head="${_zlog_colors[bright_green]}${_zlog_colors[bold]}"
+    _zprog_t_pct="${_zlog_colors[bright_green]}${_zlog_colors[bold]}"
+  fi
+
+  if (( fail )); then
+    _zprog_t_head="${_zlog_colors[bright_red]}${_zlog_colors[bold]}"
+  fi
+
+  return 0
+}
+
+__z::progress::format_timing() {
+  emulate -L zsh
+  local since="${1:-}" current="${2:-0}" total="${3:-0}"
+  local -F elapsed eta=0
+  local elapsed_fmt eta_fmt=""
+
+  if ! __z::ui::elapsed_since "$since"; then
+    REPLY=""
+    return 1
+  fi
+
+  elapsed=$REPLY
+  elapsed_fmt=$(z::util::duration "$elapsed")
+  elapsed_fmt="${elapsed_fmt%%$'\n'*}"
+
+  if [[ $current == <-> && $total == <-> ]] &&
+     (( current > 0 && total > current )); then
+    eta=$(( (elapsed / current) * (total - current) ))
+    eta_fmt=$(z::util::duration "$eta")
+    eta_fmt="~${eta_fmt%%$'\n'*}"
+  fi
+
+  if [[ -n $eta_fmt ]]; then
+    REPLY="${elapsed_fmt} ${eta_fmt}"
+  else
+    REPLY="$elapsed_fmt"
+  fi
+}
+
+__z::progress::print_line() {
+  emulate -L zsh
+  typeset -i term_width="${1:-80}" percent_int="${2:-0}" label_width="${3:-0}"
+  typeset -i do_newline=0
+  [[ ${4:-0} == <-> ]] && (( do_newline = 4 ))
+
+  local label_disp="${5:-}" progress_bar="${6:-}" current_fmt="${7:-}" total_fmt="${8:-}"
+  local timing="${9:-}" detail="${10:-}" style
+
+  __z::progress::style
+  style=$REPLY
+
+  if [[ -n $detail ]]; then
+    if [[ -n $_zprog_t_meta ]]; then
+      detail=" ${_zprog_t_sep} ${_zprog_t_meta}${detail}${_zprog_t_reset}"
+    else
+      detail=" ${detail}"
+    fi
+  fi
+
+  if (( term_width <= 50 || label_width == 0 )); then
+    if [[ -n $_zprog_t_dim ]]; then
+      if [[ $style == minimal ]]; then
+        printf '\r\e[K%s%s%3d%%%s %s %s/%s%s%s' \
+          "$_zprog_t_dim" "$_zprog_t_pct" "$percent_int" "$_zprog_t_reset" \
+          "$progress_bar" "$current_fmt" "$total_fmt" "$timing" "$_zprog_t_reset" >&2
+      else
+        printf '\r\e[K%s%s %s%3d%%%s %s %s/%s%s%s' \
+          "$_zprog_t_dim" "$_zui_glyphs_arrow" "$_zprog_t_pct" "$percent_int" "$_zprog_t_reset" \
+          "$progress_bar" "$current_fmt" "$total_fmt" "$timing" "$_zprog_t_reset" >&2
+      fi
+    else
+      printf '\r\e[K%s %3d%% %s %s/%s%s' \
+        "$_zui_glyphs_arrow" "$percent_int" "$progress_bar" \
+        "$current_fmt" "$total_fmt" "$timing" >&2
+    fi
+  elif (( term_width > 70 )); then
+    if [[ $style == minimal ]]; then
+      if [[ -n $_zprog_t_dim ]]; then
+        printf '\r\e[K%s%-*s%s %s%s %s│%s %3d%%%s %s│%s %s/%s%s %s' \
+          "$_zprog_t_bold" "$label_width" "$label_disp" "$_zprog_t_reset" \
+          "$progress_bar" "$detail" "$_zprog_t_sep" \
+          "$_zprog_t_pct" "$percent_int" "$_zprog_t_reset" "$_zprog_t_sep" \
+          "$_zprog_t_meta" "$current_fmt" "$total_fmt" "$_zprog_t_reset" "$timing" >&2
+      else
+        printf '\r\e[K%-*s %s%s │ %3d%% │ %s/%s%s' \
+          "$label_width" "$label_disp" "$progress_bar" "$detail" \
+          "$percent_int" "$current_fmt" "$total_fmt" "$timing" >&2
+      fi
+    elif [[ -n $_zprog_t_dim ]]; then
+      printf '\r\e[K%s%s %s%-*s%s %s│%s%s %s│%s %3d%%%s %s│%s %s/%s%s %s' \
+        "$_zprog_t_dim" "$_zui_glyphs_arrow" "$_zprog_t_bold" "$label_width" "$label_disp" "$_zprog_t_reset" \
+        "$_zprog_t_sep" "$progress_bar" "$detail" "$_zprog_t_sep" \
+        "$_zprog_t_pct" "$percent_int" "$_zprog_t_reset" "$_zprog_t_sep" \
+        "$_zprog_t_meta" "$current_fmt" "$total_fmt" "$_zprog_t_reset" "$timing" >&2
+    else
+      printf '\r\e[K%s %-*s %s│ %s%s │ %3d%% │ %s/%s%s' \
+        "$_zui_glyphs_arrow" "$label_width" "$label_disp" "$_zui_glyphs_sep" \
+        "$progress_bar" "$detail" "$percent_int" "$current_fmt" "$total_fmt" "$timing" >&2
+    fi
+  else
+    if [[ -n $_zprog_t_dim ]]; then
+      printf '\r\e[K%s%s %s%3d%%%s %s %s/%s%s%s' \
+        "$_zprog_t_dim" "$_zui_glyphs_arrow" "$_zprog_t_pct" "$percent_int" "$_zprog_t_reset" \
+        "$progress_bar" "$current_fmt" "$total_fmt" "$timing" "$_zprog_t_reset" >&2
+    else
+      printf '\r\e[K%s %3d%% %s %s/%s%s' \
+        "$_zui_glyphs_arrow" "$percent_int" "$progress_bar" \
+        "$current_fmt" "$total_fmt" "$timing" >&2
+    fi
+  fi
+
+  if (( do_newline )); then
+    printf '\n' >&2
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# PROGRESS — PUBLIC API
+# ---------------------------------------------------------------------------
+
+z::progress::phase() {
+  emulate -L zsh
+
+  local name="${1:-}" total="${2:-}"
+  _zprog_phase="$name"
+
+  __z::progress::is_enabled || return 0
+  [[ ! -t 2 ]] && return 0
+
+  __z::progress::theme 0
+  if [[ -n $_zprog_t_dim ]]; then
+    if [[ $total == <-> ]]; then
+      printf '\e[K zcore %s%s %s%s (%s)%s\n' \
+        "$_zprog_t_dim" "$_zui_glyphs_arrow" "$_zprog_t_bold" "$name" "$total" "$_zprog_t_reset" >&2
+    else
+      printf '\e[K zcore %s%s %s%s%s\n' \
+        "$_zprog_t_dim" "$_zui_glyphs_arrow" "$_zprog_t_bold" "$name" "$_zprog_t_reset" >&2
+    fi
+  else
+    if [[ $total == <-> ]]; then
+      printf '\e[K zcore %s %s (%s)\n' "$_zui_glyphs_arrow" "$name" "$total" >&2
+    else
+      printf '\e[K zcore %s %s\n' "$_zui_glyphs_arrow" "$name" >&2
+    fi
+  fi
+  return 0
+}
 
 z::progress::show() {
   emulate -L zsh
@@ -238,30 +886,55 @@ z::progress::show() {
     return 1
   fi
 
-  typeset -i current total term_width=80 percent_int filled bar_width empty_len
-  local label="${3:-items}"
-  local show_progress term_width_raw
-  local bar_fill="" bar_empty="" progress_bar
-  local current_fmt total_fmt
+  typeset -i current total term_width=80 percent_int bar_width newline=0
+  typeset -i active=0 fail=0 skip=0
+  local label="${3:-items}" label_disp detail="" since="" timing=""
+  local arg term_width_raw progress_bar style
+  local seg_a seg_b seg_c current_fmt total_fmt
 
   ((current = 10#$1))
   ((total = 10#$2))
+
+  shift 3
+  while (( $# )); do
+    case $1 in
+      --newline) newline=1 ;;
+      --active)  active=1 ;;
+      --fail)    fail=1 ;;
+      --skip)    skip=1 ;;
+      --since)
+        shift
+        since="${1:-}"
+        ;;
+      --detail)
+        shift
+        detail="${1:-}"
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        z::log::debug "Unknown progress flag: $1"
+        return 1
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
 
   if ((total <= 0 || current < 0 || current > total)); then
     z::log::debug "Invalid progress range: $current/$total."
     return 1
   fi
 
-  # Skip rendering when log level is below INFO or stderr is not a terminal
-  if ((${_zlog_config[level]:-0} < _ZLOG_LEVEL_INFO)) || [[ ! -t 2 ]]; then
+  if [[ ! -t 2 ]]; then
     return 0
   fi
 
-  show_progress=$(z::config::get show_progress 2>/dev/null)
-  [[ -z $show_progress ]] && show_progress=true
-  [[ $show_progress == false ]] && return 0
-
-  # Apply throttle logic before doing any rendering work
+  __z::progress::is_enabled || return 0
   __z::progress::should_show "$current" "$total" || return 0
 
   term_width_raw=$(z::ui::width)
@@ -271,50 +944,266 @@ z::progress::show() {
 
   ((percent_int = (current * 100) / total))
 
-  # Use a narrower bar on small terminals
-  if ((term_width > 40)); then
-    ((bar_width = 20))
+  typeset -i label_width=0
+  __z::progress::label_width_for_term "$term_width"
+  (( label_width = REPLY ))
+  if (( label_width > 0 )); then
+    label_disp=$(z::util::truncate "$label" "$label_width")
   else
-    ((bar_width = 10))
+    label_disp=""
   fi
 
-  ((filled = (current * bar_width) / total))
-  ((filled < 0)) && filled=0
-  ((filled > bar_width)) && filled=bar_width
-  ((empty_len = bar_width - filled))
+  __z::progress::bar_width_for_term "$term_width"
+  ((bar_width = REPLY))
+  __z::progress::render_bar "$current" "$total" "$bar_width" "$active" "$fail" "$skip"
+  seg_a="${REPLY%%|*}"
+  seg_c="${REPLY##*|}"
+  seg_b="${REPLY#*|}"
+  seg_b="${seg_b%%|*}"
 
-  # Build filled and empty segments by padding a string then substituting chars
-  if ((filled > 0)); then
-    printf -v bar_fill '%*s' "$filled" ''
-    bar_fill=${bar_fill// /█}
-  fi
-
-  if ((empty_len > 0)); then
-    printf -v bar_empty '%*s' "$empty_len" ''
-    bar_empty=${bar_empty// /░}
-  fi
-
-  progress_bar="${bar_fill}${bar_empty}"
   current_fmt=$(z::util::comma "$current")
   total_fmt=$(z::util::comma "$total")
+  __z::progress::theme "$percent_int" "$fail"
 
-  # Wide terminals get a labelled format; narrow terminals get a compact one
-  if ((term_width > 70)); then
-    printf '\r\e[K[%s] %3d%% | %s: %s / %s\n' \
-      "$progress_bar" "$percent_int" "$label" "$current_fmt" "$total_fmt" >&2
+  if (( total <= 24 && total <= bar_width )); then
+    __z::progress::format_bar discrete "$seg_a" "$seg_b" "$seg_c" "$fail"
   else
-    printf '\r\e[K[%s] %3d%% (%s/%s)\n' \
-      "$progress_bar" "$percent_int" "$current_fmt" "$total_fmt" >&2
+    __z::progress::format_bar continuous "$seg_a" "$seg_b" "$seg_c" "$fail"
   fi
+  progress_bar="$REPLY"
+
+  if [[ -n $since ]]; then
+    __z::progress::format_timing "$since" "$current" "$total"
+    timing="$REPLY"
+    if [[ -n $timing && -n $_zprog_t_meta ]]; then
+      timing="${_zprog_t_sep} ${_zprog_t_meta}${timing}${_zprog_t_reset}"
+    elif [[ -n $timing ]]; then
+      timing=" ${timing}"
+    fi
+  fi
+
+  __z::progress::print_line "$term_width" "$percent_int" "$label_width" \
+    "$(( newline || current == total ))" "$label_disp" "$progress_bar" \
+    "$current_fmt" "$total_fmt" "$timing" "$detail"
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# PROGRESS CONTROL
-# ---------------------------------------------------------------------------
+z::progress::indeterminate() {
+  emulate -L zsh
+
+  local label="${1:-Working...}" detail=""
+  local arg
+
+  shift
+  while (( $# )); do
+    case $1 in
+      --detail)
+        shift
+        detail="${1:-}"
+        ;;
+      --newline) ;;
+      *)
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  if [[ ! -t 2 ]]; then
+    return 0
+  fi
+
+  __z::progress::is_enabled || return 0
+
+  typeset -i term_width=80 bar_width
+  local term_width_raw progress_bar label_disp timing=""
+
+  term_width_raw=$(z::ui::width)
+  [[ $term_width_raw == <-> ]] && (( term_width = term_width_raw ))
+
+  typeset -i label_width=0
+  __z::progress::label_width_for_term "$term_width"
+  (( label_width = REPLY ))
+  if (( label_width > 0 )); then
+    label_disp=$(z::util::truncate "$label" "$label_width")
+  fi
+
+  __z::progress::bar_width_for_term "$term_width"
+  (( bar_width = REPLY ))
+  __z::progress::render_indeterminate "$bar_width"
+  local seg_a="${REPLY%%|*}" seg_c="${REPLY##*|}"
+  local seg_b="${REPLY#*|}"; seg_b="${seg_b%%|*}"
+
+  __z::progress::theme 0
+  __z::progress::format_bar indeterminate "$seg_a" "$seg_b" "$seg_c"
+  progress_bar="$REPLY"
+
+  __z::progress::print_line "$term_width" 0 "$label_width" 0 \
+    "$label_disp" "$progress_bar" "…" "…" "$timing" "$detail"
+  return 0
+}
+
+z::progress::track() {
+  emulate -L zsh
+
+  local id="${1:-}" label="${2:-track}"
+  [[ -n $id ]] || return 1
+
+  _zprog_tracks[$id]="0|0|${label}"
+  return 0
+}
+
+z::progress::track_update() {
+  emulate -L zsh
+
+  local id="${1:-}" current="${2:-}" total="${3:-}" label="${4:-}"
+  [[ -n $id && $current == <-> && $total == <-> ]] || return 1
+
+  if [[ -n $label ]]; then
+    _zprog_tracks[$id]="${current}|${total}|${label}"
+  elif [[ -n ${_zprog_tracks[$id]:-} ]]; then
+    local _cur _tot _lbl
+    _cur="${_zprog_tracks[$id]%%|*}"
+    _lbl="${_zprog_tracks[$id]##*|}"
+    _zprog_tracks[$id]="${current}|${total}|${_lbl}"
+  else
+    _zprog_tracks[$id]="${current}|${total}|track"
+  fi
+
+  if [[ ! -t 2 ]] || ! __z::progress::is_enabled; then
+    return 0
+  fi
+
+  typeset -i lines=${#_zprog_tracks[@]}
+  if (( _zprog_track_lines > 0 )); then
+    printf '\e[%dA' "$_zprog_track_lines" >&2
+  fi
+
+  local key line cur tot lbl pct
+  for key in ${(ok)_zprog_tracks}; do
+    line="${_zprog_tracks[$key]}"
+    cur="${line%%|*}"
+    tot="${line#*|}"; tot="${tot%%|*}"
+    lbl="${line##*|}"
+    (( pct = tot > 0 ? (cur * 100) / tot : 0 ))
+    __z::progress::theme "$pct"
+    if [[ -n $_zprog_t_dim ]]; then
+      printf '\e[K%s%s %-12s%s %3d%% %s/%s\n' \
+        "$_zprog_t_dim" "$_zui_glyphs_arrow" "$(z::util::truncate "$lbl" 12)" "$_zprog_t_reset" \
+        "$pct" "$cur" "$tot" >&2
+    else
+      printf '\e[K%s %-12s %3d%% %s/%s\n' \
+        "$_zui_glyphs_arrow" "$(z::util::truncate "$lbl" 12)" "$pct" "$cur" "$tot" >&2
+    fi
+  done
+
+  _zprog_track_lines=$lines
+  return 0
+}
+
+z::progress::track_clear() {
+  emulate -L zsh
+
+  if (( _zprog_track_lines > 0 )); then
+    typeset -i i
+    for (( i = 0; i < _zprog_track_lines; i++ )); do
+      printf '\e[A\e[K' >&2
+    done
+    _zprog_track_lines=0
+  fi
+  _zprog_tracks=()
+  return 0
+}
+
+z::progress::finish() {
+  emulate -L zsh
+
+  local label="${1:-done}" since="" detail=""
+  typeset -i warnings=0 total=0 loaded=0 newline=1
+
+  shift
+  while (( $# )); do
+    case $1 in
+      --since)
+        shift
+        since="${1:-}"
+        ;;
+      --detail)
+        shift
+        detail="${1:-}"
+        ;;
+      --warnings)
+        shift
+        warnings="${1:-0}"
+        ;;
+      --total)
+        shift
+        total="${1:-0}"
+        ;;
+      --loaded)
+        shift
+        loaded="${1:-0}"
+        ;;
+      --no-newline) newline=0 ;;
+      *)
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  z::progress::track_clear
+  z::ui::clear_line --no-newline
+
+  if [[ ! -t 2 ]] || ! __z::progress::is_enabled; then
+    return 0
+  fi
+
+  local summary="" elapsed_fmt=""
+  if [[ -n $since ]] && __z::ui::elapsed_since "$since"; then
+    elapsed_fmt=$(z::util::duration "$REPLY")
+    elapsed_fmt="${elapsed_fmt%%$'\n'*}"
+  fi
+
+  if (( total > 0 )); then
+    if (( loaded > 0 )); then
+      summary="${loaded}/${total} modules"
+    else
+      summary="${total} items"
+    fi
+  fi
+
+  if [[ -n $elapsed_fmt ]]; then
+    summary="${summary:+$summary · }${elapsed_fmt}"
+  fi
+  if (( warnings > 0 )); then
+    summary="${summary:+$summary · }${warnings} warning(s)"
+  fi
+  if [[ -n $detail ]]; then
+    summary="${summary:+$summary · }${detail}"
+  fi
+
+  __z::progress::theme 100
+  if [[ -n $_zprog_t_ok ]]; then
+    if [[ -n $summary ]]; then
+      printf '\e[K%s%s %s%s %s%s\n' \
+        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_bold" "$label" "$_zprog_t_reset" \
+        "$_zprog_t_meta" "$summary" "$_zprog_t_reset" >&2
+    else
+      printf '\e[K%s%s %s%s\n' \
+        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_bold" "$label" "$_zprog_t_reset" >&2
+    fi
+  else
+    printf '\e[K%s %s%s\n' "$_zui_glyphs_ok" "$label" "${summary:+ · ${summary}}" >&2
+  fi
+
+  _zprog_phase=""
+  return 0
+}
 
 z::progress::clear() {
   emulate -L zsh
+  __z::progress::is_enabled || return 0
   z::ui::clear_line --no-newline
 }
 
@@ -336,21 +1225,76 @@ z::progress::spinner() {
   emulate -L zsh
 
   local message="${1:-Working...}"
-  local show_progress
   local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-  show_progress=$(z::config::get show_progress 2>/dev/null)
-  [[ -z $show_progress ]] && show_progress=true
-
-  # Skip animation when stderr is not a terminal or progress is disabled
-  if [[ ! -t 2 || $show_progress == false ]]; then
+  if [[ ! -t 2 ]] || ! __z::progress::is_enabled; then
     return 0
   fi
 
-  # Advance the global frame index, wrapping around the frames array
+  if ! z::ui::supports_unicode; then
+    frames=('|' '/' '-' '\\')
+  fi
+
   typeset -gi _z_progress_spinner_idx
   ((_z_progress_spinner_idx = (_z_progress_spinner_idx % ${#frames[@]}) + 1))
 
-  printf '\r\e[K%s %s' "${frames[_z_progress_spinner_idx]}" "$message" >&2
+  __z::progress::theme 0
+  if [[ -n $_zprog_t_dim ]]; then
+    printf '\r\e[K%s%s%s%s %s%s%s' \
+      "$_zprog_t_frame" "$_zui_glyphs_frame_l" "$_zprog_t_active" "${frames[_z_progress_spinner_idx]}" \
+      "$_zprog_t_frame" "$_zui_glyphs_frame_r}${_zprog_t_reset} " \
+      "$_zprog_t_meta" "$message" "$_zprog_t_reset" >&2
+  else
+    printf '\r\e[K%s %s %s' "${frames[_z_progress_spinner_idx]}" "$message" >&2
+  fi
   return 0
 }
+
+z::progress::__spinner_tick() {
+  emulate -L zsh
+  (( _zprog_spinner_active )) || return 0
+  z::progress::spinner "$_zprog_spinner_msg"
+  sched +0.08 z::progress::__spinner_tick
+}
+
+z::progress::spinner_start() {
+  emulate -L zsh
+  _zprog_spinner_msg="${1:-Working...}"
+  typeset -gi _zprog_spinner_active=1
+  z::progress::spinner "$_zprog_spinner_msg"
+  sched +0.08 z::progress::__spinner_tick
+  return 0
+}
+
+z::progress::spinner_stop() {
+  emulate -L zsh
+  typeset -gi _zprog_spinner_active=0
+  sched -clear z::progress::__spinner_tick 2>/dev/null
+  z::ui::clear_line --no-newline
+  return 0
+}
+
+z::progress::spinner_done() {
+  emulate -L zsh
+  local message="${1:-Done}"
+
+  z::progress::spinner_stop
+  [[ ! -t 2 ]] || ! __z::progress::is_enabled && return 0
+
+  __z::progress::theme 100
+  if [[ -n $_zprog_t_ok ]]; then
+    printf '%s%s%s %s%s\n' \
+      "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_reset" \
+      "$_zprog_t_meta" "$message" "$_zprog_t_reset" >&2
+  else
+    printf '%s %s\n' "$_zui_glyphs_ok" "$message" >&2
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# INIT
+# ---------------------------------------------------------------------------
+
+__z::ui::init_glyphs
+z::ui::watch_resize
