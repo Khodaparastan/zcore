@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 
 ################################################################################
-# ZCORE v0.3.0
+# ZCORE v0.4.2
 ################################################################################
 #
 #  Layers:
@@ -400,7 +400,13 @@ __z::sys::handle_interrupt() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   if [[ -n ${ZLE_STATE:-} ]]; then
-    return 0
+    # Trap returning 0 during ZLE suppresses the interrupt; delegate to ZLE.
+    zle send-break
+    return $?
+  fi
+
+  if (( _zcore_interrupted )); then
+    exit 130
   fi
 
   if (( _zcore_interrupted == 0 )); then
@@ -412,7 +418,7 @@ __z::sys::handle_interrupt() {
       z::event::emit "sys:interrupted"
     fi
   fi
-  return 0
+  return 130
 }
 
 z::sys::interrupted() {
@@ -432,7 +438,7 @@ z::sys::die()
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   local message="${1-}"
   typeset -i exit_code
-  (( exit_code = 10#${2:-${_zcore_config[exit_general_error]}} ))
+  (( exit_code = 10#${2:-$ZCORE_ERROR_GENERAL} ))
 
   z::progress::clear
   z::log::error "FATAL (exit $exit_code): $message"
