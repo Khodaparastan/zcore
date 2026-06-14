@@ -19,17 +19,25 @@ typeset -gx ZCORE_LOGDIR="${ZDOTDIR}/logs"
 z::interactive::_init_log() {
   emulate -L zsh
   setopt local_options typeset_silent
+  local saved_show_progress=true
+
+  if z::config::get show_progress 2>/dev/null; then
+    saved_show_progress="$REPLY"
+  fi
+
+  # Suppress progress only while configuring the logger; restore user preference after.
   z::progress::disable
   __z::log::init_colors
   z::log::set_file "${ZCORE_LOGDIR}/init.log"
-  z::log::set_file_level debug
+  z::log::set_file_level error
   z::log::set_format "text"
-  z::log::set_level "error"
+  z::log::set_level error
   z::log::set_rotation 1
   z::log::set_max_size $((10 * 1024 * 1024)) # 10 MiB
   z::log::set_max_files 5
   z::log::enable_buffering 1000
   z::log::enable_performance_mode
+  z::config::set show_progress "$saved_show_progress"
   z::log::info "Zsh initialization started" \
     zsh_version "$ZSH_VERSION" \
     zdotdir "$ZDOTDIR" \
@@ -59,25 +67,78 @@ z::interactive::load_mods() {
     zoxide
   )
 
-  local -i loaded=0 processed=0 total=${#modules[@]}
-  local module full_path
+  local -i loaded=0 processed=0 total=${#modules[@]} show_progress=0 warnings=0
+  local -a progress_flags=()
+  local module full_path module_start module_status=""
+  typeset -g _z_init_start=${EPOCHREALTIME:-$SECONDS}
+
+  if z::config::get show_progress 2>/dev/null && [[ $REPLY == true ]]; then
+    show_progress=1
+  fi
+
+  progress_flags=(--since "$_z_init_start")
+  if ((${_zlog_config[level]:-2} >= _ZLOG_LEVEL_INFO)); then
+    progress_flags+=(--newline)
+  fi
+
+  if ((show_progress)); then
+    z::progress::phase "loading modules" "$total"
+  fi
+
   z::log::info "Loading ${total} configuration modules..."
 
   for module in "${modules[@]}"; do
+    module_start=${EPOCHREALTIME:-$SECONDS}
+    module_status=ok
+
+    if ((show_progress)); then
+      z::progress::show "$processed" "$total" "$module" --active "${progress_flags[@]}"
+    fi
+
     full_path="${ZCORE_MODDIR}/${module}.zsh"
 
     if [[ ! -f "$full_path" ]]; then
+      module_status=fail
+      ((warnings++))
       z::log::warn "Module file not found: ${module}.zsh"
     elif z::file::source --global "$full_path"; then
       ((loaded++))
       z::log::debug "Module loaded: ${module}.zsh"
+      if ((${_zlog_config[level]:-2} >= _ZLOG_LEVEL_DEBUG)) &&
+        __z::ui::elapsed_since "$module_start"; then
+        local -F module_elapsed=$REPLY module_timing
+        if ((module_elapsed > 0.2)); then
+          module_timing=$(z::util::duration "$module_elapsed")
+          module_timing=${module_timing%%$'\n'*}
+          z::log::debug "Module slow: ${module}.zsh (${module_timing})"
+        fi
+      fi
     else
+      module_status=fail
+      ((warnings++))
       z::log::warn "Failed to load module: ${module}.zsh"
     fi
 
     ((processed++))
-    z::progress::show "$processed" "$total" "modules"
+
+    if ((show_progress)) && [[ $module_status != ok ]]; then
+      local -a post_flags=("${progress_flags[@]}")
+      case $module_status in
+      fail) post_flags+=(--fail) ;;
+      skip) post_flags+=(--skip) ;;
+      esac
+      z::progress::show "$processed" "$total" "$module" "${post_flags[@]}"
+    fi
   done
+
+  if ((show_progress)); then
+    z::progress::show "$total" "$total" "ready" "${progress_flags[@]}"
+    z::progress::finish "zcore ready" \
+      --since "$_z_init_start" \
+      --total "$total" \
+      --loaded "$loaded" \
+      --warnings "$warnings"
+  fi
 
   z::log::info "Successfully loaded ${loaded}/${total} modules."
   return 0
@@ -90,6 +151,8 @@ z::interactive::load_libs() {
   emulate -L zsh
   setopt local_options typeset_silent
   source "$ZDOTDIR/zlog"
+  # Apply console level before other libs source — default zlog level is DEBUG.
+  z::log::set_level info
   source "$ZDOTDIR/zbase"
   source "$ZDOTDIR/ui"
   source "$ZDOTDIR/zkv"
@@ -113,11 +176,17 @@ z::interactive::init() {
   z::sys::platform
   z::interactive::_init_log
 
+  # Skip symlink resolution while sourcing trusted local modules.
+  local -i _saved_zbase_perf_mode=_ZBASE_PERF_MODE
+  _ZBASE_PERF_MODE=1
+
   # Shell options first so plugins and compinit honour them.
   z::file::source --global "${ZCORE_MODDIR}/options.zsh" ||
     z::log::warn "Failed to source options module"
 
   z::interactive::load_mods
+
+  _ZBASE_PERF_MODE=$_saved_zbase_perf_mode
 
   typeset -g _zcore_init_loaded=1
   return 0
