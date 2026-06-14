@@ -605,7 +605,7 @@ __z::config::init_defaults() {
 
   z::kv::open config || return $?
 
-  __z::config::set_default "log_level"               "$_zlog_config[level]" int
+  __z::config::set_default "log_level"               "$_ZLOG_LEVEL_INFO" int
   __z::config::set_default "cache_max_size"          "100"   int
   __z::config::set_default "timeout_default"         "30"    int
   __z::config::set_default "performance_mode"        "false" bool
