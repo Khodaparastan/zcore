@@ -13,9 +13,29 @@ typeset -gx ZCORE_LIBDIR="${ZDOTDIR}"
 typeset -gx ZCORE_MODDIR="${ZDOTDIR}/modules"
 typeset -gx ZCORE_LOGDIR="${ZDOTDIR}/logs"
 
+# Critical modules — init fails if any of these do not load.
+typeset -ga _ZCORE_CRITICAL_MODULES=(environment options)
+
 # ---------------------------------------------------------------------------
 # Logging bootstrap
 # ---------------------------------------------------------------------------
+z::interactive::_ensure_logdir() {
+  emulate -L zsh
+  setopt local_options typeset_silent
+
+  if z::probe::dir "$ZCORE_LOGDIR"; then
+    return 0
+  fi
+
+  if command mkdir -p -- "$ZCORE_LOGDIR" 2>/dev/null; then
+    z::log::debug "Created log directory: $ZCORE_LOGDIR"
+    return 0
+  fi
+
+  z::log::warn "Failed to create log directory: $ZCORE_LOGDIR"
+  return $ZBASE_ERROR_GENERAL
+}
+
 z::interactive::_init_log() {
   emulate -L zsh
   setopt local_options typeset_silent
@@ -28,10 +48,11 @@ z::interactive::_init_log() {
   # Suppress progress only while configuring the logger; restore user preference after.
   z::progress::disable
   __z::log::init_colors
+  z::interactive::_ensure_logdir
   z::log::set_file "${ZCORE_LOGDIR}/init.log"
-  z::log::set_file_level error
+  z::log::set_file_level info
   z::log::set_format "text"
-  z::log::set_level error
+  z::log::set_level warn
   z::log::set_rotation 1
   z::log::set_max_size $((10 * 1024 * 1024)) # 10 MiB
   z::log::set_max_files 5
@@ -46,15 +67,42 @@ z::interactive::_init_log() {
 }
 
 # ---------------------------------------------------------------------------
-# Module loader
+# Post-init configuration (from zkv config store)
 # ---------------------------------------------------------------------------
-z::interactive::load_mods() {
+z::interactive::_apply_config() {
   emulate -L zsh
   setopt local_options typeset_silent
 
+  if z::config::get log_level 2>/dev/null; then
+    z::log::set_level "$REPLY"
+  fi
+
+  if z::config::get performance_mode 2>/dev/null && [[ $REPLY == true ]]; then
+    typeset -gi _ZBASE_PERF_MODE=1
+    z::log::enable_performance_mode 2>/dev/null
+    (( ${+functions[z::bus::enable_performance_mode]} )) &&
+      z::bus::enable_performance_mode 2>/dev/null
+    (( ${+functions[z::kv::enable_performance_mode]} )) &&
+      z::kv::enable_performance_mode config 2>/dev/null
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Module loader
+#
+# Do not use emulate -L or local_options here — sourced modules set global
+# shell options (setpath, options) and must persist after load_mods returns.
+# ---------------------------------------------------------------------------
+z::interactive::load_mods() {
+  setopt typeset_silent
+
+  # environment must precede options (HISTFILE/XDG); setpath follows environment.
   local -ar modules=(
-    setpath
     environment
+    setpath
+    options
     ziplug
     completions
     ls-enhancements
@@ -67,7 +115,7 @@ z::interactive::load_mods() {
     zoxide
   )
 
-  local -i loaded=0 processed=0 total=${#modules[@]} show_progress=0 warnings=0
+  local -i loaded=0 processed=0 total=${#modules[@]} show_progress=0 warnings=0 failures=0
   local -a progress_flags=()
   local module full_path module_start module_status=""
   typeset -g _z_init_start=${EPOCHREALTIME:-$SECONDS}
@@ -101,6 +149,9 @@ z::interactive::load_mods() {
       module_status=fail
       ((warnings++))
       z::log::warn "Module file not found: ${module}.zsh"
+      if (( ${_ZCORE_CRITICAL_MODULES[(Ie)$module]} )); then
+        ((failures++))
+      fi
     elif z::file::source --global "$full_path"; then
       ((loaded++))
       z::log::debug "Module loaded: ${module}.zsh"
@@ -117,6 +168,9 @@ z::interactive::load_mods() {
       module_status=fail
       ((warnings++))
       z::log::warn "Failed to load module: ${module}.zsh"
+      if (( ${_ZCORE_CRITICAL_MODULES[(Ie)$module]} )); then
+        ((failures++))
+      fi
     fi
 
     ((processed++))
@@ -140,7 +194,15 @@ z::interactive::load_mods() {
       --warnings "$warnings"
   fi
 
-  z::log::info "Successfully loaded ${loaded}/${total} modules."
+  z::log::info "Successfully loaded ${loaded}/${total} modules." \
+    warnings "$warnings" \
+    failures "$failures"
+
+  if ((failures)); then
+    z::log::error "Critical module load failures: ${failures}"
+    return $ZCORE_ERROR_GENERAL
+  fi
+
   return 0
 }
 
@@ -150,29 +212,51 @@ z::interactive::load_mods() {
 z::interactive::load_libs() {
   emulate -L zsh
   setopt local_options typeset_silent
-  source "$ZDOTDIR/zlog"
-  # Apply console level before other libs source — default zlog level is DEBUG.
-  z::log::set_level info
-  source "$ZDOTDIR/zbase"
-  source "$ZDOTDIR/ui"
-  source "$ZDOTDIR/zkv"
-  source "$ZDOTDIR/zbus"
-  source "$ZDOTDIR/z"
+
+  local -a libs=(zlog zbase ui zkv zbus z)
+  local lib lib_path
+
+  # zlog must load first; clamp console before other libs source (default is DEBUG).
+  lib_path="$ZDOTDIR/zlog"
+  if [[ ! -r "$lib_path" ]]; then
+    print -ru2 -- "zcore: required library not found: $lib_path"
+    return $ZCORE_ERROR_NOT_FOUND
+  fi
+  if ! source "$lib_path"; then
+    print -ru2 -- "zcore: failed to source library: zlog"
+    return $ZCORE_ERROR_GENERAL
+  fi
+  z::log::set_level warn
+
+  for lib in "${libs[@]:1}"; do
+    lib_path="$ZDOTDIR/$lib"
+    if [[ ! -r "$lib_path" ]]; then
+      print -ru2 -- "zcore: required library not found: $lib_path"
+      return $ZCORE_ERROR_NOT_FOUND
+    fi
+    if ! source "$lib_path"; then
+      print -ru2 -- "zcore: failed to source library: $lib"
+      return $ZCORE_ERROR_GENERAL
+    fi
+  done
+
   return 0
 }
 
 # ---------------------------------------------------------------------------
 # Master init
+#
+# Avoid emulate -L around load_mods — it prevents setopt from sourced modules
+# from persisting in the interactive shell.
 # ---------------------------------------------------------------------------
 z::interactive::init() {
-  emulate -L zsh
-  setopt local_options typeset_silent
+  setopt typeset_silent
 
   # Lean module loading — only `b:` (builtins) features needed.
   zmodload -F zsh/mathfunc
   zmodload zsh/parameter zsh/nearcolor
 
-  z::interactive::load_libs
+  z::interactive::load_libs || return $?
   z::sys::platform
   z::interactive::_init_log
 
@@ -180,13 +264,22 @@ z::interactive::init() {
   local -i _saved_zbase_perf_mode=_ZBASE_PERF_MODE
   _ZBASE_PERF_MODE=1
 
-  # Shell options first so plugins and compinit honour them.
-  z::file::source --global "${ZCORE_MODDIR}/options.zsh" ||
-    z::log::warn "Failed to source options module"
-
-  z::interactive::load_mods
+  z::interactive::load_mods || return $?
 
   _ZBASE_PERF_MODE=$_saved_zbase_perf_mode
+  z::interactive::_apply_config
+
+  # Verify shell options persisted (must not use local_options above).
+  if ! [[ -o EXTENDED_HISTORY ]]; then
+    z::log::error "History options not applied — check module load order"
+    return $ZCORE_ERROR_GENERAL
+  fi
+
+  if (( ${+functions[z::event::emit]} )); then
+    z::event::emit "zcore:session_ready" "$ZCORE_VERSION" 2>/dev/null || true
+  fi
+
+  z::log::info "Zsh initialization complete"
 
   typeset -g _zcore_init_loaded=1
   return 0
@@ -200,6 +293,8 @@ z::interactive::cleanup() {
     z::interactive::load_mods \
     z::interactive::load_libs \
     z::interactive::_init_log \
+    z::interactive::_ensure_logdir \
+    z::interactive::_apply_config \
     z::interactive::cleanup
 }
 

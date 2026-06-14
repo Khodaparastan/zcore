@@ -486,6 +486,8 @@ __z::mod::env::init() {
   emulate -L zsh -o no_aliases
 
   z::log::info "Initializing core environment..."
+  __z::mod::env::setup_xdg             || return $?
+  __z::mod::env::create_xdg_dirs       || return $?
   __z::mod::env::setup_editor          || return $?
   __z::mod::env::setup_package_managers|| return $?
   __z::mod::env::setup_development     || return $?
