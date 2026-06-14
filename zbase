@@ -1259,18 +1259,35 @@ z::exec::wait_all() {
 z::exec::from_hook() {
     emulate -L zsh
     local tool_name="${1:-}" subcommand="${2:-init}" shell_arg="${3:-zsh}"
-    local init_code init_label
+    local init_code init_label cache cache_key tool_path
     typeset -i tool_rc=0
+
     if ! z::probe::cmd "$tool_name"; then
         z::log::debug "${tool_name} not found, skipping hook"
         return 0
     fi
+
     init_label="${tool_name} ${subcommand} ${shell_arg}"
+    cache_key="${tool_name}__${subcommand}__${shell_arg}"
+    cache_key=${cache_key//[^a-zA-Z0-9._-]/_}
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/hooks/${cache_key}.zsh"
+    tool_path="${commands[$tool_name]}"
+
     local _hook_timer=""
     if z::log::if_debug; then
         z::log::benchmark_start "z::exec::from_hook:${tool_name}"
         _hook_timer="$REPLY"
     fi
+
+    if [[ -s "$cache" && ( -z "$tool_path" || ! "$tool_path" -nt "$cache" ) ]]; then
+        if builtin source "$cache" 2>/dev/null; then
+            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
+            z::log::debug "${tool_name} initialized from cache" label "$init_label"
+            return 0
+        fi
+        z::log::debug "${tool_name} hook cache invalid, regenerating" label "$init_label"
+    fi
+
     # Explicit trust boundary: output from a known, validated tool binary is
     # eval'd directly without pattern scanning.  This is intentionally different
     # from z::exec::run (which scans untrusted strings).  Do not remove this
@@ -1282,9 +1299,16 @@ z::exec::from_hook() {
             z::log::debug "${tool_name} exited non-zero but produced output; proceeding with eval" \
                 label "$init_label" exit_code "$tool_rc"
         fi
-        if _z::exec::eval_trusted "$init_code" "$init_label"; then
+        command mkdir -p -- "${cache:h}" 2>/dev/null
+        print -r -- "$init_code" > "$cache" 2>/dev/null
+        if builtin source "$cache" 2>/dev/null; then
             [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
             z::log::debug "${tool_name} initialized" label "$init_label"
+            return 0
+        fi
+        if _z::exec::eval_trusted "$init_code" "$init_label"; then
+            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
+            z::log::debug "${tool_name} initialized (cache write failed)" label "$init_label"
             return 0
         else
             [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
