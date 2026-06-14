@@ -9,9 +9,9 @@ TESTS_DIR="${SCRIPT_DIR}/tests"
 # Source the framework chain in dependency order
 source "${SCRIPT_DIR}/../zlog"   || { print -u2 "failed to source zlog"; exit 1; }
 source "${SCRIPT_DIR}/../zbase"  || { print -u2 "failed to source zbase"; exit 1; }
-source "${SCRIPT_DIR}/../zkv.zsh"    || { print -u2 "failed to source zkv"; exit 1; }
-source "${SCRIPT_DIR}/../zbus.zsh"   || { print -u2 "failed to source zbus"; exit 1; }
-source "${SCRIPT_DIR}/ztest.zsh"     || { print -u2 "failed to source ztest"; exit 1; }
+source "${SCRIPT_DIR}/../zkv"    || { print -u2 "failed to source zkv"; exit 1; }
+source "${SCRIPT_DIR}/../zbus"   || { print -u2 "failed to source zbus"; exit 1; }
+source "${SCRIPT_DIR}/ztest"     || { print -u2 "failed to source ztest"; exit 1; }
 
 # Quiet zlog while tests run; uncomment for verbose mode
 z::log::set_level error
