@@ -2,12 +2,6 @@ _tmp
 .DS_Store
 .idea
 .zed
-docs
-README.md
-.zsh_history
-.zcompdump
-logs
-.z*
 .clauge-worktrees
 .junie
 .serena

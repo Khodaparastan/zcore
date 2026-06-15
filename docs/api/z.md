@@ -722,6 +722,7 @@ events automatically. Subscribe with `z::event::on`.
 | Event | Emitted by | Arguments |
 |---|---|---|
 | `zcore:initialized` | Init (once at load) | `$ZCORE_VERSION` |
+| `zcore:session_ready` | Interactive init (after modules) | `$ZCORE_VERSION` |
 | `cache:set` | `z::cache::set` | `key`, `value` |
 | `cache:hit` | `z::cache::get` | `key` |
 | `cache:miss` | `z::cache::get` | `key`, reason (`expired` \| `not_found`) |
