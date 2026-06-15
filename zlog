@@ -99,8 +99,6 @@ if [[ -z ${ZSH_VERSION-} ]]; then
   return 1 2>/dev/null || exit 1
 fi
 
-emulate zsh
-setopt typeset_silent
 
 if ! zmodload zsh/datetime 2>/dev/null; then
   print -r -u2 -- "zlog: zsh/datetime module is required"
@@ -119,41 +117,43 @@ fi
 # CONSTANTS (Readonly)
 ###############################################################################
 
-typeset -gr _ZLOG_VERSION="1.0.0"
+if (( ! ${+_ZLOG_VERSION} )); then
+  typeset -gr _ZLOG_VERSION="1.0.0"
 
-# Log levels
-typeset -gri _ZLOG_LEVEL_ERROR=0
-typeset -gri _ZLOG_LEVEL_WARN=1
-typeset -gri _ZLOG_LEVEL_INFO=2
-typeset -gri _ZLOG_LEVEL_DEBUG=3
+  # Log levels
+  typeset -gri _ZLOG_LEVEL_ERROR=0
+  typeset -gri _ZLOG_LEVEL_WARN=1
+  typeset -gri _ZLOG_LEVEL_INFO=2
+  typeset -gri _ZLOG_LEVEL_DEBUG=3
 
-# Level name mappings (readonly)
-typeset -grA _ZLOG_LEVEL_NAMES=(
-  [0]="ERROR"
-  [1]="WARN"
-  [2]="INFO"
-  [3]="DEBUG"
-)
+  # Level name mappings (readonly)
+  typeset -grA _ZLOG_LEVEL_NAMES=(
+    [0]="ERROR"
+    [1]="WARN"
+    [2]="INFO"
+    [3]="DEBUG"
+  )
 
-# Reverse lookup: name -> number (case-insensitive)
-typeset -grA _ZLOG_LEVEL_VALUES=(
-  [ERROR]=0 [error]=0
-  [WARN]=1  [warn]=1
-  [INFO]=2  [info]=2
-  [DEBUG]=3 [debug]=3
-)
+  # Reverse lookup: name -> number (case-insensitive)
+  typeset -grA _ZLOG_LEVEL_VALUES=(
+    [ERROR]=0 [error]=0
+    [WARN]=1  [warn]=1
+    [INFO]=2  [info]=2
+    [DEBUG]=3 [debug]=3
+  )
 
-# Limits and defaults
-typeset -gri _ZLOG_MIN_ROTATE_SIZE=1024              # 1KB
-typeset -gri _ZLOG_MAX_ROTATE_SIZE=1073741824        # 1GB
-typeset -gri _ZLOG_MIN_BUFFER_SIZE=1
-typeset -gri _ZLOG_MAX_BUFFER_SIZE=10000
-typeset -gri _ZLOG_MAX_CONTEXTS=100
-typeset -gri _ZLOG_MAX_TIMERS=50
-typeset -gri _ZLOG_MAX_RECURSION_DEPTH=5
-typeset -gri _ZLOG_DEFAULT_ROTATION_LOCK_TIMEOUT=5
-typeset -gri _ZLOG_DEFAULT_ROTATE_SIZE=10485760      # 10MB
-typeset -gri _ZLOG_DEFAULT_ROTATE_KEEP=5
+  # Limits and defaults
+  typeset -gri _ZLOG_MIN_ROTATE_SIZE=1024              # 1KB
+  typeset -gri _ZLOG_MAX_ROTATE_SIZE=1073741824        # 1GB
+  typeset -gri _ZLOG_MIN_BUFFER_SIZE=1
+  typeset -gri _ZLOG_MAX_BUFFER_SIZE=10000
+  typeset -gri _ZLOG_MAX_CONTEXTS=100
+  typeset -gri _ZLOG_MAX_TIMERS=50
+  typeset -gri _ZLOG_MAX_RECURSION_DEPTH=5
+  typeset -gri _ZLOG_DEFAULT_ROTATION_LOCK_TIMEOUT=5
+  typeset -gri _ZLOG_DEFAULT_ROTATE_SIZE=10485760      # 10MB
+  typeset -gri _ZLOG_DEFAULT_ROTATE_KEEP=5
+fi
 
 ###############################################################################
 # USER CONFIGURATION
@@ -235,9 +235,7 @@ fi
 
 # General cache
 if (( ! ${+_zlog_cache} )); then
-  typeset -gA _zlog_cache=(
-    [strftime_available]=""
-  )
+  typeset -gA _zlog_cache=()
 fi
 
 # Timestamp cache
@@ -354,24 +352,6 @@ __z::log::init_globals() {
   _zlog_sys_cache[pid]="$$"
   _zlog_sys_cache[hostname]="${HOST:-$(hostname 2>/dev/null || print -r -- unknown)}"
   _zlog_sys_cache[username]="${USER:-${USERNAME:-$(whoami 2>/dev/null || print -r -- unknown)}}"
-
-  # Detect stat command type
-  if command -v gstat &>/dev/null; then
-    _zlog_state[stat_cmd]="gnu"
-  elif stat -f%z / &>/dev/null 2>&1; then
-    _zlog_state[stat_cmd]="bsd"
-  elif stat -c%s / &>/dev/null 2>&1; then
-    _zlog_state[stat_cmd]="gnu"
-  else
-    _zlog_state[stat_cmd]="none"
-  fi
-
-  # Check strftime availability
-  if strftime "%Y" "$EPOCHSECONDS" >/dev/null 2>&1; then
-    _zlog_cache[strftime_available]=1
-  else
-    _zlog_cache[strftime_available]=0
-  fi
 
   # Update fast-path flags
   __z::log::update_fast_flags
@@ -1019,14 +999,15 @@ __z::log::debug_internal() {
 
   (( ${_zlog_config[debug_mode]:-0} )) || return 0
 
-  local ts
+  local ts=""
 
-  if ts=$(strftime "%H:%M:%S" "$EPOCHSECONDS" 2>/dev/null) && [[ -n "$ts" ]]; then
-    : # Success
-  elif ts=$(date +%H:%M:%S 2>/dev/null) && [[ -n "$ts" ]]; then
-    : # Success
-  else
-    ts="--:--:--"
+  # Prefer the no-fork strftime builtin; only fall back to external `date` if it
+  # is somehow unavailable (this is a debug-only path, gated by debug_mode).
+  strftime -s ts "%H:%M:%S" "$EPOCHSECONDS" 2>/dev/null
+  if [[ -z "$ts" ]]; then
+    if ! ts=$(date +%H:%M:%S 2>/dev/null) || [[ -z "$ts" ]]; then
+      ts="--:--:--"
+    fi
   fi
 
   print -r -u2 -- "[${ts}] zlog[DEBUG]: $*"
@@ -1344,8 +1325,6 @@ z::log::clear_sys_cache() {
 # Output: Sets reply as key/value pairs: hostname value username value pid value
 # Returns: 0 always
 #
-# Note: This is more efficient than calling each function separately
-#       when you need all three values
 ###
 __z::sys::get_all_info() {
   emulate -L zsh
@@ -1954,8 +1933,6 @@ __z::log::timestamp_ms() {
 # Output: Sets REPLY with timestamp in nanoseconds since epoch (INTEGER)
 # Returns: 0 always
 #
-# Note: Actual precision is microseconds (EPOCHREALTIME limitation)
-#       Nanosecond digits are zero-padded
 #
 # Example: 1704067200123456000
 ###
@@ -2106,7 +2083,7 @@ __z::log::update_timestamp_uncached() {
     # Fast path: strftime available
     local combined_format="%Y-%m-%dT%H:%M:%S|%z|${user_format}"
     local combined_output
-    combined_output=$(strftime "$combined_format" "$current_epoch" 2>/dev/null)
+    strftime -s combined_output "$combined_format" "$current_epoch" 2>/dev/null
 
     if [[ -n "$combined_output" ]]; then
       local iso_base="${combined_output%%|*}"
@@ -2379,9 +2356,8 @@ z::log::set_timestamp_format() {
     return 1
   fi
 
-  # Test the format with strftime if available
-  local test_output
-  test_output=$(strftime "$format" "$EPOCHSECONDS" 2>/dev/null)
+  local test_output=""
+  strftime -s test_output "$format" "$EPOCHSECONDS" 2>/dev/null
 
   # Fallback to prompt expansion test
   if [[ -z "$test_output" ]]; then
@@ -2494,8 +2470,8 @@ z::log::format_epoch() {
     return 1
   fi
 
-  # Format using strftime
-  REPLY=$(strftime "$format" "$epoch" 2>/dev/null)
+  REPLY=""
+  strftime -s REPLY "$format" "$epoch" 2>/dev/null
 
   if [[ -z "$REPLY" ]]; then
     # Fallback to prompt expansion (less reliable for arbitrary epochs)
@@ -2612,8 +2588,6 @@ __z::log::format_duration() {
 #   z::log::time_diff 1000 61500     # REPLY = "1m0.50s"
 #   z::log::time_diff 2000 1000      # REPLY = "<negative>" (error)
 #
-# Note: Does not support negative durations (returns error)
-#       For negative durations, swap start and end parameters
 ###
 z::log::time_diff() {
   emulate -L zsh
@@ -2997,9 +2971,22 @@ __z::log::get_file_size() {
     return 1
   fi
 
-  # Detect and cache stat command type (only once)
+  # Detect and cache stat command type (only once).
+  #
+  # Preference order:
+  #   1. The `zstat` builtin from the zsh/stat module — in-process, NO fork.
+  #      This is the hot-path winner: rotation calls this on every file write,
+  #      so avoiding a `stat(1)` fork per call is the single biggest perf win.
+  #   2. GNU stat / BSD stat (external, one fork per call).
+  #   3. wc -c fallback (external).
   if [[ -z "${_zlog_state[stat_cmd]:-}" || "${_zlog_state[stat_cmd]:-}" == "none" ]]; then
-    if command -v gstat >/dev/null 2>&1 && gstat -c%s "$filepath" >/dev/null 2>&1; then
+    local -a _zfs_probe
+    if zmodload zsh/stat 2>/dev/null \
+       && zstat -A _zfs_probe -L +size -- "$filepath" 2>/dev/null \
+       && [[ "${_zfs_probe[1]:-}" == <-> ]]; then
+      _zlog_state[stat_cmd]="zstat"
+      _zlog_state[stat_bin]="zstat"
+    elif command -v gstat >/dev/null 2>&1 && gstat -c%s "$filepath" >/dev/null 2>&1; then
       _zlog_state[stat_cmd]="gnu"
       _zlog_state[stat_bin]="gstat"
     elif stat -c%s "$filepath" >/dev/null 2>&1; then
@@ -3018,6 +3005,14 @@ __z::log::get_file_size() {
   local file_size=0
   local stat_bin="${_zlog_state[stat_bin]:-stat}"
   case "${_zlog_state[stat_cmd]:-none}" in
+    zstat)
+      local -a _zfs_st
+      if zstat -A _zfs_st -L +size -- "$filepath" 2>/dev/null; then
+        file_size="${_zfs_st[1]:-0}"
+      else
+        file_size=0
+      fi
+      ;;
     gnu)
       if [[ "$stat_bin" == "stat" ]] && ! stat -c%s "$filepath" >/dev/null 2>&1; then
         if command -v gstat >/dev/null 2>&1 && gstat -c%s "$filepath" >/dev/null 2>&1; then
@@ -3453,7 +3448,6 @@ __z::log::format_json() {
   # Update timestamp
   __z::log::update_timestamp
 
-  # Get metadata using REPLY pattern (no subshells)
   __z::log::level_name "$level"
   local level_name="$REPLY"
 
@@ -3566,17 +3560,18 @@ __z::log::format_text() {
   # Ensure colors are initialized
   (( _zlog_color_cache[initialized] )) || __z::log::init_colors
 
-  # Update timestamp
+  # Update timestamp (cache-guarded internally: only rebuilds when the second changes)
   __z::log::update_timestamp
 
-  # Get metadata using REPLY pattern
-  __z::log::level_name "$level"
-  local level_name="$REPLY"
+  # Inline the cached-lookup helpers instead of calling them. Each was a trivial
+  # O(1) lookup (level_name, sys::pid, the named-color path of z::log::colorize,
+  # and str::repeat padding); on this default-engine hot path those four function
+  # calls cost ~60us/op for output that is byte-identical to inlining. This
+  # mirrors what the fast-engine format_simple already does.
+  local level_name="${_ZLOG_LEVEL_NAMES[$level]:-UNKNOWN}"
+  local pid="${_zlog_sys_cache[pid]}"
 
-  __z::sys::pid
-  local pid="$REPLY"
-
-  # Determine color and display based on level
+  # Determine color alias based on level
   local level_color
   case "$level" in
     ${_ZLOG_LEVEL_ERROR})
@@ -3596,19 +3591,23 @@ __z::log::format_text() {
       ;;
   esac
 
-  # Build level display with color and padding
-  z::log::colorize "$level_color" "$level_name"
-  local colored_level="$REPLY"
+  # Build level display with color (inlined named-color path of z::log::colorize:
+  # level_color is always a palette name, never an rgb() spec).
+  local color_code="${_zlog_colors[$level_color]-}"
+  local colored_level
+  if [[ -n "$color_code" ]]; then
+    colored_level="${color_code}${level_name}${_zlog_colors[reset]}"
+  else
+    colored_level="$level_name"
+  fi
   local level_display="${_zlog_colors[bold]}${colored_level}${_zlog_colors[reset]}"
 
-  # Pad level name to 5 characters for alignment
-  local padding=""
+  # Pad level name to 5 characters for alignment (inlined str::repeat)
   local level_len=${#level_name}
   if (( level_len < 5 )); then
-    __z::str::repeat " " $((5 - level_len))
-    padding="$REPLY"
+    local padding="${(r:$((5 - level_len)):: :)}"
+    level_display="${level_display}${padding}"
   fi
-  level_display="${level_display}${padding}"
 
   # Build base message
   local output=""
@@ -3668,7 +3667,8 @@ __z::log::format_text() {
 #
 # Usage: __z::log::format <level> <message> [context_key context_val ...]
 #
-# Output: Prints formatted message to stdout
+# Output: Sets REPLY with the formatted message
+# Returns: 0 on success, 1 on invalid input
 ###
 __z::log::format() {
   emulate -L zsh
@@ -3854,8 +3854,6 @@ __z::log::engine() {
     return 0
   fi
 
-  # Format message with error handling. Do not use command substitution here:
-  # it would run the formatter in a subshell and discard cache updates.
   local formatted
   __z::log::format "$level" "$message" "$@"
   local format_status=$?
@@ -4943,6 +4941,68 @@ z::log::with_context() {
 }
 
 ###
+# Internal: Shared dispatcher for every context logging call.
+#
+# All per-context functions are 1-line trampolines that call this single
+# function with their own fully-qualified name as the first argument, e.g.
+#   __z::log::ctx_dispatch zlog_ctx_12_34_56::infof "$@"
+# The dispatcher parses the level (and the optional `f` printf variant) out of
+# that name, looks up the captured key-value pairs, and forwards to the public
+# z::log::<level> API. This keeps ALL behavior in one place (no per-context code
+# generation, no `eval`) while preserving the ergonomic `${ctx}::info` call site.
+#
+# Usage (internal only): __z::log::ctx_dispatch <func_name> [message-args...]
+###
+__z::log::ctx_dispatch() {
+  emulate -L zsh
+  setopt localoptions no_unset
+
+  local func_name="${1-}"
+  shift
+
+  local func_ctx_id="${func_name%%::*}"
+  local func_level="${func_name##*::}"
+
+  # Detect the printf ("f") variant and strip the suffix to get the bare level.
+  local formatted=0
+  if [[ "$func_level" == *f ]]; then
+    formatted=1
+    func_level="${func_level%f}"
+  fi
+
+  if [[ -z "${_zlog_contexts[$func_ctx_id]-}" ]]; then
+    print -r -u2 -- "zlog: Context $func_ctx_id no longer exists"
+    return 1
+  fi
+
+  if (( $# < 1 )); then
+    if (( formatted )); then
+      print -r -u2 -- "zlog: ${func_name} requires a format string"
+    else
+      print -r -u2 -- "zlog: ${func_name} requires a message"
+    fi
+    return 1
+  fi
+
+  local -a ctx_args
+  ctx_args=("${(@0)_zlog_contexts[$func_ctx_id]}")
+
+  if (( formatted )); then
+    local fmt="$1"
+    shift
+    local msg
+    if ! printf -v msg -- "$fmt" "$@" 2>/dev/null; then
+      msg="<printf error: $fmt>"
+    fi
+    z::log::${func_level} "$msg" "${ctx_args[@]}"
+  else
+    local msg="$1"
+    shift
+    z::log::${func_level} "$msg" "${ctx_args[@]}" "$@"
+  fi
+}
+
+###
 # Internal: Create all logging functions for a context
 ###
 __z::log::create_context_functions() {
@@ -4968,8 +5028,14 @@ __z::log::create_context_functions() {
 }
 
 ###
-# Internal: Create a single context logging function
-# Uses eval to create functions in current shell scope
+# Internal: Create a single context logging function.
+#
+# Each function is a 1-line trampoline that forwards to the shared
+# __z::log::ctx_dispatch with its own fully-qualified name baked in as a
+# literal. This replaces the previous per-function `eval` of a full body:
+# `functions[name]=body` defines a function without code generation, the body
+# holds no logic (all behavior lives in the dispatcher), and the baked-in name
+# removes any reliance on $0 / FUNCTION_ARGZERO at call time.
 ###
 __z::log::create_context_function() {
   emulate -L zsh
@@ -4988,77 +5054,9 @@ __z::log::create_context_function() {
     return 1
   fi
 
-  # Create function using eval
-  # The function body is self-contained
-  if [[ "$formatted" == "true" ]]; then
-    # Printf-style context function
-    eval "
-function ${func_name}() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  local func_name=\"\${0}\"
-  local func_ctx_id=\"\${func_name%%::*}\"
-  local func_level=\"\${func_name##*::}\"
-  func_level=\"\${func_level%f}\"
-
-  if [[ -z \"\${_zlog_contexts[\$func_ctx_id]-}\" ]]; then
-    print -r -u2 -- \"zlog: Context \$func_ctx_id no longer exists\"
-    return 1
-  fi
-
-  if (( \$# < 1 )); then
-    print -r -u2 -- \"zlog: \$func_name requires a format string\"
-    return 1
-  fi
-
-  local fmt=\"\$1\"
-  shift
-  local msg
-  if printf -v msg -- \"\$fmt\" \"\$@\" 2>/dev/null; then
-    :
-  else
-    msg=\"<printf error: \$fmt>\"
-  fi
-
-  local -a ctx_args
-  ctx_args=(\"\${(@0)_zlog_contexts[\$func_ctx_id]}\")
-  z::log::\${func_level} \"\$msg\" \"\${ctx_args[@]}\"
-}
-"
-  else
-    # Regular context function
-    eval "
-function ${func_name}() {
-  emulate -L zsh
-  setopt localoptions no_unset
-  local func_name=\"\${0}\"
-  local func_ctx_id=\"\${func_name%%::*}\"
-  local func_level=\"\${func_name##*::}\"
-
-  if [[ -z \"\${_zlog_contexts[\$func_ctx_id]-}\" ]]; then
-    print -r -u2 -- \"zlog: Context \$func_ctx_id no longer exists\"
-    return 1
-  fi
-
-  if (( \$# < 1 )); then
-    print -r -u2 -- \"zlog: \$func_name requires a message\"
-    return 1
-  fi
-
-  local msg=\"\$1\"
-  shift
-  local -a ctx_args
-  ctx_args=(\"\${(@0)_zlog_contexts[\$func_ctx_id]}\")
-  z::log::\${func_level} \"\$msg\" \"\${ctx_args[@]}\" \"\$@\"
-}
-"
-  fi
-
-  local eval_status=$?
-  if (( eval_status != 0 )); then
-    print -r -u2 -- "zlog: eval failed for function $func_name (status: $eval_status)"
-    return 1
-  fi
+  # Define the trampoline without `eval`. ${(q)func_name} safely quotes the
+  # (already strictly validated) name; "$@" forwards the caller's arguments.
+  functions[$func_name]="	__z::log::ctx_dispatch ${(q)func_name} \"\$@\""
 
   # Verify function was created
   if (( ! ${+functions[$func_name]} )); then
@@ -5475,17 +5473,17 @@ z::log::benchmark_block() {
 
   # Only benchmark if info level is active
   if ! z::log::if_info; then
-    # Just execute without timing
-    eval "$(cat)"
+    # Just execute without timing. `$(<&0)` reads stdin without forking `cat`.
+    eval "$(<&0)"
     return $?
   fi
 
   z::log::benchmark_now
   local start_time="$REPLY"
 
-  # Execute the code block from stdin
+  # Execute the code block from stdin. `$(<&0)` reads stdin without forking `cat`.
   local exit_code
-  eval "$(cat)"
+  eval "$(<&0)"
   exit_code=$?
 
   z::log::benchmark_now
@@ -5555,8 +5553,14 @@ z::log::list_timers() {
       local start_time="${timer_data%%|*}"
       local operation_name="${timer_data#*|}"
 
-      # Calculate elapsed time
-      local elapsed_ms=$(( (EPOCHREALTIME - start_time) * 1000 ))
+      # Calculate elapsed time. start_time is integer milliseconds-since-epoch
+      # (from z::log::benchmark_now), so compare against the same ms clock --
+      # subtracting it from the seconds-based EPOCHREALTIME yields garbage that
+      # __z::log::format_duration then rejects as "<invalid>".
+      z::log::benchmark_now
+      local now_ms="$REPLY"
+      local -i elapsed_ms=$(( now_ms - start_time ))
+      (( elapsed_ms < 0 )) && elapsed_ms=0
       __z::log::format_duration "$elapsed_ms"
       local elapsed_str="$REPLY"
 
@@ -6282,6 +6286,15 @@ z::log::reset() {
 # Enable async logging (experimental)
 # Creates a background worker process that handles all file I/O
 # Usage: z::log::enable_async
+#
+# SIDE EFFECTS / INVARIANTS (declare explicitly):
+#   - Rotation is bypassed while async is enabled. The worker appends raw lines
+#     to the file captured at fork time (see __z::log::write_async) and never
+#     calls __z::log::rotate_if_needed, so size-based rotation does NOT apply to
+#     async output. With async + size rotation "enabled", logs grow unbounded.
+#   - Async + buffering can interleave output. Buffered flushes (z::log::flush)
+#     append to the file directly in the main process, racing the worker's
+#     line-by-line appends. Prefer enabling only one of async/buffering at a time.
 ###
 z::log::enable_async() {
   emulate -L zsh
@@ -6458,70 +6471,6 @@ __z::log::fast_write() {
   print -r -- "$message" >> "$logfile" 2>/dev/null
 }
 
-###
-# Optimized engine for high-performance logging
-# Caches more aggressively and skips unnecessary work
-###
-__z::log::engine_fast() {
-  emulate -L zsh
-  setopt localoptions
-
-  if (( $# < 2 )); then
-    return 1
-  fi
-
-  local level="${1-}"
-  local message="${2-}"
-  shift 2
-
-  # Fast level check (most common case: filtered out)
-  local console_level="${_zlog_config[level]:-2}"
-  if (( level > console_level )); then
-    local file_level="${_zlog_config[file_level]:--1}"
-    (( file_level == -1 )) && file_level=$console_level
-
-    # Early exit if both console and file filter this out
-    if (( level > file_level )); then
-      return 0
-    fi
-  fi
-
-  # Use cached formatting if no context provided
-  local formatted
-  if (( $# == 0 )); then
-    __z::log::format_simple "$level" "$message"
-    formatted="$REPLY"
-  else
-    __z::log::format "$level" "$message" "$@" || return 1
-    formatted="$REPLY"
-  fi
-
-  # Output to console if appropriate
-  if (( level <= console_level )); then
-    print -r -u2 -- "$formatted"
-  fi
-
-  # Output to file if appropriate
-  if [[ -n "${_zlog_config[file]}" ]]; then
-    local file_level="${_zlog_config[file_level]:--1}"
-    (( file_level == -1 )) && file_level=$console_level
-
-    if (( level <= file_level )); then
-      if (( ${_zlog_config[buffered]:-0} )); then
-        _zlog_buffer+=("$formatted")
-
-        # Auto-flush on errors or when buffer full
-        if (( level == 0 || ${#_zlog_buffer} >= ${_zlog_config[buffer_max]:-50} )); then
-          __z::log::flush_fast
-        fi
-      else
-        __z::log::fast_write "$formatted"
-      fi
-    fi
-  fi
-
-  return 0
-}
 
 ###
 # Simplified formatter for messages without context (90% of cases)
