@@ -1,38 +1,44 @@
 #!/usr/bin/env zsh
+#
+# =============================================================================
+# ZCORE v0.5.0 — Framework Integration Layer
+# =============================================================================
+# Description: Wires the framework pillars (logging, validation, KV, event bus)
+#              into a single unified runtime exposing cache, config, system,
+#              event, and debug namespaces.
+#
+# Usage:       Sourced as part of the z-framework after its prerequisites.
+#              Prerequisites (source in this order):
+#                  zlog  — logging
+#                  zbase — validation, probes, file/exec helpers, error codes
+#                  ui    — progress bars, terminal utilities (sys/trap paths)
+#                  zkv   — KV store (configuration backend)
+#                  zbus  — event bus (optional; z::event::* wrappers if present)
+#
+#              Provides:
+#                  z::cache::*   — in-memory TTL cache
+#                  z::config::*  — KV-backed configuration
+#                  z::sys::*     — platform detection, traps, fatal exits
+#                  z::event::*   — thin wrappers over zbus when loaded
+#                  z::debug::*   — profiling, assertions, diagnostics
+#
+# Version:     v0.5.0
+# License:     MIT
+# =============================================================================
 
-################################################################################
-# ZCORE v0.4.2
-################################################################################
-#
-#  Integration layer — wires framework pillars into a unified runtime.
-#
-#  Prerequisites (source in this order):
-#      zlog  — logging
-#      zbase — validation, probes, file/exec helpers, error codes
-#      ui    — progress bars, terminal utilities (used by sys/trap paths)
-#      zkv   — KV store (configuration backend)
-#      zbus  — event bus (optional; z::event::* wrappers when present)
-#
-#  This module provides:
-#      z::cache::*   — in-memory TTL cache
-#      z::config::*  — KV-backed configuration
-#      z::sys::*     — platform detection, traps, fatal exits
-#      z::event::*   — thin wrappers over zbus when loaded
-#      z::debug::*   — profiling, assertions, diagnostics
-#
-# Version: v0.3.0
-# License: MIT
-################################################################################
-# Double-sourcing Guard
-# Prevents this module from being initialized multiple times in the same session.
-# Returns 0 when already loaded (whether sourced or executed).
+# ---------------------------------------------------------------------------
+# DOUBLE-SOURCING GUARD
+# ---------------------------------------------------------------------------
+# Prevent re-initialization within the same session. Returns 0 when already
+# loaded whether the module was sourced or executed.
 if [[ ${_zcore_loaded:-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
 typeset -g _zcore_loaded=1
-typeset -gr ZCORE_VERSION="0.3.0"
+typeset -gr ZCORE_VERSION="0.5.0"
 
 # ---------------------------------------------------------------------------
-# Runtime dependency checks
+# RUNTIME DEPENDENCY CHECKS
 # ---------------------------------------------------------------------------
+# `return` works in a sourced context; fall back to `exit` when executed.
 if (( ! ${+functions[z::log::info]} )); then
   print -u2 "z: fatal: zlog must be sourced before z"; return 1 2>/dev/null || exit 1
 fi
@@ -46,28 +52,28 @@ if (( ! ${+ZBASE_ERROR_GENERAL} )); then
   print -u2 "z: fatal: zbase error codes missing — zbase too old"; return 1 2>/dev/null || exit 1
 fi
 
-# Ensure EPOCHSECONDS is available when possible (no-op if unavailable)
+# Ensure EPOCHSECONDS is available when possible (no-op if unavailable).
 zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
 
-# z-specific return codes (ZCORE_ERROR_{GENERAL,INVALID_INPUT,NOT_FOUND,PERMISSION}
-# are aliases of ZBASE_ERROR_* defined in zbase — do not redefine here)
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+# z-specific return codes. ZCORE_ERROR_{GENERAL,INVALID_INPUT,NOT_FOUND,
+# PERMISSION} are aliases of ZBASE_ERROR_* defined in zbase — do not redefine
+# them here.
 typeset -gri ZCORE_SUCCESS=0
 typeset -gri ZCORE_ERROR_TIMEOUT=124
 typeset -gri ZCORE_ERROR_INTERRUPTED=130
 
-
-###
-# Current logging verbosity level
-# 0 = error only, 1 = warn, 2 = info (default), 3 = debug
-###
+# Per-subsystem availability flags (1 = active). Populated during INIT.
 typeset -gA _zcore_subsys
-_zcore_subsys[kv]=0;_zcore_subsys[bus]=0;_zcore_subsys[cache]=0;
+_zcore_subsys[kv]=0; _zcore_subsys[bus]=0; _zcore_subsys[cache]=0;
 
 
-
-################################################################################
+# ---------------------------------------------------------------------------
 # DEBUGGING
-################################################################################
+# ---------------------------------------------------------------------------
+
 ###
 # Stack trace for debugging
 # Prints the current function call stack
@@ -77,22 +83,24 @@ _zcore_subsys[kv]=0;_zcore_subsys[bus]=0;_zcore_subsys[cache]=0;
 #
 # @return 0 always
 ###
-
 z::debug::trace() {
   emulate -L zsh
   local -i i
   print "Stack trace:" >&2
+  # funcstack[1] is this function; start at 1 to include the immediate caller.
   for (( i = 1; i < ${#funcstack[@]}; i++ )); do
     print "  $i: ${funcstack[i]} (${funcfiletrace[i]})" >&2
   done
   return 0
 }
 
+
 z::debug::dump() {
   emulate -L zsh
   z::config::show
   return 0
 }
+
 
 ###
 # Performance profiling start
@@ -112,6 +120,7 @@ z::debug::profile_start() {
   z::log::debug "[Profiler]" "Profiling instance initiated for operation:" "$operation"
   return 0
 }
+
 
 z::debug::profile_end() {
   emulate -L zsh
@@ -133,6 +142,7 @@ z::debug::profile_end() {
   z::log::debug "[Profiler]" "Profiling for operation:" "$operation" \
     "finished in:" "$(printf '%.3f' "$duration")s"
 
+  # Emit a profiling event only when the bus subsystem is active.
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "debug:profile" "$operation" "$duration" || true
   fi
@@ -140,12 +150,14 @@ z::debug::profile_end() {
   return 0
 }
 
+
 z::debug::assert() {
   emulate -L zsh
   typeset -i condition
   (( condition = ${1:-1} ))
   local message="${2:-Assertion failed}"
 
+  # Non-zero condition is treated as a failed assertion (shell-truth inverted).
   if (( condition != 0 )); then
     z::debug::trace
     z::sys::die "$message" $ZCORE_ERROR_GENERAL
@@ -154,20 +166,19 @@ z::debug::assert() {
 }
 
 
+# ---------------------------------------------------------------------------
+# CACHE — depends ONLY on logging
+# ---------------------------------------------------------------------------
 
-
-################################################################################
-# CACHE - Depends ONLY on Logging
-################################################################################
-
-typeset -gA _zcore_cache_store
-typeset -gA _zcore_cache_ttl
-typeset -gA _zcore_cache_stats
+typeset -gA _zcore_cache_store   # key -> value
+typeset -gA _zcore_cache_ttl     # key -> absolute expiry epoch
+typeset -gA _zcore_cache_stats   # "<namespace>.<metric>" -> count
 
 __z::cache::check_ttl() {
   emulate -L zsh
   local key="$1"
 
+  # No TTL recorded means the entry never expires.
   if (( ! ${+_zcore_cache_ttl[$key]} )); then
     return 0
   fi
@@ -181,6 +192,7 @@ __z::cache::check_ttl() {
     unset "_zcore_cache_store[$key]"
     unset "_zcore_cache_ttl[$key]"
 
+    # Namespace is the segment before the first ':' in the key.
     local namespace="${key%%:*}"
     typeset -i expired
     (( expired = ${_zcore_cache_stats[${namespace}.expired]:-0} + 1 ))
@@ -207,6 +219,7 @@ z::cache::set() {
   while (( $# > 0 )); do
     case "$1" in
       --ttl)
+        # `<->` matches an integer; 10# forces base-10 interpretation.
         if [[ ${2:-} == <-> ]]; then
           (( ttl = 10#${2} ))
           shift 2
@@ -224,6 +237,7 @@ z::cache::set() {
   _zcore_cache_store[$key]="$value"
 
   if (( ttl > 0 )); then
+    # Store an absolute expiry timestamp rather than the relative TTL.
     typeset -i expire_time
     (( expire_time = ${EPOCHSECONDS:-$(date +%s)} + ttl ))
     _zcore_cache_ttl[$key]=$expire_time
@@ -238,7 +252,7 @@ z::cache::set() {
 
   z::log::debug "Cache set: $key (ttl: ${ttl}s)"
 
-  if (( _zcore_subsys[bus]==1 )); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:set" "$key" "$value" || true
   fi
   return 0
@@ -253,12 +267,13 @@ z::cache::get() {
     return $ZCORE_ERROR_INVALID_INPUT
   fi
 
+  # A failed TTL check means the entry expired and was just evicted.
   if ! __z::cache::check_ttl "$key"; then
     local namespace="${key%%:*}"
     typeset -i misses
     (( misses = ${_zcore_cache_stats[${namespace}.misses]:-0} + 1 ))
     _zcore_cache_stats[${namespace}.misses]=$misses
-    if ((_zcore_subsys[bus]==1)); then
+    if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "cache:miss" "$key" "expired" || true
     fi
     return $ZCORE_ERROR_NOT_FOUND
@@ -270,7 +285,7 @@ z::cache::get() {
     (( misses = ${_zcore_cache_stats[${namespace}.misses]:-0} + 1 ))
     _zcore_cache_stats[${namespace}.misses]=$misses
 
-    if (( _zcore_subsys[bus]==1 )); then
+    if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "cache:miss" "$key" "not_found" || true
     fi
     return $ZCORE_ERROR_NOT_FOUND
@@ -280,7 +295,7 @@ z::cache::get() {
   typeset -i hits
   (( hits = ${_zcore_cache_stats[${namespace}.hits]:-0} + 1 ))
   _zcore_cache_stats[${namespace}.hits]=$hits
-  if (( _zcore_subsys[bus]==1 )); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:hit" "$key" || true
   fi
   print -r -- "${_zcore_cache_store[$key]}"
@@ -299,7 +314,7 @@ z::cache::del() {
   unset "_zcore_cache_ttl[$key]"
 
   z::log::debug "Cache deleted: $key"
-  if (( _zcore_subsys[bus]==1 )); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:delete" "$key" || true
   fi
   return 0
@@ -320,6 +335,7 @@ z::cache::clear() {
   local key
 
   for key in "${(@k)_zcore_cache_store}"; do
+    # `${~pattern}` enables glob expansion of the user-supplied pattern.
     if [[ $key == ${~pattern} ]]; then
       z::cache::del "$key"
       (( cleared += 1 ))
@@ -327,7 +343,7 @@ z::cache::clear() {
   done
 
   z::log::debug "Cache cleared: $cleared entries"
-  if ((_zcore_subsys[bus]==1)); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:cleared" "$pattern" "$cleared" || true
   fi
   return 0
@@ -351,10 +367,12 @@ z::cache::stats() {
     (( total = ${_zcore_cache_stats[${namespace}.hits]:-0} + ${_zcore_cache_stats[${namespace}.misses]:-0} ))
     if (( total > 0 )); then
       typeset -F hit_rate
+      # 100.0 forces float arithmetic for a fractional hit rate.
       (( hit_rate = (${_zcore_cache_stats[${namespace}.hits]:-0} * 100.0) / total ))
       print "  Hit Rate: ${hit_rate}%"
     fi
   else
+    # Derive the unique namespace set from the "<ns>.<metric>" stat keys.
     typeset -A namespaces
     local key ns
     for key in "${(@k)_zcore_cache_stats}"; do
@@ -389,6 +407,7 @@ z::cache::memoize() {
     return $ZCORE_ERROR_INVALID_INPUT
   fi
 
+  # Serve the memoised value on a cache hit, skipping the function call.
   local cached
   if cached=$(z::cache::get "$cache_key"); then
     print -r -- "$cached"
@@ -400,6 +419,7 @@ z::cache::memoize() {
     return $ZCORE_ERROR_NOT_FOUND
   fi
 
+  # Propagate the function's own exit status on failure (no caching).
   local result
   result=$("$func" "$@") || return $?
 
@@ -414,11 +434,9 @@ z::cache::memoize() {
 }
 
 
-
-
-################################################################################
+# ---------------------------------------------------------------------------
 # LAYER 2: SYSTEM CORE
-################################################################################
+# ---------------------------------------------------------------------------
 
 typeset -gi _zcore_interrupted=0
 typeset -gi IS_MACOS=0 IS_LINUX=0 IS_BSD=0 IS_CYGWIN=0 IS_WSL=0 IS_TERMUX=0 IS_UNKNOWN=1
@@ -432,6 +450,7 @@ __z::sys::handle_interrupt() {
     return $?
   fi
 
+  # A second interrupt forces an immediate exit.
   if (( _zcore_interrupted )); then
     exit 130
   fi
@@ -441,7 +460,7 @@ __z::sys::handle_interrupt() {
     z::progress::clear
     z::log::warn "Interrupt received. Gracefully shutting down..."
 
-    if ((_zcore_subsys[bus]==1)); then
+    if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "sys:interrupted"
     fi
   fi
@@ -458,8 +477,7 @@ z::sys::interrupted() {
   return 0
 }
 
-z::sys::die()
-{
+z::sys::die() {
   emulate -L zsh
   # setopt no_unset
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -470,8 +488,7 @@ z::sys::die()
   z::progress::clear
   z::log::error "FATAL (exit $exit_code): $message"
 
-
-  # Return in sourced context, exit otherwise
+  # Return in a sourced context, exit otherwise.
   if [[ -n $ZSH_EVAL_CONTEXT && $ZSH_EVAL_CONTEXT == *:file:* ]]; then
     return $exit_code
   else
@@ -483,20 +500,21 @@ z::sys::platform() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  # Restore from cache when available
+  # Restore from cache when available.
   local cached_platform
   if cached_platform=$(z::cache::get "sys:platform" 2>/dev/null); then
-    (( IS_MACOS  = $(z::cache::get "sys:is_macos"  2>/dev/null) ))
-    (( IS_LINUX  = $(z::cache::get "sys:is_linux"  2>/dev/null) ))
-    (( IS_BSD    = $(z::cache::get "sys:is_bsd"    2>/dev/null) ))
-    (( IS_CYGWIN = $(z::cache::get "sys:is_cygwin" 2>/dev/null) ))
-    (( IS_WSL    = $(z::cache::get "sys:is_wsl"    2>/dev/null) ))
-    (( IS_TERMUX = $(z::cache::get "sys:is_termux" 2>/dev/null) ))
-    (( IS_UNKNOWN= $(z::cache::get "sys:is_unknown" 2>/dev/null) ))
+    (( IS_MACOS   = $(z::cache::get "sys:is_macos"   2>/dev/null) ))
+    (( IS_LINUX   = $(z::cache::get "sys:is_linux"   2>/dev/null) ))
+    (( IS_BSD     = $(z::cache::get "sys:is_bsd"     2>/dev/null) ))
+    (( IS_CYGWIN  = $(z::cache::get "sys:is_cygwin"  2>/dev/null) ))
+    (( IS_WSL     = $(z::cache::get "sys:is_wsl"     2>/dev/null) ))
+    (( IS_TERMUX  = $(z::cache::get "sys:is_termux"  2>/dev/null) ))
+    (( IS_UNKNOWN = $(z::cache::get "sys:is_unknown" 2>/dev/null) ))
     z::log::debug "Platform (cached): $cached_platform"
     return 0
   fi
 
+  # Fall back to `uname -s` when $OSTYPE is unset.
   local ostype_value="${OSTYPE:-}"
   if [[ -z $ostype_value ]]; then
     case "$(uname -s 2>/dev/null)" in
@@ -531,6 +549,7 @@ z::sys::platform() {
       ;;
   esac
 
+  # WSL detection: env hints, the binfmt interop file, or /proc/version markers.
   local -i is_wsl=0 is_termux=0
   if (( IS_LINUX )); then
     if [[ -n ${WSL_DISTRO_NAME:-} || -n ${WSLENV:-} || -f /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
@@ -546,6 +565,7 @@ z::sys::platform() {
   fi
   (( IS_WSL = is_wsl ))
 
+  # Termux ships its prefix under this fixed Android data path.
   if (( IS_LINUX )) && [[ -d /data/data/com.termux/files/usr ]]; then
     (( is_termux = 1 ))
   fi
@@ -557,7 +577,7 @@ z::sys::platform() {
     (( IS_UNKNOWN = 1 ))
   fi
 
-  # Cache platform (no expiration)
+  # Cache platform results (no expiration).
   z::cache::set "sys:platform" "$platform_name"
   z::cache::set "sys:is_macos" "$IS_MACOS"
   z::cache::set "sys:is_linux" "$IS_LINUX"
@@ -569,26 +589,29 @@ z::sys::platform() {
 
   z::log::debug "Platform: $platform_name"
 
-  if ((_zcore_subsys[bus]==1)); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "sys:platform_detected" "$platform_name" 2>/dev/null || true
   fi
 
   return 0
 }
 
+# Each predicate inverts the flag so a set flag (1) yields exit status 0.
 z::sys::is_macos() { z::sys::platform; return $(( ! IS_MACOS )); }
 z::sys::is_linux() { z::sys::platform; return $(( ! IS_LINUX )); }
-z::sys::is_bsd() { z::sys::platform; return $(( ! IS_BSD )); }
-z::sys::is_wsl() { z::sys::platform; return $(( ! IS_WSL )); }
+z::sys::is_bsd()   { z::sys::platform; return $(( ! IS_BSD )); }
+z::sys::is_wsl()   { z::sys::platform; return $(( ! IS_WSL )); }
 
-################################################################################
-# LAYER 3: CONFIGURATION (Built on KV)
-################################################################################
+
+# ---------------------------------------------------------------------------
+# LAYER 3: CONFIGURATION (built on KV)
+# ---------------------------------------------------------------------------
 
 __z::config::set_default() {
   emulate -L zsh
   local key="$1" value="$2" kind="${3:-string}"
 
+  # Never overwrite an existing value; defaults are seed-only.
   if z::kv::exists config "$key" 2>/dev/null; then
     return 0
   fi
@@ -605,15 +628,16 @@ __z::config::init_defaults() {
 
   z::kv::open config || return $?
 
-  __z::config::set_default "log_level"               "$_ZLOG_LEVEL_INFO" int
-  __z::config::set_default "cache_max_size"          "100"   int
-  __z::config::set_default "timeout_default"         "30"    int
-  __z::config::set_default "performance_mode"        "false" bool
-  __z::config::set_default "show_progress"             "true"  bool
-  __z::config::set_default "symlink_max_iterations"  "40"    int
-  __z::config::set_default "progress_update_interval" "10"   int
-  __z::config::set_default "progress_style"          "classic"
+  __z::config::set_default "log_level"                "$_ZLOG_LEVEL_INFO" int
+  __z::config::set_default "cache_max_size"           "100"     int
+  __z::config::set_default "timeout_default"          "30"      int
+  __z::config::set_default "performance_mode"         "false"   bool
+  __z::config::set_default "show_progress"            "true"    bool
+  __z::config::set_default "symlink_max_iterations"   "40"      int
+  __z::config::set_default "progress_update_interval" "10"      int
+  __z::config::set_default "progress_style"           "classic"
 
+  # Environment overrides take precedence over the seeded defaults.
   if [[ -n ${ZCORE_PERFORMANCE_MODE:-} ]]; then
     z::kv::set_bool config "performance_mode" "$ZCORE_PERFORMANCE_MODE"
   fi
@@ -655,6 +679,7 @@ z::config::set() {
 
   local rc=0
 
+  # Key-suffix conventions select the typed setter and validation rule.
   case $key in
     *_mode|show_*|enable_*)
       if [[ $value != true && $value != false ]]; then
@@ -681,7 +706,7 @@ z::config::set() {
 
   z::log::debug "Config updated: $key = $value"
 
-  if ((_zcore_subsys[bus]==1)); then
+  if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "config:changed" "$key" "$value" || true
   fi
 
@@ -774,9 +799,11 @@ z::config::load() {
 
   local line key value
   while IFS= read -r line; do
+    # Skip comment-only and blank lines.
     [[ $line =~ ^[[:space:]]*# ]] && continue
     [[ $line =~ ^[[:space:]]*$ ]] && continue
 
+    # Split on the first '='; $match holds the regex capture groups.
     if [[ $line =~ ^([^=]+)=(.*)$ ]]; then
       key="${match[1]}"
       value="${match[2]}"
@@ -788,16 +815,19 @@ z::config::load() {
   return 0
 }
 
-################################################################################
+
+# ---------------------------------------------------------------------------
 # HELP SYSTEM
-################################################################################
+# ---------------------------------------------------------------------------
 
 z::help::list() {
   emulate -L zsh
   local namespace="${1:-z::}"
 
   local func
+  # `(Mok)` + `:#pattern` keeps only sorted function names matching the prefix.
   for func in ${(Mok)functions:#${namespace}*}; do
+    # Hide internal helpers (segment beginning with an underscore).
     [[ $func == *::_* ]] && continue
     print -r -- "$func"
   done
@@ -814,32 +844,33 @@ EOF
   return 0
 }
 
-################################################################################
+
+# ---------------------------------------------------------------------------
 # EVENT BUS INTEGRATION (zbus)
-#
+# ---------------------------------------------------------------------------
 # Thin z::event::* wrappers over z::bus::* when zbus is loaded by init.
 # Keeps subsystem code decoupled from the bus module namespace.
-################################################################################
 
 if (( ${+functions[z::bus::emit]} )); then
   _zcore_subsys[bus]=1
 
-  z::event::emit()       { z::bus::emit "$@"; }
-  z::event::emit_safe()  { z::bus::emit_safe "$@"; }
-  z::event::emit_async() { z::bus::emit_async "$@"; }
-  z::event::on()         { z::bus::on "$@"; }
-  z::event::once()       { z::bus::once "$@"; }
-  z::event::off()        { z::bus::off "$@"; }
-  z::event::off_id()     { z::bus::off_id "$@"; }
-  z::event::has()        { z::bus::has "$@"; }
-  z::event::subscribe()  { z::bus::subscribe "$@"; }
-  z::event::unsubscribe(){ z::bus::unsubscribe "$@"; }
-  z::event::publish()    { z::bus::publish "$@"; }
+  z::event::emit()        { z::bus::emit "$@"; }
+  z::event::emit_safe()   { z::bus::emit_safe "$@"; }
+  z::event::emit_async()  { z::bus::emit_async "$@"; }
+  z::event::on()          { z::bus::on "$@"; }
+  z::event::once()        { z::bus::once "$@"; }
+  z::event::off()         { z::bus::off "$@"; }
+  z::event::off_id()      { z::bus::off_id "$@"; }
+  z::event::has()         { z::bus::has "$@"; }
+  z::event::subscribe()   { z::bus::subscribe "$@"; }
+  z::event::unsubscribe() { z::bus::unsubscribe "$@"; }
+  z::event::publish()     { z::bus::publish "$@"; }
 fi
 
-################################################################################
+
+# ---------------------------------------------------------------------------
 # INITIALIZATION
-################################################################################
+# ---------------------------------------------------------------------------
 
 # KV-backed config store (zkv must be sourced before `z` in load_libs).
 if (( ${+functions[z::kv::open]} )); then
@@ -853,6 +884,7 @@ if (( _zcore_subsys[bus] == 1 )); then
   z::event::emit "zcore:initialized" "$ZCORE_VERSION" 2>/dev/null || true
 fi
 
+# Install the interrupt trap when interactive or explicitly requested.
 if [[ -o interactive ]] || [[ ${ZCORE_INSTALL_TRAPS:-} == true ]]; then
   trap '__z::sys::handle_interrupt' INT TERM
 fi
