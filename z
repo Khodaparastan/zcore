@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 #
 # =============================================================================
-# ZCORE v0.5.0 — Framework Integration Layer
+# ZCORE v0.6.0 — Framework Integration Layer
 # =============================================================================
 # Description: Wires the framework pillars (logging, validation, KV, event bus)
 #              into a single unified runtime exposing cache, config, system,
@@ -22,7 +22,7 @@
 #                  z::event::*   — thin wrappers over zbus when loaded
 #                  z::debug::*   — profiling, assertions, diagnostics
 #
-# Version:     v0.5.0
+# Version:     v0.6.0
 # License:     MIT
 # =============================================================================
 
