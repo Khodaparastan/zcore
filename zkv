@@ -20,7 +20,7 @@
 #
 # Requires:
 #   zlog   — must be sourced before zkv (provides z::log::*)
-#   zbase  — must be sourced before zkv (provides z::validate::*, z::probe::*)
+#   zbase  — must be sourced before zkv (provides z::ensure::*, z::is::*)
 #
 # Constants exported:
 #   ZKV_VERSION                 — module version integer
@@ -39,13 +39,13 @@ if (( ! ${+functions[z::log::info]} )); then
 fi
 
 # Verify zbase core validation helpers are present.
-if (( ! ${+functions[z::validate::nonempty]} )); then
+if (( ! ${+functions[z::ensure::nonempty]} )); then
   print -u2 "zkv: fatal: zbase must be sourced before zkv"
   return 1
 fi
 
-# Verify zbase probe helpers — added in a later zbase revision.
-if (( ! ${+functions[z::probe::func]} )); then
+# Verify zbase predicate helpers — zbase v3+.
+if (( ! ${+functions[z::is::func]} )); then
   print -u2 "zkv: fatal: zbase command/function probes missing — zbase too old"
   return 1
 fi
@@ -57,7 +57,7 @@ if (( ! ${+Z_SEP} )); then
 fi
 
 # Verify error-code constants exported by zbase.
-if (( ! ${+ZBASE_ERROR_GENERAL} )); then
+if (( ! ${+Z_ERR_GENERAL} )); then
   print -u2 "zkv: fatal: zbase error codes missing — zbase too old"
   return 1
 fi
@@ -209,14 +209,14 @@ _z::kv::epoch() {
 
   z::log::get_timestamp epoch || {
     REPLY=""
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   }
 
   # Sanity-check: the fallback must return a bare integer.
   if [[ ! $REPLY == <-> ]]; then
     z::log::error "zkv: epoch timestamp unavailable" value "$REPLY"
     REPLY=""
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   fi
 
   return 0
@@ -242,7 +242,7 @@ _z::kv::require_handle() {
 
   if [[ -z $h ]] || (( ! ${+_zkv_handles[$h]} )); then
     z::log::error "zkv: unknown store handle" handle "${h:-<empty>}"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   return 0
@@ -256,7 +256,7 @@ _z::kv::validate_key() {
 
   if [[ -z $_vk_key ]]; then
     z::log::error "zkv: empty key" handle "$_vk_handle"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   local _vk_cfg="_zkv_cfg_${_vk_handle}"
@@ -266,13 +266,13 @@ _z::kv::validate_key() {
   if (( ${#_vk_key} > _vk_max )); then
     z::log::error "zkv: key too long" \
       handle "$_vk_handle" length "${#_vk_key}" max "$_vk_max"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   if [[ ! $_vk_key =~ '^[a-zA-Z0-9._:/-]+$' ]]; then
     z::log::error "zkv: invalid key format (allowed: a-z A-Z 0-9 . _ : / -)" \
       handle "$_vk_handle" key "$_vk_key"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   return 0
@@ -295,7 +295,7 @@ _z::kv::require_string_key() {
   if [[ $_struct != "$_ZKV_STRUCT_STRING" ]]; then
     z::log::error "zkv: operation only supports string keys" \
       handle "$_handle" key "$_key" structure "$_struct"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   return 0
@@ -441,7 +441,7 @@ _z::kv::reserve_type() {
       z::log::error "zkv: type collision" \
         handle "$_rt_handle" key "$_rt_key" \
         existing "$_rt_old_struct" requested "$_rt_new_struct"
-      return $ZBASE_ERROR_PERMISSION
+      return $Z_ERR_PERM
     fi
 
     _zkv_aset "$_rt_tx_meta" "$_rt_key" "$_rt_new"
@@ -460,7 +460,7 @@ _z::kv::reserve_type() {
       z::log::error "zkv: type collision" \
         handle "$_rt_handle" key "$_rt_key" \
         existing "$_rt_old_struct" requested "$_rt_new_struct"
-      return $ZBASE_ERROR_PERMISSION
+      return $Z_ERR_PERM
     fi
   fi
 
@@ -615,7 +615,7 @@ _z::kv::trigger_watchers() {
       _tw_handlers=( "${(@ps:$_ZKV_SEP:)_tw_hlist}" )
 
       for _tw_handler in "${_tw_handlers[@]}"; do
-        if z::probe::func "$_tw_handler" 2>/dev/null; then
+        if z::is::func "$_tw_handler" 2>/dev/null; then
           _tw_rc=0
           "$_tw_handler" "$_tw_handle" "$_tw_key" "$_tw_value" "$_tw_op" 2>/dev/null || _tw_rc=$?
 
@@ -750,7 +750,7 @@ _z::kv::tx_resolve_write() {
 # Returns (via REPLY) the map name that a read operation should consult.
 # Outside a transaction: the live map.
 # Inside a transaction: the tx-buffer if the key was written there, otherwise
-# the live map.  Returns ZBASE_ERROR_NOT_FOUND if the key was deleted in-tx.
+# the live map.  Returns Z_ERR_NOTFOUND if the key was deleted in-tx.
 _z::kv::tx_resolve_read() {
   local _h="$1" _t="$2" _k="$3"
   local _live="_zkv_${_t}_${_h}"
@@ -765,7 +765,7 @@ _z::kv::tx_resolve_read() {
 
   # Key was deleted in this transaction — treat as absent.
   if _zkv_ahas "$_del" "$_k"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   if _zkv_ahas "$_buf" "$_k"; then
@@ -800,8 +800,8 @@ z::kv::open() {
   local name="${1:-}"
   shift 2>/dev/null || true
 
-  z::validate::nonempty   "$name" "store name" || return $ZBASE_ERROR_INVALID_INPUT
-  z::validate::identifier "$name" "store name" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty   "$name" "store name" || return $Z_ERR_INPUT
+  z::ensure::identifier "$name" "store name" || return $Z_ERR_INPUT
 
   REPLY="$name"
 
@@ -852,31 +852,31 @@ z::kv::open() {
   while (( $# > 0 )); do
     case "$1" in
       --max-key-length)
-        z::validate::integer::range "${2:-}" 1 1048576 "--max-key-length" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 1 1048576 "--max-key-length" || return $Z_ERR_INPUT
         _zkv_aset "$_cfg_n" max_key_length "$2"
         shift 2
         ;;
 
       --max-value-length)
-        z::validate::integer::range "${2:-}" 1 1073741824 "--max-value-length" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 1 1073741824 "--max-value-length" || return $Z_ERR_INPUT
         _zkv_aset "$_cfg_n" max_value_length "$2"
         shift 2
         ;;
 
       --max-snapshots)
-        z::validate::integer::range "${2:-}" 1 1000 "--max-snapshots" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 1 1000 "--max-snapshots" || return $Z_ERR_INPUT
         _zkv_aset "$_cfg_n" max_snapshots "$2"
         shift 2
         ;;
 
       --enable-ttl)
-        z::validate::enum "0|1" "${2:-}" "--enable-ttl" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::enum "0|1" "${2:-}" "--enable-ttl" || return $Z_ERR_INPUT
         _zkv_aset "$_cfg_n" enable_ttl "$2"
         shift 2
         ;;
 
       --persist-debounce)
-        z::validate::integer::range "${2:-}" 0 86400 "--persist-debounce" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 0 86400 "--persist-debounce" || return $Z_ERR_INPUT
         _zkv_aset "$_cfg_n" persist_debounce "$2"
         shift 2
         ;;
@@ -899,7 +899,7 @@ z::kv::open() {
 
   # Deferred: enable_persist validates the path and sets auto_persist=1.
   if [[ -n $auto_persist_file ]]; then
-    z::kv::enable_persist "$name" "$auto_persist_file" || return $ZBASE_ERROR_GENERAL
+    z::kv::enable_persist "$name" "$auto_persist_file" || return $Z_ERR_GENERAL
   fi
 
   return 0
@@ -996,7 +996,7 @@ z::kv::set() {
   if (( ${#value} > _mvl )); then
     z::log::error "zkv: value too long" \
       handle "$handle" key "$key" length "${#value}" max "$_mvl"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   typeset -i ttl=0
@@ -1005,7 +1005,7 @@ z::kv::set() {
   while (( $# > 0 )); do
     case "$1" in
       --ttl)
-        z::validate::integer "${2:-}" "--ttl" || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int "${2:-}" "--ttl" || return $Z_ERR_INPUT
         ttl="${2}"
         shift 2
         ;;
@@ -1030,7 +1030,7 @@ z::kv::set() {
   if [[ $_vstruct != $_ZKV_STRUCT_STRING ]]; then
     z::log::error "zkv: z::kv::set only accepts string-category types" \
       handle "$handle" type "$value_type"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   _z::kv::reserve_type "$handle" "$key" "$value_type" || return $?
@@ -1067,7 +1067,7 @@ z::kv::set() {
 
 # z::kv::get <handle> <key>
 # Retrieves a scalar value.  Sets REPLY to the value and REPLY2 to the type.
-# Returns ZBASE_ERROR_NOT_FOUND if the key is absent or expired.
+# Returns Z_ERR_NOTFOUND if the key is absent or expired.
 z::kv::get() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1084,14 +1084,14 @@ z::kv::get() {
     # Key deleted in this transaction.
     if _zkv_ahas "_zkv_txbuf_del_${handle}" "$key"; then
       (( _zkv_stats_${handle}[misses] += 1 ))
-      return $ZBASE_ERROR_NOT_FOUND
+      return $Z_ERR_NOTFOUND
     fi
 
     # Key written in this transaction — check TTL against the buffer.
     if _zkv_ahas "_zkv_txbuf_store_${handle}" "$key"; then
       if ! _z::kv::check_ttl "$handle" "$key"; then
         (( _zkv_stats_${handle}[misses] += 1 ))
-        return $ZBASE_ERROR_NOT_FOUND
+        return $Z_ERR_NOTFOUND
       fi
 
       _zkv_aget "_zkv_txbuf_store_${handle}" "$key"
@@ -1111,12 +1111,12 @@ z::kv::get() {
   # Live path: check TTL, then look up in the live store.
   if ! _z::kv::check_ttl "$handle" "$key"; then
     (( _zkv_stats_${handle}[misses] += 1 ))
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   if ! _zkv_ahas "_zkv_store_${handle}" "$key"; then
     (( _zkv_stats_${handle}[misses] += 1 ))
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_aget "_zkv_store_${handle}" "$key"
@@ -1158,7 +1158,7 @@ z::kv::del() {
 
   if ! _zkv_ahas "_zkv_meta_${handle}" "$key"; then
     z::log::debug "zkv: del key not found" handle "$handle" key "$key"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local old_value="" struct mtype
@@ -1247,7 +1247,7 @@ z::kv::set_int() {
 
   local handle="$1" key="$2" value="$3"
 
-  z::validate::integer "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int "$value" "value" || return $Z_ERR_INPUT
   z::kv::set "$handle" "$key" "$value" --type int
 }
 
@@ -1260,7 +1260,7 @@ z::kv::get_int() {
   REPLY=""
 
   z::kv::get "$1" "$2" || return $?
-  z::validate::integer "$REPLY" "stored value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int "$REPLY" "stored value" || return $Z_ERR_INPUT
 
   return 0
 }
@@ -1274,7 +1274,7 @@ z::kv::set_bool() {
 
   local handle="$1" key="$2" value="$3"
 
-  z::validate::boolean "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::bool "$value" "value" || return $Z_ERR_INPUT
 
   case "${value:l}" in
     true|1|yes|on) value="true"  ;;
@@ -1293,7 +1293,7 @@ z::kv::get_bool() {
   REPLY="false"
 
   z::kv::get "$1" "$2" || return $?
-  z::validate::boolean "$REPLY" "stored value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::bool "$REPLY" "stored value" || return $Z_ERR_INPUT
 
   case "${REPLY:l}" in
     true|1|yes|on) REPLY="true"  ;;
@@ -1327,7 +1327,7 @@ z::kv::get_array() {
 
   local handle="$1" key="$2" output_var="$3"
 
-  z::validate::varname "$output_var" "output_var" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::varname "$output_var" "output_var" || return $Z_ERR_INPUT
   z::kv::get "$handle" "$key" || return $?
 
   local _raw="$REPLY"
@@ -1365,7 +1365,7 @@ z::kv::incr() {
 
   local handle="$1" key="$2" amount_raw="${3:-1}"
 
-  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int "$amount_raw" "amount" || return $Z_ERR_INPUT
 
   typeset -i amount current=0
   amount="$amount_raw"
@@ -1395,7 +1395,7 @@ z::kv::decr() {
 
   local handle="$1" key="$2" amount_raw="${3:-1}"
 
-  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int "$amount_raw" "amount" || return $Z_ERR_INPUT
 
   typeset -i amount
   amount="$amount_raw"
@@ -1490,11 +1490,11 @@ z::kv::expire() {
   local handle="$1" key="$2" ttl_raw="${3:-0}"
 
   _z::kv::require_handle "$handle"        || return $?
-  z::validate::integer   "$ttl_raw" "ttl" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int   "$ttl_raw" "ttl" || return $Z_ERR_INPUT
 
   if ! z::kv::exists "$handle" "$key"; then
     z::log::error "zkv: cannot set TTL on non-existent key" handle "$handle" key "$key"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   typeset -i ttl
@@ -1536,7 +1536,7 @@ z::kv::persist() {
 
   if ! z::kv::exists "$handle" "$key"; then
     z::log::error "zkv: cannot persist non-existent key" handle "$handle" key "$key"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   z::kv::expire "$handle" "$key" 0
@@ -1560,7 +1560,7 @@ z::kv::mset() {
 
   if (( $# % 2 != 0 )); then
     z::log::error "zkv: mset requires even number of key-value arguments" received "$#"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   while (( $# >= 2 )); do
@@ -1661,7 +1661,7 @@ z::kv::getset() {
 
 # z::kv::setnx <handle> <key> <value>
 # Sets <key> only if it does not already exist (SET if Not eXists).
-# Returns ZBASE_ERROR_PERMISSION if the key is already present.
+# Returns Z_ERR_PERM if the key is already present.
 z::kv::setnx() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1673,7 +1673,7 @@ z::kv::setnx() {
 
   if z::kv::exists "$handle" "$key"; then
     z::log::debug "zkv: setnx key exists" handle "$handle" key "$key"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   z::kv::set "$handle" "$key" "$value"
@@ -1681,7 +1681,7 @@ z::kv::setnx() {
 
 # z::kv::setxx <handle> <key> <value>
 # Sets <key> only if it already exists (SET if eXists).
-# Returns ZBASE_ERROR_NOT_FOUND if the key is absent.
+# Returns Z_ERR_NOTFOUND if the key is absent.
 z::kv::setxx() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1692,7 +1692,7 @@ z::kv::setxx() {
   _z::kv::validate_key   "$key" "$handle" || return $?
 
   if ! z::kv::exists "$handle" "$key"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   z::kv::set "$handle" "$key" "$value"
@@ -1700,7 +1700,7 @@ z::kv::setxx() {
 
 # z::kv::cas <handle> <key> <expected> <new-value>
 # Compare-And-Swap: sets <key> to <new-value> only when the current value
-# equals <expected>.  Returns ZBASE_ERROR_PERMISSION on mismatch.
+# equals <expected>.  Returns Z_ERR_PERM on mismatch.
 z::kv::cas() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1717,7 +1717,7 @@ z::kv::cas() {
 
   if [[ $current != $expected ]]; then
     z::log::debug "zkv: CAS failed" handle "$handle" key "$key"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   z::kv::set "$handle" "$key" "$new"
@@ -1741,7 +1741,7 @@ z::kv::begin() {
 
   if _zkv_tx_active "$handle"; then
     z::log::error "zkv: already in transaction" handle "$handle"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   # Clear all write buffers before starting a fresh transaction.
@@ -1952,11 +1952,11 @@ z::kv::tx() {
   shift 2
 
   _z::kv::require_handle "$handle" || return $?
-  z::validate::nonempty "$cb" "callback" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$cb" "callback" || return $Z_ERR_INPUT
 
-  if ! z::probe::func "$cb"; then
+  if ! z::is::func "$cb"; then
     z::log::error "zkv: tx callback not defined" callback "$cb"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   z::kv::begin "$handle" || return $?
@@ -1990,8 +1990,8 @@ z::kv::save() {
   local handle="$1" file="$2"
 
   _z::kv::require_handle   "$handle"                       || return $?
-  z::validate::nonempty    "$file" "file"                  || return $ZBASE_ERROR_INVALID_INPUT
-  z::probe::path::writable "${file:h}" "persist directory" || return $ZBASE_ERROR_PERMISSION
+  z::ensure::nonempty    "$file" "file"                  || return $Z_ERR_INPUT
+  z::ensure::path::writable "${file:h}" "persist directory" || return $Z_ERR_PERM
 
   # Temp file includes PID and epoch to avoid collisions across concurrent saves.
   _z::kv::epoch || return $?
@@ -2137,14 +2137,14 @@ z::kv::save() {
   } > "$tmp" || {
     z::log::error "zkv: failed to write temp file" handle "$handle" file "$tmp"
     command rm -f "$tmp" 2>/dev/null
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   }
 
   # Atomic rename — avoids partial reads by other processes.
   command mv -f "$tmp" "$file" || {
     z::log::error "zkv: atomic rename failed" handle "$handle" src "$tmp" dst "$file"
     command rm -f "$tmp" 2>/dev/null
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   }
 
   _z::kv::epoch || return $?
@@ -2198,8 +2198,8 @@ z::kv::load() {
   [[ ${3:-} == "--clear" ]] && clear=1
 
   _z::kv::require_handle   "$handle"      || return $?
-  z::validate::nonempty    "$file" "file" || return $ZBASE_ERROR_INVALID_INPUT
-  z::probe::path::readable "$file" "file" || return $ZBASE_ERROR_NOT_FOUND
+  z::ensure::nonempty    "$file" "file" || return $Z_ERR_INPUT
+  z::ensure::path::readable "$file" "file" || return $Z_ERR_NOTFOUND
 
   # Parse the comment header to extract the format version.
   local header_line file_version=0
@@ -2215,13 +2215,13 @@ z::kv::load() {
 
   if [[ ! $file_version =~ '^[0-9]+$' ]]; then
     z::log::error "zkv: dump version unreadable" file "$file"
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   fi
 
   if (( file_version > ZKV_PERSIST_FORMAT_VERSION )); then
     z::log::error "zkv: dump format too new" \
       file "$file" file_version "$file_version" supported "$ZKV_PERSIST_FORMAT_VERSION"
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   fi
 
   (( clear )) && z::kv::clear "$handle"
@@ -2265,7 +2265,7 @@ z::kv::load() {
 
     _zkv_aset "$_meta_n" "$key" "$vtype"
 
-    if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+    if z::ensure::int "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
       _z::kv::epoch || return $?
       now_epoch="$REPLY"
       _zkv_aset "$_ttl_n" "$key" "$(( now_epoch + ttlval ))"
@@ -2302,7 +2302,7 @@ z::kv::load() {
         _z::kv::decode_value "$evalue"
         value="$REPLY"
 
-        if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+        if z::ensure::int "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
           z::kv::set "$handle" "$key" "$value" --type "$vtype" --ttl "$ttlval"
         else
           z::kv::set "$handle" "$key" "$value" --type "$vtype"
@@ -2341,7 +2341,7 @@ z::kv::load() {
             ;;
         esac
 
-        if z::validate::integer "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
+        if z::ensure::int "$ttlval" "ttl" 2>/dev/null && (( ttlval > 0 )); then
           _z::kv::epoch || return $?
           now_epoch="$REPLY"
           _zkv_aset "$_ttl_n" "$key" "$(( now_epoch + ttlval ))"
@@ -2395,8 +2395,8 @@ z::kv::enable_persist() {
   local handle="$1" file="$2"
 
   _z::kv::require_handle   "$handle"      || return $?
-  z::validate::nonempty    "$file" "file" || return $ZBASE_ERROR_INVALID_INPUT
-  z::probe::path::writable "$file" "file" || return $ZBASE_ERROR_PERMISSION
+  z::ensure::nonempty    "$file" "file" || return $Z_ERR_INPUT
+  z::ensure::path::writable "$file" "file" || return $Z_ERR_PERM
 
   local _cfg_n="_zkv_cfg_${handle}"
 
@@ -2432,7 +2432,7 @@ z::kv::disable_persist() {
 
 # z::kv::lock <handle> <lock-name> [<ttl>] [<owner>]
 # Acquires a named lock with an expiry of <ttl> seconds (default: 10).
-# Returns ZBASE_ERROR_PERMISSION if the lock is held and not yet expired.
+# Returns Z_ERR_PERM if the lock is held and not yet expired.
 # Expired locks are silently taken over.
 z::kv::lock() {
   emulate -L zsh
@@ -2442,7 +2442,7 @@ z::kv::lock() {
 
   _z::kv::require_handle "$handle"              || return $?
   _z::kv::validate_key   "$lock_name" "$handle" || return $?
-  z::validate::integer   "$ttl_raw" "ttl"       || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int   "$ttl_raw" "ttl"       || return $Z_ERR_INPUT
 
   typeset -i ttl
   ttl="$ttl_raw"
@@ -2470,7 +2470,7 @@ z::kv::lock() {
 
     if (( REPLY < prev_expire )); then
       z::log::debug "zkv: lock held" handle "$handle" lock "$lock_name" owner "$prev_owner"
-      return $ZBASE_ERROR_PERMISSION
+      return $Z_ERR_PERM
     fi
 
     z::log::debug "zkv: lock expired, taking over" handle "$handle" lock "$lock_name"
@@ -2486,7 +2486,7 @@ z::kv::lock() {
 }
 
 # z::kv::unlock <handle> <lock-name> [<owner>]
-# Releases a named lock.  Fails with ZBASE_ERROR_PERMISSION if the caller's
+# Releases a named lock.  Fails with Z_ERR_PERM if the caller's
 # <owner> does not match the recorded owner.
 z::kv::unlock() {
   emulate -L zsh
@@ -2500,7 +2500,7 @@ z::kv::unlock() {
   local _locks_n="_zkv_locks_${handle}"
 
   if ! _zkv_ahas "$_locks_n" "$lock_name"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_aget "$_locks_n" "$lock_name"
@@ -2510,7 +2510,7 @@ z::kv::unlock() {
   if [[ $prev_owner != $owner ]]; then
     z::log::error "zkv: unlock owner mismatch" handle "$handle" lock "$lock_name" \
       expected "$prev_owner" got "$owner"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   _zkv_adel "$_locks_n" "$lock_name"
@@ -2531,12 +2531,12 @@ z::kv::lock_wait() {
 
   _z::kv::require_handle "$handle"                  || return $?
   _z::kv::validate_key   "$lock_name" "$handle"     || return $?
-  z::validate::integer   "$ttl_raw" "ttl"           || return $ZBASE_ERROR_INVALID_INPUT
-  z::validate::integer   "$attempts_raw" "attempts" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int   "$ttl_raw" "ttl"           || return $Z_ERR_INPUT
+  z::ensure::int   "$attempts_raw" "attempts" || return $Z_ERR_INPUT
 
   if [[ ! $interval_raw == (<->|<->.<->) ]]; then
     z::log::error "zkv: invalid interval" interval "$interval_raw"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   zmodload -F zsh/zselect b:zselect 2>/dev/null
@@ -2561,7 +2561,7 @@ z::kv::lock_wait() {
     fi
   done
 
-  return $ZBASE_ERROR_PERMISSION
+  return $Z_ERR_PERM
 }
 
 
@@ -2580,12 +2580,12 @@ z::kv::watch() {
   local handle="$1" pattern="$2" handler="$3"
 
   _z::kv::require_handle "$handle"            || return $?
-  z::validate::nonempty  "$pattern" "pattern" || return $ZBASE_ERROR_INVALID_INPUT
-  z::validate::nonempty  "$handler" "handler" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$pattern" "pattern" || return $Z_ERR_INPUT
+  z::ensure::nonempty  "$handler" "handler" || return $Z_ERR_INPUT
 
-  if ! z::probe::func "$handler"; then
+  if ! z::is::func "$handler"; then
     z::log::error "zkv: watcher handler not found" handle "$handle" handler "$handler"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local _wat_n="_zkv_watchers_${handle}"
@@ -2615,7 +2615,7 @@ z::kv::unwatch() {
   local handle="$1" pattern="$2" handler="${3:-}"
 
   _z::kv::require_handle "$handle"            || return $?
-  z::validate::nonempty  "$pattern" "pattern" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$pattern" "pattern" || return $Z_ERR_INPUT
 
   local _wat_n="_zkv_watchers_${handle}"
 
@@ -2625,13 +2625,13 @@ z::kv::unwatch() {
   fi
 
   if ! _zkv_ahas "$_wat_n" "$pattern"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_aget "$_wat_n" "$pattern"
   local existing="$REPLY"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a handlers
   handlers=( "${(@ps:$_ZKV_SEP:)existing}" )
@@ -2661,7 +2661,7 @@ z::kv::lpush() {
 
   _z::kv::require_handle "$handle"             || return $?
   _z::kv::validate_key   "$key" "$handle"      || return $?
-  z::validate::nonempty  "$value" "value"      || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value"      || return $Z_ERR_INPUT
   _z::kv::reserve_type   "$handle" "$key" list || return $?
 
   _z::kv::tx_resolve_write "$handle" lists "$key"
@@ -2692,7 +2692,7 @@ z::kv::rpush() {
 
   _z::kv::require_handle "$handle"             || return $?
   _z::kv::validate_key   "$key" "$handle"      || return $?
-  z::validate::nonempty  "$value" "value"      || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value"      || return $Z_ERR_INPUT
   _z::kv::reserve_type   "$handle" "$key" list || return $?
 
   _z::kv::tx_resolve_write "$handle" lists "$key"
@@ -2731,13 +2731,13 @@ z::kv::lpop() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items rest
   _z::kv::split_decoded "$existing"
   items=( "${reply[@]}" )
 
-  (( ${#items} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+  (( ${#items} == 0 )) && return $Z_ERR_NOTFOUND
 
   REPLY="${items[1]}"
 
@@ -2771,13 +2771,13 @@ z::kv::rpop() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items rest
   _z::kv::split_decoded "$existing"
   items=( "${reply[@]}" )
 
-  (( ${#items} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+  (( ${#items} == 0 )) && return $Z_ERR_NOTFOUND
 
   REPLY="${items[-1]}"
 
@@ -2882,7 +2882,7 @@ z::kv::lindex() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items
   _z::kv::split_decoded "$existing"
@@ -2894,7 +2894,7 @@ z::kv::lindex() {
   (( zi = idx < 0 ? n + idx + 1 : idx + 1 ))
 
   if (( zi < 1 || zi > n )); then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   REPLY="${items[zi]}"
@@ -2913,7 +2913,7 @@ z::kv::lset() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_write "$handle" lists "$key"
 
@@ -2921,7 +2921,7 @@ z::kv::lset() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items
   _z::kv::split_decoded "$existing"
@@ -2932,7 +2932,7 @@ z::kv::lset() {
   (( zi = idx < 0 ? n + idx + 1 : idx + 1 ))
 
   if (( zi < 1 || zi > n )); then
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   items[zi]="$value"
@@ -2951,7 +2951,7 @@ z::kv::lset() {
 
 # z::kv::sadd <handle> <key> <value>
 # Adds <value> to the set at <key>.
-# Returns ZBASE_ERROR_PERMISSION if <value> is already a member.
+# Returns Z_ERR_PERM if <value> is already a member.
 z::kv::sadd() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2960,7 +2960,7 @@ z::kv::sadd() {
 
   _z::kv::require_handle "$handle"            || return $?
   _z::kv::validate_key   "$key" "$handle"     || return $?
-  z::validate::nonempty  "$value" "value"     || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value"     || return $Z_ERR_INPUT
   _z::kv::reserve_type   "$handle" "$key" set || return $?
 
   _z::kv::tx_resolve_write "$handle" sets "$key"
@@ -2974,7 +2974,7 @@ z::kv::sadd() {
   members=( "${reply[@]}" )
 
   # (Ie) flag: case-sensitive exact-match index; non-zero means already present.
-  (( ${members[(Ie)$value]} )) && return $ZBASE_ERROR_PERMISSION
+  (( ${members[(Ie)$value]} )) && return $Z_ERR_PERM
 
   members+=( "$value" )
 
@@ -2997,7 +2997,7 @@ z::kv::srem() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_write "$handle" sets "$key"
 
@@ -3005,7 +3005,7 @@ z::kv::srem() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a members filtered
   local member found=0
@@ -3021,7 +3021,7 @@ z::kv::srem() {
     fi
   done
 
-  (( found )) || return $ZBASE_ERROR_NOT_FOUND
+  (( found )) || return $Z_ERR_NOTFOUND
 
   if (( ${#filtered} > 0 )); then
     _z::kv::join_encoded "${filtered[@]}"
@@ -3044,7 +3044,7 @@ z::kv::sismember() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$value" "value" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_read "$handle" sets "$key" || return 1
 
@@ -3305,7 +3305,7 @@ _z::kv::zscore_pack() {
   LC_NUMERIC=C printf -v canon "%.6f" "$raw" 2>/dev/null || {
     REPLY=""
     REPLY2=""
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   }
 
   typeset -F f
@@ -3314,7 +3314,7 @@ _z::kv::zscore_pack() {
   if (( f < -999999999999.999999 || f > 999999999999.999999 )); then
     REPLY=""
     REPLY2=""
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   # Shift into unsigned space (add 2e18 microseconds) so lexicographic order
@@ -3373,12 +3373,12 @@ z::kv::zadd() {
 
   _z::kv::require_handle "$handle"              || return $?
   _z::kv::validate_key   "$key" "$handle"       || return $?
-  z::validate::nonempty  "$member" "member"     || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$member" "member"     || return $Z_ERR_INPUT
   _z::kv::reserve_type   "$handle" "$key" zset  || return $?
 
   _z::kv::zentry_pack "$score_raw" "$member" || {
     z::log::error "zkv: invalid score" handle "$handle" key "$key" score "$score_raw"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   }
 
   local new_entry="$REPLY"
@@ -3426,7 +3426,7 @@ z::kv::zscore() {
 
   _z::kv::require_handle "$handle"          || return $?
   _z::kv::validate_key   "$key" "$handle"   || return $?
-  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$member" "member" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_read "$handle" zsets "$key" || return $?
 
@@ -3434,7 +3434,7 @@ z::kv::zscore() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items
   local item entry_member
@@ -3452,7 +3452,7 @@ z::kv::zscore() {
     fi
   done
 
-  return $ZBASE_ERROR_NOT_FOUND
+  return $Z_ERR_NOTFOUND
 }
 
 # z::kv::zrank <handle> <key> <member> [<reverse>]
@@ -3468,7 +3468,7 @@ z::kv::zrank() {
 
   _z::kv::require_handle "$handle"          || return $?
   _z::kv::validate_key   "$key" "$handle"   || return $?
-  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$member" "member" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_read "$handle" zsets "$key" || return $?
 
@@ -3476,7 +3476,7 @@ z::kv::zrank() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items sorted
   local item entry_member
@@ -3501,7 +3501,7 @@ z::kv::zrank() {
     (( rank += 1 ))
   done
 
-  return $ZBASE_ERROR_NOT_FOUND
+  return $Z_ERR_NOTFOUND
 }
 
 # z::kv::zrange <handle> <key> [<start>] [<stop>] [--rev]
@@ -3631,10 +3631,10 @@ z::kv::zrangebyscore() {
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
 
-  _z::kv::zscore_pack "$min_raw" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::zscore_pack "$min_raw" || return $Z_ERR_INPUT
   local min_pack="$REPLY"
 
-  _z::kv::zscore_pack "$max_raw" || return $ZBASE_ERROR_INVALID_INPUT
+  _z::kv::zscore_pack "$max_raw" || return $Z_ERR_INPUT
   local max_pack="$REPLY"
 
   _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
@@ -3681,7 +3681,7 @@ z::kv::zrem() {
 
   _z::kv::require_handle "$handle"          || return $?
   _z::kv::validate_key   "$key" "$handle"   || return $?
-  z::validate::nonempty  "$member" "member" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$member" "member" || return $Z_ERR_INPUT
 
   _z::kv::tx_resolve_write "$handle" zsets "$key"
 
@@ -3689,7 +3689,7 @@ z::kv::zrem() {
   local _ref="${_map_n}[${key}]"
   local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return $ZBASE_ERROR_NOT_FOUND
+  [[ -z $existing ]] && return $Z_ERR_NOTFOUND
 
   local -a items filtered
   local item entry_member found=0
@@ -3708,7 +3708,7 @@ z::kv::zrem() {
     fi
   done
 
-  (( found )) || return $ZBASE_ERROR_NOT_FOUND
+  (( found )) || return $Z_ERR_NOTFOUND
 
   if (( ${#filtered} > 0 )); then
     _z::kv::join_encoded "${filtered[@]}"
@@ -3779,7 +3779,7 @@ z::kv::hset() {
 
   _z::kv::require_handle "$handle"           || return $?
   _z::kv::validate_key   "$key" "$handle"    || return $?
-  z::validate::nonempty  "$field" "field"    || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$field" "field"    || return $Z_ERR_INPUT
   _z::kv::reserve_type   "$handle" "$key" hash || return $?
 
   _z::kv::hash_compose "$key" "$field"
@@ -3812,7 +3812,7 @@ z::kv::hmset() {
   if (( $# % 2 != 0 )); then
     z::log::error "zkv: hmset requires even field-value count" \
       handle "$handle" key "$key" received "$#"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   while (( $# >= 2 )); do
@@ -3835,7 +3835,7 @@ z::kv::hget() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$field" "field" || return $Z_ERR_INPUT
 
   _z::kv::hash_compose "$key" "$field"
   local hk="$REPLY"
@@ -3845,7 +3845,7 @@ z::kv::hget() {
   local _map_n="$REPLY"
 
   if ! _zkv_ahas "$_map_n" "$hk"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_aget "$_map_n" "$hk"
@@ -3925,7 +3925,7 @@ z::kv::hdel() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$field" "field" || return $Z_ERR_INPUT
 
   _z::kv::hash_compose "$key" "$field"
   local hk="$REPLY"
@@ -3954,13 +3954,13 @@ z::kv::hdel() {
       return 0
     fi
 
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local _live_n="_zkv_hashes_${handle}"
 
   if ! _zkv_ahas "$_live_n" "$hk"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_adel "$_live_n" "$hk"
@@ -3979,7 +3979,7 @@ z::kv::hexists() {
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$field" "field" || return $Z_ERR_INPUT
 
   _z::kv::hash_compose "$key" "$field"
   local hk="$REPLY"
@@ -4061,18 +4061,18 @@ z::kv::hincrby() {
 
   local handle="$1" key="$2" field="$3" amount_raw="${4:-1}"
 
-  z::validate::integer "$amount_raw" "amount" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int "$amount_raw" "amount" || return $Z_ERR_INPUT
 
   typeset -i amount current=0
   amount="$amount_raw"
 
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
-  z::validate::nonempty  "$field" "field" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$field" "field" || return $Z_ERR_INPUT
 
   if z::kv::hexists "$handle" "$key" "$field"; then
     z::kv::hget "$handle" "$key" "$field" || return $?
-    z::validate::integer "$REPLY" "field value" || return $ZBASE_ERROR_INVALID_INPUT
+    z::ensure::int "$REPLY" "field value" || return $Z_ERR_INPUT
     current="$REPLY"
   fi
 
@@ -4170,7 +4170,7 @@ z::kv::snapshot_restore() {
   local handle="$1" snap_id="$2"
 
   _z::kv::require_handle "$handle"                || return $?
-  z::validate::nonempty  "$snap_id" "snapshot_id" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$snap_id" "snapshot_id" || return $Z_ERR_INPUT
 
   local _snaps_n="_zkv_snaps_${handle}"
 
@@ -4178,7 +4178,7 @@ z::kv::snapshot_restore() {
 
   if [[ -z $REPLY ]]; then
     z::log::error "zkv: snapshot not found" handle "$handle" id "$snap_id"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local suffix
@@ -4256,14 +4256,14 @@ z::kv::snapshot_delete() {
   local handle="$1" snap_id="$2"
 
   _z::kv::require_handle "$handle"                || return $?
-  z::validate::nonempty  "$snap_id" "snapshot_id" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$snap_id" "snapshot_id" || return $Z_ERR_INPUT
 
   local _snaps_n="_zkv_snaps_${handle}"
 
   _zkv_aget "$_snaps_n" "${snap_id}.label"
 
   if [[ -z $REPLY ]]; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local k
@@ -4468,7 +4468,7 @@ z::kv::batch() {
   if (( failed > 0 )); then
     z::log::error "zkv: batch failed, rolling back" handle "$handle" errors "$failed"
     z::kv::rollback "$handle"
-    return $ZBASE_ERROR_GENERAL
+    return $Z_ERR_GENERAL
   fi
 
   z::kv::commit "$handle"
@@ -4590,7 +4590,7 @@ z::kv::rename() {
   _z::kv::validate_key   "$new" "$handle" || return $?
 
   if ! z::kv::exists "$handle" "$old"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   if [[ $old == "$new" ]]; then
@@ -4623,7 +4623,7 @@ z::kv::copy() {
   _z::kv::validate_key   "$dst" "$handle" || return $?
 
   if ! z::kv::exists "$handle" "$src"; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _z::kv::_copy_key_data "$handle" "$src" "$dst" || return $?
@@ -4662,7 +4662,7 @@ z::kv::randomkey() {
     active+=( "$k" )
   done
 
-  (( ${#active} == 0 )) && return $ZBASE_ERROR_NOT_FOUND
+  (( ${#active} == 0 )) && return $Z_ERR_NOTFOUND
 
   typeset -i idx
   (( idx = (RANDOM % ${#active}) + 1 ))
@@ -4685,8 +4685,8 @@ z::kv::scan() {
   reply=()
 
   _z::kv::require_handle "$handle"              || return $?
-  z::validate::integer   "$cursor_raw" "cursor" || return $ZBASE_ERROR_INVALID_INPUT
-  z::validate::integer   "$count_raw" "count"   || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::int   "$cursor_raw" "cursor" || return $Z_ERR_INPUT
+  z::ensure::int   "$count_raw" "count"   || return $Z_ERR_INPUT
 
   typeset -i cursor count
   cursor="$cursor_raw"
@@ -4694,7 +4694,7 @@ z::kv::scan() {
 
   if (( cursor < 0 || count < 1 )); then
     z::log::error "zkv: invalid scan bounds" cursor "$cursor" count "$count"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   local _meta_n="_zkv_meta_${handle}"
@@ -4740,39 +4740,39 @@ z::kv::config() {
   local handle="$1" key="$2" value="$3"
 
   _z::kv::require_handle "$handle"           || return $?
-  z::validate::nonempty  "$key" "config_key" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty  "$key" "config_key" || return $Z_ERR_INPUT
 
   local _cfg_n="_zkv_cfg_${handle}"
 
   if ! _zkv_ahas "$_cfg_n" "$key"; then
     z::log::error "zkv: unknown config key" handle "$handle" key "$key"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   case "$key" in
     auto_persist|enable_ttl)
-      z::validate::enum "0|1" "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::enum "0|1" "$value" "$key" || return $Z_ERR_INPUT
       ;;
 
     max_key_length)
-      z::validate::integer::range "$value" 1 1048576 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 1 1048576 "$key" || return $Z_ERR_INPUT
       ;;
 
     max_value_length)
-      z::validate::integer::range "$value" 1 1073741824 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 1 1073741824 "$key" || return $Z_ERR_INPUT
       ;;
 
     max_snapshots)
-      z::validate::integer::range "$value" 1 1000 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 1 1000 "$key" || return $Z_ERR_INPUT
       ;;
 
     persist_debounce)
-      z::validate::integer::range "$value" 0 86400 "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 0 86400 "$key" || return $Z_ERR_INPUT
       ;;
 
     persist_file)
-      z::validate::nonempty "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
-      z::probe::path::writable "$value" "$key" || return $ZBASE_ERROR_PERMISSION
+      z::ensure::nonempty "$value" "$key" || return $Z_ERR_INPUT
+      z::ensure::path::writable "$value" "$key" || return $Z_ERR_PERM
       ;;
   esac
 
@@ -5109,7 +5109,7 @@ z::kv::info() {
 
   if ! _zkv_ahas "$_meta_n" "$key"; then
     print "Key not found.\n"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _zkv_aget "$_meta_n" "$key"

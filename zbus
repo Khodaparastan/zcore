@@ -25,7 +25,7 @@
 #
 # Requires:
 #   zlog  — must be sourced before zbus (provides z::log::*)
-#   zbase — must be sourced before zbus (provides z::validate::*, z::probe::*)
+#   zbase — must be sourced before zbus (provides z::ensure::*, z::is::*, z::get::*)
 #   zkv   — v4+ must be sourced before zbus (provides z::kv::*)
 # =============================================================================
 
@@ -37,7 +37,7 @@
 if (( ! ${+functions[z::log::info]} )); then
   print -u2 "zbus: fatal: zlog must be sourced before zbus"; return 1
 fi
-if (( ! ${+functions[z::validate::nonempty]} )); then
+if (( ! ${+functions[z::ensure::nonempty]} )); then
   print -u2 "zbus: fatal: zbase must be sourced before zbus"; return 1
 fi
 if (( ! ${+functions[z::kv::open]} )); then
@@ -46,7 +46,7 @@ fi
 if (( ! ${+Z_SEP} )); then
   print -u2 "zbus: fatal: zbase separator constants missing"; return 1
 fi
-if (( ! ${+ZBASE_ERROR_GENERAL} )); then
+if (( ! ${+Z_ERR_GENERAL} )); then
   print -u2 "zbus: fatal: zbase error codes missing — zbase too old"; return 1
 fi
 if (( ! ${+ZKV_VERSION} )) || (( ZKV_VERSION < 4 )); then
@@ -191,10 +191,10 @@ _z::bus::generate_id() {
 # The * character is allowed so wildcard patterns can be validated here too.
 _z::bus::validate_event() {
   local name="$1"
-  z::validate::nonempty "$name" "event name" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$name" "event name" || return $Z_ERR_INPUT
   if [[ ! $name =~ '^[a-zA-Z0-9_:*.-]+$' ]]; then
     z::log::error "zbus: invalid event name" name "$name" allowed "a-zA-Z0-9_:*.-"
-    return $ZBASE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
   return 0
 }
@@ -203,10 +203,10 @@ _z::bus::validate_event() {
 # Verifies the handler is non-empty and currently defined as a function.
 _z::bus::validate_handler() {
   local func="$1"
-  z::validate::nonempty "$func" "handler" || return $ZBASE_ERROR_INVALID_INPUT
-  if ! z::probe::func "$func"; then
+  z::ensure::nonempty "$func" "handler" || return $Z_ERR_INPUT
+  if ! z::is::func "$func"; then
     z::log::error "zbus: handler function not defined" handler "$func"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
   return 0
 }
@@ -364,7 +364,7 @@ _z::bus::add_history() {
   local event_name="$1"; shift
   local ts entry args_str
 
-  z::time::epoch; ts=$REPLY
+  z::get::epoch; ts=$REPLY
 
   if (( $# > 0 )); then
     args_str="${(pj:$_ZBUS_SEP:)@}"   # join args with field separator
@@ -463,7 +463,7 @@ _z::bus::dispatch_one_sync() {
     REPLY="remove"
     return 0
   fi
-  if ! z::probe::func "$handler_func"; then
+  if ! z::is::func "$handler_func"; then
     z::log::once "zbus-handler-missing-${handler_func}" warn \
       "zbus: handler no longer defined" handler "$handler_func" id "$hid"
     REPLY="remove"
@@ -498,7 +498,7 @@ _z::bus::dispatch_one_safe() {
     REPLY="remove"
     return 0
   fi
-  if ! z::probe::func "$handler_func"; then
+  if ! z::is::func "$handler_func"; then
     z::log::once "zbus-handler-missing-${handler_func}" warn \
       "zbus: handler no longer defined" handler "$handler_func" id "$hid"
     REPLY="remove"
@@ -506,7 +506,7 @@ _z::bus::dispatch_one_safe() {
   fi
 
   typeset -i start_ts end_ts elapsed bg wdog exit_code
-  z::time::epoch; start_ts=$REPLY
+  z::get::epoch; start_ts=$REPLY
 
   # Run handler in its own subshell so it cannot mutate the caller's env.
   ( "$handler_func" "$event_name" "$@" ) &
@@ -529,7 +529,7 @@ _z::bus::dispatch_one_safe() {
   kill "$wdog" 2>/dev/null || true
   wait "$wdog" 2>/dev/null || true
 
-  z::time::epoch; end_ts=$REPLY
+  z::get::epoch; end_ts=$REPLY
   (( elapsed = end_ts - start_ts ))
 
   # Only classify as a timeout when the exit code is SIGTERM/SIGKILL AND the
@@ -652,7 +652,7 @@ z::bus::init() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
-  z::kv::open "$_ZBUS_STORE" || return $ZBASE_ERROR_GENERAL
+  z::kv::open "$_ZBUS_STORE" || return $Z_ERR_GENERAL
 
   # Write defaults only when the key is absent (setnx) so re-init does not
   # clobber values that were persisted from a previous session.
@@ -673,20 +673,20 @@ z::bus::init() {
   while (( $# > 0 )); do
     case "$1" in
       --max-history)
-        z::validate::integer::range "${2:-}" 0 1000000 "--max-history" \
-          || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 0 1000000 "--max-history" \
+          || return $Z_ERR_INPUT
         z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HISTORY" "$2"
         shift 2
         ;;
       --handler-timeout)
-        z::validate::integer::range "${2:-}" 1 86400 "--handler-timeout" \
-          || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 1 86400 "--handler-timeout" \
+          || return $Z_ERR_INPUT
         z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_HANDLER_TIMEOUT" "$2"
         shift 2
         ;;
       --max-handlers)
-        z::validate::integer::range "${2:-}" 1 100000 "--max-handlers" \
-          || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 1 100000 "--max-handlers" \
+          || return $Z_ERR_INPUT
         z::kv::set "$_ZBUS_STORE" "$ZBUS_CFG_MAX_HANDLERS" "$2"
         shift 2
         ;;
@@ -766,8 +766,8 @@ z::bus::on() {
   while (( $# > 0 )); do
     case "$1" in
       --priority)
-        z::validate::integer::range "${2:-}" 0 100 "priority" \
-          || return $ZBASE_ERROR_INVALID_INPUT
+        z::ensure::int_range "${2:-}" 0 100 "priority" \
+          || return $Z_ERR_INPUT
         (( priority = 10#${2} ))   # force base-10 parse to avoid octal surprises
         shift 2
         ;;
@@ -798,7 +798,7 @@ z::bus::on() {
   if (( ${#existing_handlers} >= _zbus_cfg_max_handlers )); then
     z::log::error "zbus: handler limit reached" \
       event "$event_name" limit "$_zbus_cfg_max_handlers"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   _z::bus::generate_id
@@ -842,7 +842,7 @@ z::bus::once() {
 # Removes all handlers (or only those matching <handler-func>) for every
 # event that matches <event-pattern>.
 # Sets REPLY = count of removed handlers.
-# Returns ZBASE_ERROR_NOT_FOUND when nothing was removed.
+# Returns Z_ERR_NOTFOUND when nothing was removed.
 z::bus::off() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -889,7 +889,7 @@ z::bus::off() {
 
   REPLY=$removed
   z::log::debug "zbus: off complete" pattern "$event_pattern" removed "$removed"
-  (( removed > 0 )) && return 0 || return $ZBASE_ERROR_NOT_FOUND
+  (( removed > 0 )) && return 0 || return $Z_ERR_NOTFOUND
 }
 
 # z::bus::off_id <handler-id>
@@ -899,12 +899,12 @@ z::bus::off_id() {
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local hid="$1"
-  z::validate::nonempty "$hid" "handler_id" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$hid" "handler_id" || return $Z_ERR_INPUT
   _z::bus::ensure_init || return $?
 
   if [[ -z ${_zbus_handler_meta[${hid}.function]:-} ]]; then
     z::log::warn "zbus: handler ID not found" id "$hid"
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   _z::bus::remove_handler_by_id "$hid"
@@ -957,7 +957,7 @@ z::bus::emit_async() {
   if (( ${#_zbus_async_pids} >= _ZBUS_ASYNC_PID_CAP )); then
     z::log::error "zbus: async PID cap reached" \
       cap "$_ZBUS_ASYNC_PID_CAP" event "$event_name"
-    return $ZBASE_ERROR_PERMISSION
+    return $Z_ERR_PERM
   fi
 
   z::log::debug "zbus: emit_async" event "$event_name"
@@ -1340,42 +1340,42 @@ z::bus::config() {
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
 
   local key="$1" value="$2"
-  z::validate::nonempty "$key"   "key"   || return $ZBASE_ERROR_INVALID_INPUT
-  z::validate::nonempty "$value" "value" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$key"   "key"   || return $Z_ERR_INPUT
+  z::ensure::nonempty "$value" "value" || return $Z_ERR_INPUT
   _z::bus::ensure_init || return $?
 
   local cfg_key
   case "$key" in
     max_history)
-      z::validate::integer::range "$value" 0 1000000 "$key" \
-        || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 0 1000000 "$key" \
+        || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_MAX_HISTORY"
       ;;
     handler_timeout)
-      z::validate::integer::range "$value" 1 86400 "$key" \
-        || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 1 86400 "$key" \
+        || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_HANDLER_TIMEOUT"
       ;;
     max_handlers_per_event)
-      z::validate::integer::range "$value" 1 100000 "$key" \
-        || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::int_range "$value" 1 100000 "$key" \
+        || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_MAX_HANDLERS"
       ;;
     enable_history)
-      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::bool "$value" "$key" || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_ENABLE_HISTORY"
       ;;
     enable_stats)
-      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::bool "$value" "$key" || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_ENABLE_STATS"
       ;;
     enable_wildcards)
-      z::validate::boolean "$value" "$key" || return $ZBASE_ERROR_INVALID_INPUT
+      z::ensure::bool "$value" "$key" || return $Z_ERR_INPUT
       cfg_key="$ZBUS_CFG_ENABLE_WILDCARDS"
       ;;
     *)
       z::log::error "zbus: unknown config key" key "$key"
-      return $ZBASE_ERROR_NOT_FOUND
+      return $Z_ERR_NOTFOUND
       ;;
   esac
 
@@ -1401,7 +1401,7 @@ z::bus::get_config() {
   local key="$1"
   REPLY=""
 
-  z::validate::nonempty "$key" "key" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$key" "key" || return $Z_ERR_INPUT
   _z::bus::ensure_init || return $?
 
   case "$key" in
@@ -1413,7 +1413,7 @@ z::bus::get_config() {
     enable_wildcards)       (( _zbus_flag_wildcards )) && REPLY="true" || REPLY="false" ;;
     *)
       z::log::error "zbus: unknown config key" key "$key"
-      return $ZBASE_ERROR_NOT_FOUND
+      return $Z_ERR_NOTFOUND
       ;;
   esac
   return 0
@@ -1534,7 +1534,7 @@ z::bus::subscribe() {
   local channel="$1" handler="$2"
 
   _z::bus::ensure_init                        || return $?
-  z::validate::nonempty     "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty     "$channel" "channel" || return $Z_ERR_INPUT
   _z::bus::validate_handler "$handler"           || return $?
 
   local existing="${_zbus_channels[$channel]:-}"
@@ -1564,7 +1564,7 @@ z::bus::unsubscribe() {
   local channel="$1" handler="${2:-}"
 
   _z::bus::ensure_init                       || return $?
-  z::validate::nonempty "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$channel" "channel" || return $Z_ERR_INPUT
 
   if [[ -z $handler ]]; then
     unset "_zbus_channels[$channel]"
@@ -1574,7 +1574,7 @@ z::bus::unsubscribe() {
 
   local existing="${_zbus_channels[$channel]:-}"
   if [[ -z $existing ]]; then
-    return $ZBASE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local -a current=("${(@ps:$_ZBUS_SEP:)existing}")
@@ -1600,7 +1600,7 @@ z::bus::publish() {
   local channel="$1" message="$2"
 
   _z::bus::ensure_init                       || return $?
-  z::validate::nonempty "$channel" "channel" || return $ZBASE_ERROR_INVALID_INPUT
+  z::ensure::nonempty "$channel" "channel" || return $Z_ERR_INPUT
 
   local list="${_zbus_channels[$channel]:-}"
   if [[ -z $list ]]; then
@@ -1612,7 +1612,7 @@ z::bus::publish() {
   local h rc
 
   for h in "${handlers[@]}"; do
-    if z::probe::func "$h"; then
+    if z::is::func "$h"; then
       rc=0
       "$h" "$channel" "$message" 2>/dev/null || rc=$?
       if (( rc != 0 )); then

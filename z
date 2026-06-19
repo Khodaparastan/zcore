@@ -42,13 +42,13 @@ typeset -gr ZCORE_VERSION="0.5.0"
 if (( ! ${+functions[z::log::info]} )); then
   print -u2 "z: fatal: zlog must be sourced before z"; return 1 2>/dev/null || exit 1
 fi
-if (( ! ${+functions[z::validate::nonempty]} )); then
+if (( ! ${+functions[z::ensure::nonempty]} )); then
   print -u2 "z: fatal: zbase must be sourced before z"; return 1 2>/dev/null || exit 1
 fi
 if (( ! ${+functions[z::kv::open]} )); then
   print -u2 "z: fatal: zkv must be sourced before z"; return 1 2>/dev/null || exit 1
 fi
-if (( ! ${+ZBASE_ERROR_GENERAL} )); then
+if (( ! ${+Z_ERR_GENERAL} )); then
   print -u2 "z: fatal: zbase error codes missing — zbase too old"; return 1 2>/dev/null || exit 1
 fi
 
@@ -58,9 +58,9 @@ zmodload -F zsh/datetime b:EPOCHSECONDS 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------------
-# z-specific return codes. ZCORE_ERROR_{GENERAL,INVALID_INPUT,NOT_FOUND,
-# PERMISSION} are aliases of ZBASE_ERROR_* defined in zbase — do not redefine
-# them here.
+# z-specific return codes. Shared Z_ERR_* codes are defined in zbase.
+# ZCORE_ERROR_TIMEOUT and ZCORE_ERROR_INTERRUPTED are z-only — do not redefine
+# Z_ERR_* here.
 typeset -gri ZCORE_SUCCESS=0
 typeset -gri ZCORE_ERROR_TIMEOUT=124
 typeset -gri ZCORE_ERROR_INTERRUPTED=130
@@ -115,7 +115,7 @@ z::debug::profile_start() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   local operation="${1:-operation}"
-  z::kv::open profiling 2>/dev/null || return $ZCORE_ERROR_GENERAL
+  z::kv::open profiling 2>/dev/null || return $Z_ERR_GENERAL
   z::kv::set profiling "${operation}.start" "${EPOCHREALTIME:-0}"
   z::log::debug "[Profiler]" "Profiling instance initiated for operation:" "$operation"
   return 0
@@ -131,7 +131,7 @@ z::debug::profile_end() {
 
   if ! z::kv::get profiling "${operation}.start" 2>/dev/null; then
     z::log::warn "[Profiler]" "No start time recorded for operation:" "$operation"
-    return $ZCORE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
   start=$REPLY
   end=${EPOCHREALTIME:-0}
@@ -160,7 +160,7 @@ z::debug::assert() {
   # Non-zero condition is treated as a failed assertion (shell-truth inverted).
   if (( condition != 0 )); then
     z::debug::trace
-    z::sys::die "$message" $ZCORE_ERROR_GENERAL
+    z::sys::die "$message" $Z_ERR_GENERAL
   fi
   return 0
 }
@@ -212,7 +212,7 @@ z::cache::set() {
 
   if [[ -z $key ]]; then
     z::log::error "Cache key required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   typeset -i ttl=0
@@ -225,7 +225,7 @@ z::cache::set() {
           shift 2
         else
           z::log::error "Invalid TTL: ${2:-}"
-          return $ZCORE_ERROR_INVALID_INPUT
+          return $Z_ERR_INPUT
         fi
         ;;
       *)
@@ -264,7 +264,7 @@ z::cache::get() {
 
   if [[ -z $key ]]; then
     z::log::error "Cache key required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   # A failed TTL check means the entry expired and was just evicted.
@@ -276,7 +276,7 @@ z::cache::get() {
     if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "cache:miss" "$key" "expired" || true
     fi
-    return $ZCORE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   if (( ! ${+_zcore_cache_store[$key]} )); then
@@ -288,7 +288,7 @@ z::cache::get() {
     if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "cache:miss" "$key" "not_found" || true
     fi
-    return $ZCORE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local namespace="${key%%:*}"
@@ -307,7 +307,7 @@ z::cache::del() {
   local key="${1:-}"
 
   if [[ -z $key ]]; then
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   unset "_zcore_cache_store[$key]"
@@ -404,7 +404,7 @@ z::cache::memoize() {
 
   if [[ -z $cache_key || -z $func ]]; then
     z::log::error "Cache key and function required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   # Serve the memoised value on a cache hit, skipping the function call.
@@ -416,7 +416,7 @@ z::cache::memoize() {
 
   if (( ! ${+functions[$func]} )); then
     z::log::error "Function not found: $func"
-    return $ZCORE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   # Propagate the function's own exit status on failure (no caching).
@@ -483,7 +483,7 @@ z::sys::die() {
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   local message="${1-}"
   typeset -i exit_code
-  (( exit_code = 10#${2:-$ZCORE_ERROR_GENERAL} ))
+  (( exit_code = 10#${2:-$Z_ERR_GENERAL} ))
 
   z::progress::clear
   z::log::error "FATAL (exit $exit_code): $message"
@@ -660,7 +660,7 @@ z::config::get() {
 
   if [[ -z $key ]]; then
     z::log::error "Config key required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   z::kv::get config "${key}"
@@ -674,7 +674,7 @@ z::config::set() {
 
   if [[ -z $key ]]; then
     z::log::error "Config key required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   local rc=0
@@ -684,14 +684,14 @@ z::config::set() {
     *_mode|show_*|enable_*)
       if [[ $value != true && $value != false ]]; then
         z::log::error "Boolean required for $key"
-        return $ZCORE_ERROR_INVALID_INPUT
+        return $Z_ERR_INPUT
       fi
       z::kv::set_bool config "${key}" "$value" || rc=$?
       ;;
     *_size|*_timeout|*_depth|*_threshold|*_interval|*_iterations|*_level)
       if [[ $value != <-> ]]; then
         z::log::error "Integer required for $key"
-        return $ZCORE_ERROR_INVALID_INPUT
+        return $Z_ERR_INPUT
       fi
       z::kv::set_int config "${key}" "$value" || rc=$?
       ;;
@@ -720,7 +720,7 @@ z::config::watch() {
 
   if [[ -z $pattern || -z $handler ]]; then
     z::log::error "Pattern and handler required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   z::kv::watch config "${pattern}" "$handler"
@@ -756,7 +756,7 @@ z::config::save() {
 
   if [[ -z $file ]]; then
     z::log::error "File path required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   {
@@ -789,12 +789,12 @@ z::config::load() {
 
   if [[ -z $file ]]; then
     z::log::error "File path required"
-    return $ZCORE_ERROR_INVALID_INPUT
+    return $Z_ERR_INPUT
   fi
 
   if [[ ! -f $file || ! -r $file ]]; then
     z::log::error "Cannot read: $file"
-    return $ZCORE_ERROR_NOT_FOUND
+    return $Z_ERR_NOTFOUND
   fi
 
   local line key value
