@@ -3,19 +3,19 @@ test_teardown() { z::kv::close _ty_test }
 
 test_zkv_type_collision_string_then_list() {
   z::kv::set _ty_test "k" "string"
-  ztest::assert::returns $ZBASE_ERROR_PERMISSION \
+  ztest::assert::returns $Z_ERR_PERM \
     z::kv::lpush _ty_test "k" "boom"
 }
 
 test_zkv_type_collision_list_then_string() {
   z::kv::lpush _ty_test "k" "item"
-  ztest::assert::returns $ZBASE_ERROR_PERMISSION \
+  ztest::assert::returns $Z_ERR_PERM \
     z::kv::set _ty_test "k" "boom"
 }
 
 test_zkv_type_collision_set_then_hash() {
   z::kv::sadd _ty_test "k" "m"
-  ztest::assert::returns $ZBASE_ERROR_PERMISSION \
+  ztest::assert::returns $Z_ERR_PERM \
     z::kv::hset _ty_test "k" "f" "v"
 }
 

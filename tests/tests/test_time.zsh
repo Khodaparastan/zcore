@@ -1,15 +1,15 @@
+_time_is_digits() { [[ ${1:-} =~ '^[0-9]+$' ]]; }
+
 test_time_epoch_is_integer() {
-  local -a match mbegin mend
-  z::time::epoch
-  ztest::assert::true [[ $REPLY =~ '^[0-9]+$' ]] || true
+  z::get::epoch
+  ztest::assert::true _time_is_digits "$REPLY"
   (( REPLY > 1700000000 )) || ztest::fail "expected REPLY > 1700000000, got $REPLY"   # post-2023
 }
 
 test_time_epoch_ms_has_more_precision() {
-  z::time::epoch;    local s=$REPLY
-  z::time::epoch_ms; local ms=$REPLY
-  local -a match mbegin mend
-  ztest::assert::true [[ $ms =~ '^[0-9]+$' ]] || true
+  z::get::epoch;    local s=$REPLY
+  z::get::epoch_ms; local ms=$REPLY
+  ztest::assert::true _time_is_digits "$ms"
   # ms should be in the same ballpark as s*1000 (within 2s drift)
   local diff=$(( ms - s * 1000 ))
   (( diff < 0 )) && (( diff = -diff ))
@@ -17,13 +17,17 @@ test_time_epoch_ms_has_more_precision() {
 }
 
 test_time_epoch_ms_monotonic() {
-  z::time::epoch_ms; local a=$REPLY
-  z::time::epoch_ms; local b=$REPLY
+  z::get::epoch_ms; local a=$REPLY
+  z::get::epoch_ms; local b=$REPLY
   (( b >= a )) || ztest::fail "epoch_ms went backwards: a=$a b=$b"
 }
 
 test_time_epoch_ns_more_digits_than_ms() {
-  z::time::epoch_ms; local ms_len=${#REPLY}
-  z::time::epoch_ns; local ns_len=${#REPLY}
-  ztest::assert::eq 6 "$(( ns_len - ms_len ))" "ns should have 6 more digits than ms"
+  z::get::epoch_ms; local ms_len=${#REPLY}
+  z::get::epoch_ns; local ns_len=${#REPLY}
+  # EPOCHREALTIME fractional width varies by zsh build (6 µs vs 9+ ns digits).
+  (( ns_len > ms_len )) \
+    || ztest::fail "ns ($ns_len digits) should be longer than ms ($ms_len digits)"
+  (( ns_len - ms_len >= 3 )) \
+    || ztest::fail "ns should have at least 3 more digits than ms (got $(( ns_len - ms_len )))"
 }

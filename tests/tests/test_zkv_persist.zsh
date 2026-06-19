@@ -35,7 +35,7 @@ test_zkv_persist_load_rejects_future_version() {
 S|k|string|0|v
 EOF
   z::kv::open _ps_v
-  ztest::assert::returns $ZBASE_ERROR_GENERAL z::kv::load _ps_v "$tmp"
+  ztest::assert::returns $Z_ERR_GENERAL z::kv::load _ps_v "$tmp"
   z::kv::close _ps_v
   rm -f "$tmp"
 }

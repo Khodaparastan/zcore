@@ -68,7 +68,7 @@ test_zkv_tx_set_then_delete_in_same_tx() {
   z::kv::set _tx_test "k" "v"
   z::kv::del _tx_test "k"
   z::kv::commit _tx_test
-  ztest::assert::returns $ZBASE_ERROR_NOT_FOUND z::kv::get _tx_test "k"
+  ztest::assert::returns $Z_ERR_NOTFOUND z::kv::get _tx_test "k"
 }
 
 test_zkv_tx_delete_then_set_in_same_tx() {
