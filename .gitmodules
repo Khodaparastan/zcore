@@ -1,3 +1,4 @@
 [submodule "lib/zsh-log"]
 	path = lib/zsh-log
-	url = https://github.com/khodaparastan/zsh-log
+  url = https://github.com/khodaparastan/zsh-log
+  branch = main
