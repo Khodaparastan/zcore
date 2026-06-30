@@ -5,7 +5,7 @@
 #
 # Usage:       Sourced as part of the z-framework; not for direct CLI use.
 #
-# Requires:    z::cache, z::config, z::log (internal framework modules)
+# Requires:    z::cache, z::config, zlog (internal framework modules)
 #              tput (optional, fallback for terminal dimension detection)
 # =============================================================================
 
@@ -882,7 +882,7 @@ z::progress::show() {
   emulate -L zsh
 
   if [[ ${1-} != <-> || ${2-} != <-> ]]; then
-    z::log::debug "Invalid progress params: must be integers."
+    zlog::debug "Invalid progress params: must be integers."
     return 1
   fi
 
@@ -915,7 +915,7 @@ z::progress::show() {
         break
         ;;
       -*)
-        z::log::debug "Unknown progress flag: $1"
+        zlog::debug "Unknown progress flag: $1"
         return 1
         ;;
       *)
@@ -926,7 +926,7 @@ z::progress::show() {
   done
 
   if ((total <= 0 || current < 0 || current > total)); then
-    z::log::debug "Invalid progress range: $current/$total."
+    zlog::debug "Invalid progress range: $current/$total."
     return 1
   fi
 

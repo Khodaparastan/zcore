@@ -4,7 +4,7 @@
 
 (( ${+_Z_BASE_LOADED} )) && return 0
 
-if (( ! ${+functions[z::log::error]} )); then
+if (( ! ${+functions[zlog::error]} )); then
     print -u2 "zbase: fatal: zlog must be sourced before zbase"
     return 1 2>/dev/null || exit 1
 fi
@@ -177,7 +177,7 @@ z::ensure::set() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local name="${1:-}" context="${2:-Variable}"
     if [[ -z $name ]] || (( ! ${+parameters[$name]} )); then
-        z::log::error "${context} is not set" field "$context"
+        zlog::error "${context} is not set" field "$context"
         return 1
     fi
     return 0
@@ -187,7 +187,7 @@ z::ensure::nonempty() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local value="$1" field_name="${2:-Value}"
     if [[ -z $value ]]; then
-        z::log::error "${field_name} cannot be empty" field "$field_name"
+        zlog::error "${field_name} cannot be empty" field "$field_name"
         return 1
     fi
     return 0
@@ -197,10 +197,10 @@ z::ensure::identifier() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local name="$1" context="${2:-Identifier}"
     if [[ -z $name ]]; then
-        z::log::error "${context} cannot be empty" field "$context"; return 1
+        zlog::error "${context} cannot be empty" field "$context"; return 1
     fi
     if [[ $name != [[:alnum:]_-]## ]]; then
-        z::log::error "Invalid ${context}" field "$context" value "$name" \
+        zlog::error "Invalid ${context}" field "$context" value "$name" \
             allowed "alphanumeric, underscore, hyphen"
         return 1
     fi
@@ -211,10 +211,10 @@ z::ensure::varname() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local name="$1" context="${2:-Variable name}"
     if [[ -z $name ]]; then
-        z::log::error "${context} cannot be empty" field "$context"; return 1
+        zlog::error "${context} cannot be empty" field "$context"; return 1
     fi
     if [[ $name != [[:alpha:]_][[:alnum:]_]# ]]; then
-        z::log::error "Invalid ${context}" field "$context" value "$name" \
+        zlog::error "Invalid ${context}" field "$context" value "$name" \
             allowed "letter or underscore, then alphanumeric/underscore"
         return 1
     fi
@@ -225,7 +225,7 @@ z::ensure::int() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local value="$1" field_name="${2:-Value}"
     if [[ $value != (-[1-9][0-9]#|[0-9]|[1-9][0-9]#) ]]; then
-        z::log::error "${field_name} must be an integer" field "$field_name" value "$value"
+        zlog::error "${field_name} must be an integer" field "$field_name" value "$value"
         return 1
     fi
     return 0
@@ -241,11 +241,11 @@ z::ensure::int_range() {
     z::ensure::int "$value" "$field_name"      || return 1
     typeset -i min_val=$(( 10#$2 )) max_val=$(( 10#$3 )) int_value=$(( 10#$value ))
     if (( min_val > max_val )); then
-        z::log::error "Invalid range boundaries" field "$field_name" min "$min_val" max "$max_val"
+        zlog::error "Invalid range boundaries" field "$field_name" min "$min_val" max "$max_val"
         return 1
     fi
     if (( int_value < min_val || int_value > max_val )); then
-        z::log::error "${field_name} out of range" \
+        zlog::error "${field_name} out of range" \
             field "$field_name" value "$int_value" min "$min_val" max "$max_val"
         return 1
     fi
@@ -258,7 +258,7 @@ z::ensure::bool() {
     case "${value:l}" in
         0|1|true|false|yes|no|on|off) return 0 ;;
         *)
-            z::log::error "Invalid ${field_name}" field "$field_name" value "$value" \
+            zlog::error "Invalid ${field_name}" field "$field_name" value "$value" \
                 allowed "0, 1, true, false, yes, no, on, off"
             return 1 ;;
     esac
@@ -269,16 +269,16 @@ z::ensure::enum() {
     local allowed_values="$1" value="$2" field_name="${3:-Value}"
     local -a allowed_array
     if [[ -z $allowed_values ]]; then
-        z::log::error "z::ensure::enum: allowed_values required" param "allowed_values"; return 1
+        zlog::error "z::ensure::enum: allowed_values required" param "allowed_values"; return 1
     fi
     if [[ -z $value ]]; then
-        z::log::error "${field_name} cannot be empty" field "$field_name" allowed "$allowed_values"
+        zlog::error "${field_name} cannot be empty" field "$field_name" allowed "$allowed_values"
         return 1
     fi
     allowed_array=("${(@s:|:)allowed_values}")
     # M1 FIX: (re) = literal-string match. (r) would glob-match '*','a*',etc.
     [[ -n ${allowed_array[(re)$value]} ]] && return 0
-    z::log::error "Invalid ${field_name}" \
+    zlog::error "Invalid ${field_name}" \
         field "$field_name" value "$value" allowed "$allowed_values"
     return 1
 }
@@ -287,13 +287,13 @@ z::ensure::path() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local p="$1" path_type="${2:-any}" field_name="${3:-Path}"
     if [[ -z $p ]]; then
-        z::log::error "${field_name} cannot be empty" field "$field_name"; return 1
+        zlog::error "${field_name} cannot be empty" field "$field_name"; return 1
     fi
     case $path_type in
-        file) [[ -f $p ]] || { z::log::error "${field_name} not a regular file" field "$field_name" path "$p"; return 1; } ;;
-        dir)  [[ -d $p ]] || { z::log::error "${field_name} not a directory"   field "$field_name" path "$p"; return 1; } ;;
-        any)  [[ -e $p ]] || { z::log::error "${field_name} does not exist"     field "$field_name" path "$p"; return 1; } ;;
-        *)    z::log::error "z::ensure::path: invalid path_type" field "$field_name" path_type "$path_type" allowed "file, dir, any"; return 1 ;;
+        file) [[ -f $p ]] || { zlog::error "${field_name} not a regular file" field "$field_name" path "$p"; return 1; } ;;
+        dir)  [[ -d $p ]] || { zlog::error "${field_name} not a directory"   field "$field_name" path "$p"; return 1; } ;;
+        any)  [[ -e $p ]] || { zlog::error "${field_name} does not exist"     field "$field_name" path "$p"; return 1; } ;;
+        *)    zlog::error "z::ensure::path: invalid path_type" field "$field_name" path_type "$path_type" allowed "file, dir, any"; return 1 ;;
     esac
     return 0
 }
@@ -301,22 +301,22 @@ z::ensure::path() {
 z::ensure::path::readable() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local p="$1" field_name="${2:-Path}"
-    [[ -n $p ]] || { z::log::error "${field_name} cannot be empty" field "$field_name"; return 1; }
-    [[ -r $p ]] || { z::log::error "${field_name} is not readable" field "$field_name" path "$p"; return 1; }
+    [[ -n $p ]] || { zlog::error "${field_name} cannot be empty" field "$field_name"; return 1; }
+    [[ -r $p ]] || { zlog::error "${field_name} is not readable" field "$field_name" path "$p"; return 1; }
     return 0
 }
 
 z::ensure::path::writable() {
     emulate -L zsh; setopt extendedglob warncreateglobal typesetsilent
     local p="$1" field_name="${2:-Path}"
-    [[ -n $p ]] || { z::log::error "${field_name} cannot be empty" field "$field_name"; return 1; }
+    [[ -n $p ]] || { zlog::error "${field_name} cannot be empty" field "$field_name"; return 1; }
     if [[ -e $p ]]; then
-        [[ -w $p ]] || { z::log::error "${field_name} is not writable" field "$field_name" path "$p"; return 1; }
+        [[ -w $p ]] || { zlog::error "${field_name} is not writable" field "$field_name" path "$p"; return 1; }
     else
         local parent_dir="${p:h}"
         [[ $parent_dir == '.' ]] && parent_dir="$PWD"
         [[ -w $parent_dir ]] || {
-            z::log::error "${field_name} cannot be created: parent not writable" \
+            zlog::error "${field_name} cannot be created: parent not writable" \
                 field "$field_name" path "$p" parent_dir "$parent_dir"
             return 1
         }
@@ -327,17 +327,17 @@ z::ensure::path::writable() {
 z::ensure::cmd()  {
     emulate -L zsh
     z::ensure::nonempty "${1:-}" "cmd" || return $Z_ERR_INPUT
-    z::is::cmd "$1" || { z::log::error "Command not found" cmd "$1"; return $Z_ERR_NOTFOUND; }
+    z::is::cmd "$1" || { zlog::error "Command not found" cmd "$1"; return $Z_ERR_NOTFOUND; }
 }
 z::ensure::func() {
     emulate -L zsh
     z::ensure::nonempty "${1:-}" "func" || return $Z_ERR_INPUT
-    z::is::func "$1" || { z::log::warn "Function not found" func "$1"; return $Z_ERR_NOTFOUND; }
+    z::is::func "$1" || { zlog::warn "Function not found" func "$1"; return $Z_ERR_NOTFOUND; }
 }
 z::ensure::var()  {
     emulate -L zsh
     z::ensure::nonempty "${1:-}" "name" || return $Z_ERR_INPUT
-    z::is::var "$1" || { z::log::error "Variable not set" name "$1"; return $Z_ERR_NOTFOUND; }
+    z::is::var "$1" || { zlog::error "Variable not set" name "$1"; return $Z_ERR_NOTFOUND; }
 }
 
 ##############################################################################
@@ -353,14 +353,14 @@ z::get::opt() {
     local -A _opts
     REPLY="$default_value"; REPLY2=""; reply=()
     if [[ -z $opts_var ]]; then
-        z::log::error "z::get::opt: opts_var required" param "opts_var"; return $Z_ERR_INPUT
+        zlog::error "z::get::opt: opts_var required" param "opts_var"; return $Z_ERR_INPUT
     fi
     if [[ -z $short_opt && -z $long_opt ]]; then
-        z::log::warn "z::get::opt: both short/long empty; returning default" opts_var "$opts_var"
+        zlog::warn "z::get::opt: both short/long empty; returning default" opts_var "$opts_var"
         return 0
     fi
     if ! z::is::assoc "$opts_var"; then
-        z::log::debug "z::get::opt: not an assoc array" opts_var "$opts_var"
+        zlog::debug "z::get::opt: not an assoc array" opts_var "$opts_var"
         return 0
     fi
     _opts=( "${(@kvP)opts_var}" )
@@ -369,9 +369,9 @@ z::get::opt() {
     elif [[ -n $long_opt && -n ${_opts[--$long_opt]+x} ]]; then
         REPLY="${_opts[--$long_opt]}"; matched=1
     fi
-    if z::log::if_debug; then
+    if zlog::if_debug; then
         local _saved="$REPLY"
-        z::log::debug "z::get::opt resolved" opts_var "$opts_var" \
+        zlog::debug "z::get::opt resolved" opts_var "$opts_var" \
             short_opt "${short_opt:--}" long_opt "${long_opt:--}" matched "$matched"
         REPLY="$_saved"
     fi
@@ -390,13 +390,13 @@ z::get::flag() {
     local opts_var="$1" short_flag="$2" long_flag="$3"
     local raw_default="${4:-0}" caller_name="${5:-z::get::flag}"
     if [[ $raw_default != 0 && $raw_default != 1 ]]; then
-        z::log::warn "${caller_name}: default must be 0 or 1, got '${raw_default}'; using 0" \
+        zlog::warn "${caller_name}: default must be 0 or 1, got '${raw_default}'; using 0" \
             caller "$caller_name" default "$raw_default"
         raw_default=0
     fi
     typeset -i flag_val=$raw_default
     if [[ -z $opts_var ]]; then
-        z::log::error "${caller_name}: opts_var required" param "opts_var"
+        zlog::error "${caller_name}: opts_var required" param "opts_var"
         REPLY=$flag_val; return $Z_ERR_INPUT
     fi
     z::is::opt "$opts_var" "$short_flag" "$long_flag" && flag_val=1
@@ -432,7 +432,7 @@ z::get::cmd() {
     elif (( ${+builtins[$cmd]}  )); then REPLY2="builtin";  REPLY="$cmd"
     elif (( ${+commands[$cmd]}  )); then REPLY2="external"; REPLY="${commands[$cmd]}"
     else
-        z::log::error "Command not found" cmd "$cmd"; return $Z_ERR_NOTFOUND
+        zlog::error "Command not found" cmd "$cmd"; return $Z_ERR_NOTFOUND
     fi
     return 0
 }
@@ -443,7 +443,7 @@ z::get::funcs() {
     local pattern="${1:-*}"
     REPLY=""; REPLY2=""; reply=()
     if [[ -z ${1:-} && $# -gt 0 ]]; then
-        z::log::once "get-funcs-empty-pattern" warn \
+        zlog::once "get-funcs-empty-pattern" warn \
             "z::get::funcs: empty pattern, defaulting to '*'"
     fi
     reply=("${(ko)functions[(I)$pattern]}")
@@ -492,7 +492,7 @@ z::get::realpath() {
     local p="${1:-}"
     REPLY=""; REPLY2=""; reply=()
     if [[ -z $p || $p == [[:space:]]# ]]; then
-        z::log::error "z::get::realpath: empty path"; return $Z_ERR_INPUT
+        zlog::error "z::get::realpath: empty path"; return $Z_ERR_INPUT
     fi
     z::get::abspath "$p"
     local current_path="$REPLY"
@@ -502,12 +502,12 @@ z::get::realpath() {
         while [[ -L $current_path ]]; do
             (( iter += 1 ))
             if (( iter > _Z_FILE_SYMLINK_MAX_ITER )); then
-                z::log::warn "z::get::realpath: max symlink iterations" \
+                zlog::warn "z::get::realpath: max symlink iterations" \
                     path "$current_path" max "$_Z_FILE_SYMLINK_MAX_ITER"
                 REPLY="$current_path"; return $Z_ERR_GENERAL
             fi
             if (( ${+visited[$current_path]} )); then
-                z::log::warn "z::get::realpath: symlink cycle" path "$current_path"
+                zlog::warn "z::get::realpath: symlink cycle" path "$current_path"
                 REPLY="$current_path"; return $Z_ERR_GENERAL
             fi
             visited[$current_path]=1
@@ -529,7 +529,7 @@ z::set::var() {
     local name="${1:-}" value="${2:-}"
     z::ensure::varname "$name" "name" || return $Z_ERR_INPUT
     typeset -g -- "${name}=${value}"
-    z::log::if_debug && z::log::debug "Variable set" name "$name"
+    zlog::if_debug && zlog::debug "Variable set" name "$name"
     return 0
 }
 
@@ -538,7 +538,7 @@ z::set::export() {
     local name="${1:-}" value="${2:-}"
     z::ensure::varname "$name" "name" || return $Z_ERR_INPUT
     typeset -gx -- "${name}=${value}"
-    z::log::if_debug && z::log::debug "Variable exported" name "$name"
+    zlog::if_debug && zlog::debug "Variable exported" name "$name"
     return 0
 }
 
@@ -548,13 +548,13 @@ z::set::unset_var() {
     z::ensure::nonempty "$target" "name" || return $Z_ERR_INPUT
     (( ${+parameters[$target]} )) || return $Z_ERR_NOTFOUND
     if [[ ${(tP)target} == *readonly* ]]; then
-        z::log::error "Cannot unset readonly variable" name "$target"; return $Z_ERR_PERM
+        zlog::error "Cannot unset readonly variable" name "$target"; return $Z_ERR_PERM
     fi
     if unset -v -- "$target"; then
-        z::log::if_debug && z::log::debug "Variable unset" name "$target"
+        zlog::if_debug && zlog::debug "Variable unset" name "$target"
         return 0
     fi
-    z::log::error "Failed to unset variable" name "$target"; return $Z_ERR_GENERAL
+    zlog::error "Failed to unset variable" name "$target"; return $Z_ERR_GENERAL
 }
 
 z::set::unset_func() {
@@ -563,10 +563,10 @@ z::set::unset_func() {
     z::ensure::nonempty "$target" "func" || return $Z_ERR_INPUT
     (( ${+functions[$target]} )) || return $Z_ERR_NOTFOUND
     if unfunction -- "$target"; then
-        z::log::if_debug && z::log::debug "Function unset" func "$target"
+        zlog::if_debug && zlog::debug "Function unset" func "$target"
         return 0
     fi
-    z::log::error "Failed to unset function" func "$target"; return $Z_ERR_GENERAL
+    zlog::error "Failed to unset function" func "$target"; return $Z_ERR_GENERAL
 }
 
 z::set::alias() {
@@ -575,13 +575,13 @@ z::set::alias() {
     z::ensure::nonempty "$alias_name"  "alias_name"  || return $Z_ERR_INPUT
     z::ensure::nonempty "$alias_value" "alias_value" || return $Z_ERR_INPUT
     if [[ $alias_name == *[[:space:]=]* ]]; then
-        z::log::error "Invalid alias name: spaces or equals" name "$alias_name"; return $Z_ERR_INPUT
+        zlog::error "Invalid alias name: spaces or equals" name "$alias_name"; return $Z_ERR_INPUT
     fi
     aliases[$alias_name]="$alias_value"
     if [[ ${aliases[$alias_name]} != "$alias_value" ]]; then
-        z::log::error "Alias not registered" name "$alias_name"; return $Z_ERR_GENERAL
+        zlog::error "Alias not registered" name "$alias_name"; return $Z_ERR_GENERAL
     fi
-    z::log::if_debug && z::log::debug "Alias created" name "$alias_name" value "$alias_value"
+    zlog::if_debug && zlog::debug "Alias created" name "$alias_name" value "$alias_value"
     return 0
 }
 
@@ -590,13 +590,13 @@ z::set::unalias() {
     local alias_name="${1:-}"
     z::ensure::nonempty "$alias_name" "alias_name" || return $Z_ERR_INPUT
     if ! (( ${+aliases[$alias_name]} )); then
-        z::log::if_debug && z::log::debug "Alias not found" name "$alias_name"
+        zlog::if_debug && zlog::debug "Alias not found" name "$alias_name"
         return $Z_ERR_NOTFOUND
     fi
     if ! unset "aliases[$alias_name]"; then
-        z::log::error "Failed to remove alias" name "$alias_name"; return $Z_ERR_GENERAL
+        zlog::error "Failed to remove alias" name "$alias_name"; return $Z_ERR_GENERAL
     fi
-    z::log::if_debug && z::log::debug "Alias removed" name "$alias_name"
+    zlog::if_debug && zlog::debug "Alias removed" name "$alias_name"
     return 0
 }
 
@@ -607,11 +607,11 @@ z::set::path::add() {
     z::ensure::enum "prepend|append" "$position" "position" || return $Z_ERR_INPUT
     z::get::abspath "$dir"; dir="$REPLY"
     if [[ ! -d $dir ]]; then
-        z::log::debug "Directory missing, skipping PATH add" dir "$dir"; return $Z_ERR_NOTFOUND
+        zlog::debug "Directory missing, skipping PATH add" dir "$dir"; return $Z_ERR_NOTFOUND
     fi
     # M2 FIX: literal index match (Ie), not pattern.
     if (( ${path[(Ie)$dir]} )); then
-        z::log::once "path-has-${dir//[^[:alnum:]]/_}" debug "Already in PATH" dir "$dir"
+        zlog::once "path-has-${dir//[^[:alnum:]]/_}" debug "Already in PATH" dir "$dir"
         return 0
     fi
     case $position in
@@ -619,7 +619,7 @@ z::set::path::add() {
         append)  path+=("$dir") ;;
     esac
     builtin hash -r 2>/dev/null
-    z::log::debug "Added to PATH" dir "$dir" position "$position"
+    zlog::debug "Added to PATH" dir "$dir" position "$position"
     return 0
 }
 
@@ -633,7 +633,7 @@ z::set::path::del() {
     for p in "${path[@]}"; do [[ $p == $dir ]] || kept+=("$p"); done
     path=("${kept[@]}")
     builtin hash -r 2>/dev/null
-    z::log::debug "Removed from PATH" dir "$dir"
+    zlog::debug "Removed from PATH" dir "$dir"
     return 0
 }
 
@@ -647,24 +647,24 @@ z::do::call() {
     z::ensure::nonempty "$func" "func" || return $Z_ERR_INPUT
     shift
     if ! z::is::func "$func"; then
-        z::log::warn "Function not found" func "$func"; return $Z_ERR_NOTFOUND
+        zlog::warn "Function not found" func "$func"; return $Z_ERR_NOTFOUND
     fi
     typeset -i exit_code=0 _is_debug=0
     local _bench_timer="" _call_ctx=""
-    z::log::if_debug && _is_debug=1
+    zlog::if_debug && _is_debug=1
     if (( _is_debug )); then
-        z::log::with_context "func" "$func"; _call_ctx="$REPLY"
-        z::log::benchmark_start "z::do::call:${func}"; _bench_timer="$REPLY"
+        zlog::with_context "func" "$func"; _call_ctx="$REPLY"
+        zlog::benchmark_start "z::do::call:${func}"; _bench_timer="$REPLY"
         [[ -n $_call_ctx ]] && ${_call_ctx}::debug "Calling function" argc "$#"
     fi
     {
         "$func" "$@" || exit_code=$?
     } always {
         if (( _is_debug )); then
-            [[ -n $_bench_timer ]] && z::log::benchmark_end "$_bench_timer"
+            [[ -n $_bench_timer ]] && zlog::benchmark_end "$_bench_timer"
             (( exit_code != 0 )) && [[ -n $_call_ctx ]] && \
                 ${_call_ctx}::debug "Function returned non-zero" exit_code "$exit_code"
-            [[ -n $_call_ctx ]] && z::log::remove_context "$_call_ctx"
+            [[ -n $_call_ctx ]] && zlog::remove_context "$_call_ctx"
         fi
     }
     return $exit_code
@@ -676,19 +676,19 @@ _z::do::source::resolve_readable() {
     typeset -i rc=0
     typeset -g REPLY="" REPLY2=""; typeset -ga reply=()
     if [[ -z $file ]]; then
-        z::log::error "z::do::source: file path required"; return $Z_ERR_INPUT
+        zlog::error "z::do::source: file path required"; return $Z_ERR_INPUT
     fi
     z::get::abspath "$file"; resolved="$REPLY"
     if (( ! _Z_PERF_MODE )); then
         z::get::realpath "$resolved"; rc=$?
         if (( rc != 0 )); then
-            z::log::error "z::do::source: failed to resolve" path "$file" error_code "$rc"
+            zlog::error "z::do::source: failed to resolve" path "$file" error_code "$rc"
             return $rc
         fi
         resolved="$REPLY"
     fi
     if [[ ! -f $resolved || ! -r $resolved ]]; then
-        z::log::warn "z::do::source: not readable" path "$resolved"; return $Z_ERR_NOTFOUND
+        zlog::warn "z::do::source: not readable" path "$resolved"; return $Z_ERR_NOTFOUND
     fi
     REPLY="$resolved"
     return 0
@@ -702,8 +702,8 @@ z::do::source() {
     _z::do::source::resolve_readable "$file" || return $?
     resolved="$REPLY"
     local _src_timer=""
-    if z::log::if_debug; then
-        z::log::benchmark_start "z::do::source:${resolved:t}"; _src_timer="$REPLY"
+    if zlog::if_debug; then
+        zlog::benchmark_start "z::do::source:${resolved:t}"; _src_timer="$REPLY"
     fi
     if (( use_global_scope )); then
         builtin source "$resolved" "$@" || exit_code=$?
@@ -711,8 +711,8 @@ z::do::source() {
         emulate -L zsh
         builtin source "$resolved" "$@" || exit_code=$?
     fi
-    [[ -n $_src_timer ]] && z::log::benchmark_end "$_src_timer"
-    (( exit_code != 0 )) && z::log::warn "z::do::source: failed" path "$resolved" exit_code "$exit_code"
+    [[ -n $_src_timer ]] && zlog::benchmark_end "$_src_timer"
+    (( exit_code != 0 )) && zlog::warn "z::do::source: failed" path "$resolved" exit_code "$exit_code"
     return $exit_code
 }
 
@@ -756,7 +756,7 @@ _z::do::scan::check_segment() {
     local cmd_base="${cmd:t}"
     case "$cmd_base" in
         sh|bash|zsh|ksh|dash)
-            z::log::always "SECURITY: Direct shell invocation in scanned input" shell "$cmd_base"
+            zlog::always "SECURITY: Direct shell invocation in scanned input" shell "$cmd_base"
             return 1 ;;
     esac
     if [[ $cmd_base == rm ]]; then
@@ -782,7 +782,7 @@ _z::do::scan::check_segment() {
             esac
         done
         if (( have_r && dpc > 0 && (have_f || have_npr) )); then
-            z::log::always "SECURITY: Dangerous rm detected" cmd "rm" path "$first_dp"; return 1
+            zlog::always "SECURITY: Dangerous rm detected" cmd "rm" path "$first_dp"; return 1
         fi
     fi
     if [[ $cmd_base == dd ]]; then
@@ -792,7 +792,7 @@ _z::do::scan::check_segment() {
                 dev="${kv#of=}"; base="${dev#/dev/}"
                 case $base in
                     sd*|hd*|nvme*|disk*|rdisk*)
-                        z::log::always "SECURITY: Dangerous dd detected" cmd "dd" device "$dev"; return 1 ;;
+                        zlog::always "SECURITY: Dangerous dd detected" cmd "dd" device "$dev"; return 1 ;;
                 esac
             fi
         done
@@ -885,7 +885,7 @@ _z::do::scan::patterns() {
     words=("${(s: :)input}")
     (( ${#words} == 0 )) && return 0
     if [[ $input =~ $_Z_EXEC_FORKBOMB_RE_1 && $input =~ $_Z_EXEC_FORKBOMB_RE_2 ]]; then
-        z::log::always "SECURITY: fork bomb detected" input "$input"; return 1
+        zlog::always "SECURITY: fork bomb detected" input "$input"; return 1
     fi
     seg=()
     for w in "${words[@]}"; do
@@ -929,38 +929,38 @@ z::do::run() {
     local input="${1:-}"
     typeset -i timeout=$_Z_EXEC_TIMEOUT_DEFAULT exit_code=0
     if [[ -z $input ]]; then
-        z::log::error "z::do::run: command required"; return $Z_ERR_INPUT
+        zlog::error "z::do::run: command required"; return $Z_ERR_INPUT
     fi
     if [[ -n ${2:-} ]]; then
         if [[ ${2:-} != <-> ]]; then
-            z::log::error "z::do::run: timeout must be a non-negative integer" timeout "${2:-}"
+            zlog::error "z::do::run: timeout must be a non-negative integer" timeout "${2:-}"
             return $Z_ERR_INPUT
         fi
         timeout=$(( 10#${2} ))
         if (( timeout > _Z_EXEC_TIMEOUT_MAX )); then
-            z::log::error "z::do::run: timeout exceeds max" timeout "$timeout" max "$_Z_EXEC_TIMEOUT_MAX"
+            zlog::error "z::do::run: timeout exceeds max" timeout "$timeout" max "$_Z_EXEC_TIMEOUT_MAX"
             return $Z_ERR_INPUT
         fi
     fi
     if ! _z::do::run::is_init_cmd "$input"; then
         if _z::do::run::has_metachars "$input"; then
-            z::log::error "z::do::run: rejected dangerous metacharacters" input "$input"
+            zlog::error "z::do::run: rejected dangerous metacharacters" input "$input"
             return $Z_ERR_PERM
         fi
     fi
     _z::do::scan::patterns "$input" || return $?
     if (( timeout > 0 )) && [[ -n $_Z_EXEC_TIMEOUT_CMD ]]; then
         "$_Z_EXEC_TIMEOUT_CMD" "$timeout" zsh -o pipefail -c "$input" || exit_code=$?
-        (( exit_code == 124 )) && z::log::warn "z::do::run: timeout after ${timeout}s" cmd "$input"
+        (( exit_code == 124 )) && zlog::warn "z::do::run: timeout after ${timeout}s" cmd "$input"
     else
         if (( timeout > 0 )) && [[ -z $_Z_EXEC_TIMEOUT_CMD ]]; then
-            z::log::once "zbase-no-timeout-cmd" debug \
+            zlog::once "zbase-no-timeout-cmd" debug \
                 "z::do::run: no timeout binary; running without enforcement"
         fi
         zsh -o pipefail -c "$input" || exit_code=$?
     fi
     (( exit_code != 0 && exit_code != 124 )) && \
-        z::log::warn "z::do::run: command failed" exit_code "$exit_code" cmd "$input"
+        zlog::warn "z::do::run: command failed" exit_code "$exit_code" cmd "$input"
     return $exit_code
 }
 
@@ -968,20 +968,20 @@ _z::do::hook::eval_trusted() {
     local input="${1:-}" label="${2:-unknown}"
     typeset -i exit_code=0
     if [[ -z $input ]]; then
-        z::log::error "_z::do::hook::eval_trusted: input required"; return $Z_ERR_INPUT
+        zlog::error "_z::do::hook::eval_trusted: input required"; return $Z_ERR_INPUT
     fi
     # Intentional trust boundary: runs in live caller shell, not under emulate.
     local _ctx=""
-    if z::log::if_debug; then
-        z::log::with_context "trusted_eval" "$label"; _ctx="$REPLY"
+    if zlog::if_debug; then
+        zlog::with_context "trusted_eval" "$label"; _ctx="$REPLY"
         [[ -n $_ctx ]] && ${_ctx}::debug "Trusted eval in current shell"
     fi
     builtin eval -- "$input" || exit_code=$?
     if (( exit_code != 0 )); then
         if [[ -n $_ctx ]]; then ${_ctx}::warn "Trusted eval failed" exit_code "$exit_code"
-        else z::log::warn "Trusted eval failed" label "$label" exit_code "$exit_code"; fi
+        else zlog::warn "Trusted eval failed" label "$label" exit_code "$exit_code"; fi
     fi
-    [[ -n $_ctx ]] && z::log::remove_context "$_ctx"
+    [[ -n $_ctx ]] && zlog::remove_context "$_ctx"
     return $exit_code
 }
 
@@ -1001,11 +1001,11 @@ z::do::run_async() {
     local cmd="${1:-}" callback="${2:-}" job_id
     REPLY=""; REPLY2=""; reply=()
     if [[ -z $cmd ]]; then
-        z::log::error "z::do::run_async: command required"; return $Z_ERR_INPUT
+        zlog::error "z::do::run_async: command required"; return $Z_ERR_INPUT
     fi
     _z::do::run_async::prune
     if (( ${#_Z_EXEC_ASYNC_PIDS} >= _Z_EXEC_ASYNC_MAX_PIDS )); then
-        z::log::error "z::do::run_async: PID cap reached; call z::do::wait first" \
+        zlog::error "z::do::run_async: PID cap reached; call z::do::wait first" \
             pending "${#_Z_EXEC_ASYNC_PIDS}" max "$_Z_EXEC_ASYNC_MAX_PIDS"
         return $Z_ERR_GENERAL
     fi
@@ -1015,13 +1015,13 @@ z::do::run_async() {
         result=$(z::do::run "$cmd" 2>&1); exit_code=$?
         if [[ -n $callback ]] && z::is::func "$callback"; then
             "$callback" "$exit_code" "$result"
-        elif (( exit_code != 0 )) && z::log::if_debug; then
-            z::log::debug "z::do::run_async: job failed, no callback" exit_code "$exit_code" cmd "$cmd"
+        elif (( exit_code != 0 )) && zlog::if_debug; then
+            zlog::debug "z::do::run_async: job failed, no callback" exit_code "$exit_code" cmd "$cmd"
         fi
     } &
     job_id=$!
     _Z_EXEC_ASYNC_PIDS+=("$job_id")
-    z::log::if_debug && z::log::debug "z::do::run_async: launched" pid "$job_id" cmd "$cmd"
+    zlog::if_debug && zlog::debug "z::do::run_async: launched" pid "$job_id" cmd "$cmd"
     REPLY="$job_id"
     return 0
 }
@@ -1046,7 +1046,7 @@ z::do::hook() {
     local init_code init_label cache cache_key tool_path tmp
     typeset -i tool_rc=0
     if ! z::is::cmd "$tool_name"; then
-        z::log::debug "${tool_name} not found, skipping hook"; return 0
+        zlog::debug "${tool_name} not found, skipping hook"; return 0
     fi
     init_label="${tool_name} ${subcommand} ${shell_arg}"
     cache_key="${tool_name}__${subcommand}__${shell_arg}"
@@ -1054,45 +1054,45 @@ z::do::hook() {
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/zsh/hooks/${cache_key}.zsh"
     tool_path="${commands[$tool_name]}"
     local _hook_timer=""
-    if z::log::if_debug; then
-        z::log::benchmark_start "z::do::hook:${tool_name}"; _hook_timer="$REPLY"
+    if zlog::if_debug; then
+        zlog::benchmark_start "z::do::hook:${tool_name}"; _hook_timer="$REPLY"
     fi
     # M4: when tool is external, invalidate on binary mtime; otherwise trust cache.
     if [[ -s "$cache" && ( -z "$tool_path" || ! "$tool_path" -nt "$cache" ) ]]; then
         if builtin source "$cache" 2>/dev/null; then
-            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
-            z::log::debug "${tool_name} initialized from cache" label "$init_label"
+            [[ -n $_hook_timer ]] && zlog::benchmark_end "$_hook_timer"
+            zlog::debug "${tool_name} initialized from cache" label "$init_label"
             return 0
         fi
-        z::log::debug "${tool_name} cache invalid, regenerating" label "$init_label"
+        zlog::debug "${tool_name} cache invalid, regenerating" label "$init_label"
     fi
     init_code=$("$tool_name" "$subcommand" "$shell_arg" 2>/dev/null); tool_rc=$?
     if [[ -n $init_code ]]; then
-        (( tool_rc != 0 )) && z::log::debug "${tool_name} non-zero but produced output" \
+        (( tool_rc != 0 )) && zlog::debug "${tool_name} non-zero but produced output" \
             label "$init_label" exit_code "$tool_rc"
         # M4 FIX: atomic write (temp + rename), 0700 dir.
         command mkdir -p -m 700 -- "${cache:h}" 2>/dev/null
         tmp="${cache}.$$"
         if print -r -- "$init_code" > "$tmp" 2>/dev/null && command mv -f -- "$tmp" "$cache" 2>/dev/null; then
             if builtin source "$cache" 2>/dev/null; then
-                [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
-                z::log::debug "${tool_name} initialized" label "$init_label"
+                [[ -n $_hook_timer ]] && zlog::benchmark_end "$_hook_timer"
+                zlog::debug "${tool_name} initialized" label "$init_label"
                 return 0
             fi
         else
             command rm -f -- "$tmp" 2>/dev/null
         fi
         if _z::do::hook::eval_trusted "$init_code" "$init_label"; then
-            [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
-            z::log::debug "${tool_name} initialized (cache write failed)" label "$init_label"
+            [[ -n $_hook_timer ]] && zlog::benchmark_end "$_hook_timer"
+            zlog::debug "${tool_name} initialized (cache write failed)" label "$init_label"
             return 0
         fi
-        [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
-        z::log::warn "Failed to initialize ${tool_name}" label "$init_label"
+        [[ -n $_hook_timer ]] && zlog::benchmark_end "$_hook_timer"
+        zlog::warn "Failed to initialize ${tool_name}" label "$init_label"
         return $Z_ERR_GENERAL
     fi
-    [[ -n $_hook_timer ]] && z::log::benchmark_end "$_hook_timer"
-    z::log::debug "${tool_name} produced no init output" label "$init_label" exit_code "$tool_rc"
+    [[ -n $_hook_timer ]] && zlog::benchmark_end "$_hook_timer"
+    zlog::debug "${tool_name} produced no init output" label "$init_label" exit_code "$tool_rc"
     return 0
 }
 
@@ -1100,14 +1100,14 @@ z::do::hook() {
 # Load tail
 ##############################################################################
 
-if (( ! _Z_PERF_MODE )) && z::log::if_debug; then
+if (( ! _Z_PERF_MODE )) && zlog::if_debug; then
     local _fn
     for _fn in z::get::epoch z::get::var z::get::cmd z::get::realpath; do
-        (( ${+functions[$_fn]} )) || z::log::warn "zbase: missing get:: surface" fn "$_fn"
+        (( ${+functions[$_fn]} )) || zlog::warn "zbase: missing get:: surface" fn "$_fn"
     done
 fi
 
-z::log::once "zbase-loaded" info "zbase loaded" \
+zlog::once "zbase-loaded" info "zbase loaded" \
     module      "zbase" \
     version     "$_Z_BASE_VERSION" \
     pid         "$$" \

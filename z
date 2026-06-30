@@ -39,7 +39,7 @@ typeset -gr ZCORE_VERSION="0.5.0"
 # RUNTIME DEPENDENCY CHECKS
 # ---------------------------------------------------------------------------
 # `return` works in a sourced context; fall back to `exit` when executed.
-if (( ! ${+functions[z::log::info]} )); then
+if (( ! ${+functions[zlog::info]} )); then
   print -u2 "z: fatal: zlog must be sourced before z"; return 1 2>/dev/null || exit 1
 fi
 if (( ! ${+functions[z::ensure::nonempty]} )); then
@@ -117,7 +117,7 @@ z::debug::profile_start() {
   local operation="${1:-operation}"
   z::kv::open profiling 2>/dev/null || return $Z_ERR_GENERAL
   z::kv::set profiling "${operation}.start" "${EPOCHREALTIME:-0}"
-  z::log::debug "[Profiler]" "Profiling instance initiated for operation:" "$operation"
+  zlog::debug "[Profiler]" "Profiling instance initiated for operation:" "$operation"
   return 0
 }
 
@@ -130,7 +130,7 @@ z::debug::profile_end() {
   local -F start end duration
 
   if ! z::kv::get profiling "${operation}.start" 2>/dev/null; then
-    z::log::warn "[Profiler]" "No start time recorded for operation:" "$operation"
+    zlog::warn "[Profiler]" "No start time recorded for operation:" "$operation"
     return $Z_ERR_NOTFOUND
   fi
   start=$REPLY
@@ -139,7 +139,7 @@ z::debug::profile_end() {
 
   z::kv::set profiling "${operation}.end" "$end"
   z::kv::set profiling "${operation}.duration" "$duration"
-  z::log::debug "[Profiler]" "Profiling for operation:" "$operation" \
+  zlog::debug "[Profiler]" "Profiling for operation:" "$operation" \
     "finished in:" "$(printf '%.3f' "$duration")s"
 
   # Emit a profiling event only when the bus subsystem is active.
@@ -188,7 +188,7 @@ __z::cache::check_ttl() {
   (( current_time = ${EPOCHSECONDS:-$(date +%s)} ))
 
   if (( current_time >= expire_time )); then
-    z::log::debug "Cache expired: $key"
+    zlog::debug "Cache expired: $key"
     unset "_zcore_cache_store[$key]"
     unset "_zcore_cache_ttl[$key]"
 
@@ -211,7 +211,7 @@ z::cache::set() {
   shift 2
 
   if [[ -z $key ]]; then
-    z::log::error "Cache key required"
+    zlog::error "Cache key required"
     return $Z_ERR_INPUT
   fi
 
@@ -224,7 +224,7 @@ z::cache::set() {
           (( ttl = 10#${2} ))
           shift 2
         else
-          z::log::error "Invalid TTL: ${2:-}"
+          zlog::error "Invalid TTL: ${2:-}"
           return $Z_ERR_INPUT
         fi
         ;;
@@ -250,7 +250,7 @@ z::cache::set() {
   (( writes = ${_zcore_cache_stats[${namespace}.writes]:-0} + 1 ))
   _zcore_cache_stats[${namespace}.writes]=$writes
 
-  z::log::debug "Cache set: $key (ttl: ${ttl}s)"
+  zlog::debug "Cache set: $key (ttl: ${ttl}s)"
 
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:set" "$key" "$value" || true
@@ -263,7 +263,7 @@ z::cache::get() {
   local key="${1:-}"
 
   if [[ -z $key ]]; then
-    z::log::error "Cache key required"
+    zlog::error "Cache key required"
     return $Z_ERR_INPUT
   fi
 
@@ -313,7 +313,7 @@ z::cache::del() {
   unset "_zcore_cache_store[$key]"
   unset "_zcore_cache_ttl[$key]"
 
-  z::log::debug "Cache deleted: $key"
+  zlog::debug "Cache deleted: $key"
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:delete" "$key" || true
   fi
@@ -342,7 +342,7 @@ z::cache::clear() {
     fi
   done
 
-  z::log::debug "Cache cleared: $cleared entries"
+  zlog::debug "Cache cleared: $cleared entries"
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "cache:cleared" "$pattern" "$cleared" || true
   fi
@@ -403,7 +403,7 @@ z::cache::memoize() {
   shift 3
 
   if [[ -z $cache_key || -z $func ]]; then
-    z::log::error "Cache key and function required"
+    zlog::error "Cache key and function required"
     return $Z_ERR_INPUT
   fi
 
@@ -415,7 +415,7 @@ z::cache::memoize() {
   fi
 
   if (( ! ${+functions[$func]} )); then
-    z::log::error "Function not found: $func"
+    zlog::error "Function not found: $func"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -458,7 +458,7 @@ __z::sys::handle_interrupt() {
   if (( _zcore_interrupted == 0 )); then
     (( _zcore_interrupted = 1 ))
     z::progress::clear
-    z::log::warn "Interrupt received. Gracefully shutting down..."
+    zlog::warn "Interrupt received. Gracefully shutting down..."
 
     if (( _zcore_subsys[bus] == 1 )); then
       z::event::emit "sys:interrupted"
@@ -471,7 +471,7 @@ z::sys::interrupted() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   if (( _zcore_interrupted )); then
-    z::log::info "Operation cancelled by user."
+    zlog::info "Operation cancelled by user."
     return $ZCORE_ERROR_INTERRUPTED
   fi
   return 0
@@ -486,7 +486,7 @@ z::sys::die() {
   (( exit_code = 10#${2:-$Z_ERR_GENERAL} ))
 
   z::progress::clear
-  z::log::error "FATAL (exit $exit_code): $message"
+  zlog::error "FATAL (exit $exit_code): $message"
 
   # Return in a sourced context, exit otherwise.
   if [[ -n $ZSH_EVAL_CONTEXT && $ZSH_EVAL_CONTEXT == *:file:* ]]; then
@@ -510,7 +510,7 @@ z::sys::platform() {
     (( IS_WSL     = $(z::cache::get "sys:is_wsl"     2>/dev/null) ))
     (( IS_TERMUX  = $(z::cache::get "sys:is_termux"  2>/dev/null) ))
     (( IS_UNKNOWN = $(z::cache::get "sys:is_unknown" 2>/dev/null) ))
-    z::log::debug "Platform (cached): $cached_platform"
+    zlog::debug "Platform (cached): $cached_platform"
     return 0
   fi
 
@@ -587,7 +587,7 @@ z::sys::platform() {
   z::cache::set "sys:is_termux" "$IS_TERMUX"
   z::cache::set "sys:is_unknown" "$IS_UNKNOWN"
 
-  z::log::debug "Platform: $platform_name"
+  zlog::debug "Platform: $platform_name"
 
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "sys:platform_detected" "$platform_name" 2>/dev/null || true
@@ -650,7 +650,7 @@ __z::config::init_defaults() {
     z::kv::set config "progress_style" "$ZCORE_PROGRESS_STYLE"
   fi
 
-  z::log::debug "Configuration defaults initialized"
+  zlog::debug "Configuration defaults initialized"
   return 0
 }
 
@@ -659,7 +659,7 @@ z::config::get() {
   local key="${1:-}"
 
   if [[ -z $key ]]; then
-    z::log::error "Config key required"
+    zlog::error "Config key required"
     return $Z_ERR_INPUT
   fi
 
@@ -673,7 +673,7 @@ z::config::set() {
   local value="${2:-}"
 
   if [[ -z $key ]]; then
-    z::log::error "Config key required"
+    zlog::error "Config key required"
     return $Z_ERR_INPUT
   fi
 
@@ -683,14 +683,14 @@ z::config::set() {
   case $key in
     *_mode|show_*|enable_*)
       if [[ $value != true && $value != false ]]; then
-        z::log::error "Boolean required for $key"
+        zlog::error "Boolean required for $key"
         return $Z_ERR_INPUT
       fi
       z::kv::set_bool config "${key}" "$value" || rc=$?
       ;;
     *_size|*_timeout|*_depth|*_threshold|*_interval|*_iterations|*_level)
       if [[ $value != <-> ]]; then
-        z::log::error "Integer required for $key"
+        zlog::error "Integer required for $key"
         return $Z_ERR_INPUT
       fi
       z::kv::set_int config "${key}" "$value" || rc=$?
@@ -704,7 +704,7 @@ z::config::set() {
     return $rc
   fi
 
-  z::log::debug "Config updated: $key = $value"
+  zlog::debug "Config updated: $key = $value"
 
   if (( _zcore_subsys[bus] == 1 )); then
     z::event::emit "config:changed" "$key" "$value" || true
@@ -719,7 +719,7 @@ z::config::watch() {
   local handler="${2:-}"
 
   if [[ -z $pattern || -z $handler ]]; then
-    z::log::error "Pattern and handler required"
+    zlog::error "Pattern and handler required"
     return $Z_ERR_INPUT
   fi
 
@@ -755,7 +755,7 @@ z::config::save() {
   local file="${1:-}"
 
   if [[ -z $file ]]; then
-    z::log::error "File path required"
+    zlog::error "File path required"
     return $Z_ERR_INPUT
   fi
 
@@ -779,7 +779,7 @@ z::config::save() {
     done
   } > "$file"
 
-  z::log::info "Configuration saved: $file"
+  zlog::info "Configuration saved: $file"
   return 0
 }
 
@@ -788,12 +788,12 @@ z::config::load() {
   local file="${1:-}"
 
   if [[ -z $file ]]; then
-    z::log::error "File path required"
+    zlog::error "File path required"
     return $Z_ERR_INPUT
   fi
 
   if [[ ! -f $file || ! -r $file ]]; then
-    z::log::error "Cannot read: $file"
+    zlog::error "Cannot read: $file"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -807,11 +807,11 @@ z::config::load() {
     if [[ $line =~ ^([^=]+)=(.*)$ ]]; then
       key="${match[1]}"
       value="${match[2]}"
-      z::config::set "$key" "$value" || z::log::warn "Failed: $key=$value"
+      z::config::set "$key" "$value" || zlog::warn "Failed: $key=$value"
     fi
   done < "$file"
 
-  z::log::info "Configuration loaded: $file"
+  zlog::info "Configuration loaded: $file"
   return 0
 }
 
@@ -880,7 +880,7 @@ fi
 _zcore_subsys[cache]=1
 
 if (( _zcore_subsys[bus] == 1 )); then
-  z::bus::init 2>/dev/null || z::log::warn "zbus init failed; event integration disabled"
+  z::bus::init 2>/dev/null || zlog::warn "zbus init failed; event integration disabled"
   z::event::emit "zcore:initialized" "$ZCORE_VERSION" 2>/dev/null || true
 fi
 
@@ -889,4 +889,4 @@ if [[ -o interactive ]] || [[ ${ZCORE_INSTALL_TRAPS:-} == true ]]; then
   trap '__z::sys::handle_interrupt' INT TERM
 fi
 
-z::log::info "zCore initialized .::. Cache $( (( _zcore_subsys[cache] == 1 )) && echo '✓' || echo '✗') | KV Store $( (( _zcore_subsys[kv] == 1 )) && echo '✓' || echo '✗') | Event Bus $( (( _zcore_subsys[bus] == 1 )) && echo '✓' || echo '✗')"
+zlog::info "zCore initialized .::. Cache $( (( _zcore_subsys[cache] == 1 )) && echo '✓' || echo '✗') | KV Store $( (( _zcore_subsys[kv] == 1 )) && echo '✓' || echo '✗') | Event Bus $( (( _zcore_subsys[bus] == 1 )) && echo '✓' || echo '✗')"

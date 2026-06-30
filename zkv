@@ -19,7 +19,7 @@
 # Private API:  _z::kv::*  /  _zkv_*
 #
 # Requires:
-#   zlog   — must be sourced before zkv (provides z::log::*)
+#   zlog   — must be sourced before zkv (provides zlog::*)
 #   zbase  — must be sourced before zkv (provides z::ensure::*, z::is::*)
 #
 # Constants exported:
@@ -33,7 +33,7 @@
 # -----------------------------------------------------------------------------
 
 # Verify zlog is loaded (required for all logging calls throughout this file).
-if (( ! ${+functions[z::log::info]} )); then
+if (( ! ${+functions[zlog::info]} )); then
   print -u2 "zkv: fatal: zlog must be sourced before zkv"
   return 1
 fi
@@ -82,9 +82,9 @@ typeset -gi _zkv_loaded=1
 # zsh/datetime provides $EPOCHSECONDS for cheap epoch reads without forking.
 zmodload zsh/datetime 2>/dev/null
 
-# If the module is unavailable, epoch calls fall back to z::log's timestamp.
+# If the module is unavailable, epoch calls fall back to zlog's timestamp.
 if (( ! ${+EPOCHSECONDS} )); then
-  z::log::warn "zkv: zsh/datetime unavailable — epoch timestamps use zlog fallback"
+  zlog::warn "zkv: zsh/datetime unavailable — epoch timestamps use zlog fallback"
 fi
 
 
@@ -195,7 +195,7 @@ _zkv_state_dirty() {
 
 # _z::kv::epoch
 # Sets REPLY to the current Unix epoch (integer seconds).
-# Prefers $EPOCHSECONDS (no fork); falls back to z::log::get_timestamp.
+# Prefers $EPOCHSECONDS (no fork); falls back to zlog::get_timestamp.
 _z::kv::epoch() {
   emulate -L zsh
   setopt typesetsilent
@@ -207,14 +207,14 @@ _z::kv::epoch() {
     return 0
   fi
 
-  z::log::get_timestamp epoch || {
+  zlog::get_timestamp epoch || {
     REPLY=""
     return $Z_ERR_GENERAL
   }
 
   # Sanity-check: the fallback must return a bare integer.
   if [[ ! $REPLY == <-> ]]; then
-    z::log::error "zkv: epoch timestamp unavailable" value "$REPLY"
+    zlog::error "zkv: epoch timestamp unavailable" value "$REPLY"
     REPLY=""
     return $Z_ERR_GENERAL
   fi
@@ -241,7 +241,7 @@ _z::kv::require_handle() {
   local h="${1:-}"
 
   if [[ -z $h ]] || (( ! ${+_zkv_handles[$h]} )); then
-    z::log::error "zkv: unknown store handle" handle "${h:-<empty>}"
+    zlog::error "zkv: unknown store handle" handle "${h:-<empty>}"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -255,7 +255,7 @@ _z::kv::validate_key() {
   local _vk_key="${1:-}" _vk_handle="${2:-}"
 
   if [[ -z $_vk_key ]]; then
-    z::log::error "zkv: empty key" handle "$_vk_handle"
+    zlog::error "zkv: empty key" handle "$_vk_handle"
     return $Z_ERR_INPUT
   fi
 
@@ -264,13 +264,13 @@ _z::kv::validate_key() {
   local _vk_max="$REPLY"
 
   if (( ${#_vk_key} > _vk_max )); then
-    z::log::error "zkv: key too long" \
+    zlog::error "zkv: key too long" \
       handle "$_vk_handle" length "${#_vk_key}" max "$_vk_max"
     return $Z_ERR_INPUT
   fi
 
   if [[ ! $_vk_key =~ '^[a-zA-Z0-9._:/-]+$' ]]; then
-    z::log::error "zkv: invalid key format (allowed: a-z A-Z 0-9 . _ : / -)" \
+    zlog::error "zkv: invalid key format (allowed: a-z A-Z 0-9 . _ : / -)" \
       handle "$_vk_handle" key "$_vk_key"
     return $Z_ERR_INPUT
   fi
@@ -293,7 +293,7 @@ _z::kv::require_string_key() {
   _struct="$REPLY"
 
   if [[ $_struct != "$_ZKV_STRUCT_STRING" ]]; then
-    z::log::error "zkv: operation only supports string keys" \
+    zlog::error "zkv: operation only supports string keys" \
       handle "$_handle" key "$_key" structure "$_struct"
     return $Z_ERR_PERM
   fi
@@ -438,7 +438,7 @@ _z::kv::reserve_type() {
     _rt_old_struct="$REPLY"
 
     if [[ $_rt_new_struct != $_rt_old_struct ]]; then
-      z::log::error "zkv: type collision" \
+      zlog::error "zkv: type collision" \
         handle "$_rt_handle" key "$_rt_key" \
         existing "$_rt_old_struct" requested "$_rt_new_struct"
       return $Z_ERR_PERM
@@ -457,7 +457,7 @@ _z::kv::reserve_type() {
     _rt_old_struct="$REPLY"
 
     if [[ $_rt_new_struct != $_rt_old_struct ]]; then
-      z::log::error "zkv: type collision" \
+      zlog::error "zkv: type collision" \
         handle "$_rt_handle" key "$_rt_key" \
         existing "$_rt_old_struct" requested "$_rt_new_struct"
       return $Z_ERR_PERM
@@ -516,7 +516,7 @@ _z::kv::check_ttl() {
   (( _ct_now < _ct_expire )) && return 0
 
   # Key has expired — log at a rate-limited debug level to avoid spam.
-  z::log::rate_limit "zkv-expire-${_ct_handle}" 20 60 debug \
+  zlog::rate_limit "zkv-expire-${_ct_handle}" 20 60 debug \
     "zkv: key expired" handle "$_ct_handle" key "$_ct_key"
 
   # Inside a transaction we cannot reap eagerly; caller treats return 1 as
@@ -620,13 +620,13 @@ _z::kv::trigger_watchers() {
           "$_tw_handler" "$_tw_handle" "$_tw_key" "$_tw_value" "$_tw_op" 2>/dev/null || _tw_rc=$?
 
           if (( _tw_rc != 0 )); then
-            z::log::rate_limit "zkv-watcher-fail-${_tw_handler}" 5 60 warn \
+            zlog::rate_limit "zkv-watcher-fail-${_tw_handler}" 5 60 warn \
               "zkv: watcher handler returned non-zero" \
               handler "$_tw_handler" key "$_tw_key" rc "$_tw_rc"
           fi
         else
           # Handler was unset after registration — warn once, not on every key event.
-          z::log::once "zkv-watcher-missing-${_tw_handler}" warn \
+          zlog::once "zkv-watcher-missing-${_tw_handler}" warn \
             "zkv: watcher handler no longer defined" \
             handler "$_tw_handler" pattern "$_tw_pattern"
         fi
@@ -806,7 +806,7 @@ z::kv::open() {
   REPLY="$name"
 
   if (( ${+_zkv_handles[$name]} )); then
-    z::log::debug "zkv: store already open" handle "$name"
+    zlog::debug "zkv: store already open" handle "$name"
     return 0
   fi
 
@@ -887,7 +887,7 @@ z::kv::open() {
         ;;
 
       *)
-        z::log::warn "zkv: unknown open option" option "$1"
+        zlog::warn "zkv: unknown open option" option "$1"
         shift
         ;;
     esac
@@ -895,7 +895,7 @@ z::kv::open() {
 
   _zkv_handles[$name]=1
 
-  z::log::debug "zkv: store opened" handle "$name"
+  zlog::debug "zkv: store opened" handle "$name"
 
   # Deferred: enable_persist validates the path and sets auto_persist=1.
   if [[ -n $auto_persist_file ]]; then
@@ -959,7 +959,7 @@ z::kv::close() {
   unset "_zkv_handles[$_cl_handle]"
   unset "_zkv_perf_mode[$_cl_handle]"
 
-  z::log::debug "zkv: store closed" handle "$_cl_handle"
+  zlog::debug "zkv: store closed" handle "$_cl_handle"
   return 0
 }
 
@@ -994,7 +994,7 @@ z::kv::set() {
   typeset -i _mvl="$REPLY"
 
   if (( ${#value} > _mvl )); then
-    z::log::error "zkv: value too long" \
+    zlog::error "zkv: value too long" \
       handle "$handle" key "$key" length "${#value}" max "$_mvl"
     return $Z_ERR_INPUT
   fi
@@ -1016,7 +1016,7 @@ z::kv::set() {
         ;;
 
       *)
-        z::log::warn "zkv: unknown set option" option "$1"
+        zlog::warn "zkv: unknown set option" option "$1"
         shift
         ;;
     esac
@@ -1028,7 +1028,7 @@ z::kv::set() {
   _vstruct="$REPLY"
 
   if [[ $_vstruct != $_ZKV_STRUCT_STRING ]]; then
-    z::log::error "zkv: z::kv::set only accepts string-category types" \
+    zlog::error "zkv: z::kv::set only accepts string-category types" \
       handle "$handle" type "$value_type"
     return $Z_ERR_INPUT
   fi
@@ -1061,7 +1061,7 @@ z::kv::set() {
     _z::kv::auto_persist "$handle"
   fi
 
-  z::log::debug "zkv: set" handle "$handle" key "$key" type "$value_type"
+  zlog::debug "zkv: set" handle "$handle" key "$key" type "$value_type"
   return 0
 }
 
@@ -1157,7 +1157,7 @@ z::kv::del() {
   fi
 
   if ! _zkv_ahas "_zkv_meta_${handle}" "$key"; then
-    z::log::debug "zkv: del key not found" handle "$handle" key "$key"
+    zlog::debug "zkv: del key not found" handle "$handle" key "$key"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -1182,7 +1182,7 @@ z::kv::del() {
   _z::kv::trigger_watchers "$handle" "$key" "$old_value" "del"
   _z::kv::auto_persist "$handle"
 
-  z::log::debug "zkv: deleted" handle "$handle" key "$key"
+  zlog::debug "zkv: deleted" handle "$handle" key "$key"
   return 0
 }
 
@@ -1493,7 +1493,7 @@ z::kv::expire() {
   z::ensure::int   "$ttl_raw" "ttl" || return $Z_ERR_INPUT
 
   if ! z::kv::exists "$handle" "$key"; then
-    z::log::error "zkv: cannot set TTL on non-existent key" handle "$handle" key "$key"
+    zlog::error "zkv: cannot set TTL on non-existent key" handle "$handle" key "$key"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -1518,7 +1518,7 @@ z::kv::expire() {
     _z::kv::auto_persist "$handle"
   fi
 
-  z::log::debug "zkv: TTL set" handle "$handle" key "$key" ttl "${ttl}s"
+  zlog::debug "zkv: TTL set" handle "$handle" key "$key" ttl "${ttl}s"
   return 0
 }
 
@@ -1535,7 +1535,7 @@ z::kv::persist() {
   _z::kv::validate_key   "$key" "$handle" || return $?
 
   if ! z::kv::exists "$handle" "$key"; then
-    z::log::error "zkv: cannot persist non-existent key" handle "$handle" key "$key"
+    zlog::error "zkv: cannot persist non-existent key" handle "$handle" key "$key"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -1559,7 +1559,7 @@ z::kv::mset() {
   _z::kv::require_handle "$handle" || return $?
 
   if (( $# % 2 != 0 )); then
-    z::log::error "zkv: mset requires even number of key-value arguments" received "$#"
+    zlog::error "zkv: mset requires even number of key-value arguments" received "$#"
     return $Z_ERR_INPUT
   fi
 
@@ -1622,7 +1622,7 @@ z::kv::clear() {
     z::kv::del "$handle" "$key" && (( deleted += 1 ))
   done
 
-  z::log::debug "zkv: cleared" handle "$handle" pattern "$pattern" count "$deleted"
+  zlog::debug "zkv: cleared" handle "$handle" pattern "$pattern" count "$deleted"
   return 0
 }
 
@@ -1672,7 +1672,7 @@ z::kv::setnx() {
   _z::kv::validate_key   "$key" "$handle" || return $?
 
   if z::kv::exists "$handle" "$key"; then
-    z::log::debug "zkv: setnx key exists" handle "$handle" key "$key"
+    zlog::debug "zkv: setnx key exists" handle "$handle" key "$key"
     return $Z_ERR_PERM
   fi
 
@@ -1716,7 +1716,7 @@ z::kv::cas() {
   fi
 
   if [[ $current != $expected ]]; then
-    z::log::debug "zkv: CAS failed" handle "$handle" key "$key"
+    zlog::debug "zkv: CAS failed" handle "$handle" key "$key"
     return $Z_ERR_PERM
   fi
 
@@ -1740,7 +1740,7 @@ z::kv::begin() {
   _z::kv::require_handle "$handle" || return $?
 
   if _zkv_tx_active "$handle"; then
-    z::log::error "zkv: already in transaction" handle "$handle"
+    zlog::error "zkv: already in transaction" handle "$handle"
     return $Z_ERR_PERM
   fi
 
@@ -1753,7 +1753,7 @@ z::kv::begin() {
 
   _zkv_aset "_zkv_tx_${handle}" active 1
 
-  z::log::debug "zkv: transaction started" handle "$handle"
+  zlog::debug "zkv: transaction started" handle "$handle"
   return 0
 }
 
@@ -1769,7 +1769,7 @@ z::kv::commit() {
   _z::kv::require_handle "$handle" || return $?
 
   if ! _zkv_tx_active "$handle"; then
-    z::log::warn "zkv: commit called outside transaction" handle "$handle"
+    zlog::warn "zkv: commit called outside transaction" handle "$handle"
     return 0
   fi
 
@@ -1909,7 +1909,7 @@ z::kv::commit() {
 
   _z::kv::auto_persist "$handle"
 
-  z::log::debug "zkv: transaction committed" handle "$handle" writes "${#_wkeys}"
+  zlog::debug "zkv: transaction committed" handle "$handle" writes "${#_wkeys}"
   return 0
 }
 
@@ -1925,7 +1925,7 @@ z::kv::rollback() {
   _z::kv::require_handle "$handle" || return $?
 
   if ! _zkv_tx_active "$handle"; then
-    z::log::warn "zkv: rollback called outside transaction" handle "$handle"
+    zlog::warn "zkv: rollback called outside transaction" handle "$handle"
     return 0
   fi
 
@@ -1937,7 +1937,7 @@ z::kv::rollback() {
 
   _zkv_aset "_zkv_tx_${handle}" active 0
 
-  z::log::debug "zkv: transaction rolled back" handle "$handle"
+  zlog::debug "zkv: transaction rolled back" handle "$handle"
   return 0
 }
 
@@ -1955,7 +1955,7 @@ z::kv::tx() {
   z::ensure::nonempty "$cb" "callback" || return $Z_ERR_INPUT
 
   if ! z::is::func "$cb"; then
-    z::log::error "zkv: tx callback not defined" callback "$cb"
+    zlog::error "zkv: tx callback not defined" callback "$cb"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -1967,7 +1967,7 @@ z::kv::tx() {
 
   if (( rc != 0 )); then
     z::kv::rollback "$handle"
-    z::log::warn "zkv: tx rolled back" handle "$handle" callback "$cb" rc "$rc"
+    zlog::warn "zkv: tx rolled back" handle "$handle" callback "$cb" rc "$rc"
     return $rc
   fi
 
@@ -1997,7 +1997,7 @@ z::kv::save() {
   _z::kv::epoch || return $?
   local tmp="${file}.zkv.tmp.${$}.${REPLY}"
 
-  z::log::get_timestamp "human"
+  zlog::get_timestamp "human"
   local ts="$REPLY"
 
   local _store_n="_zkv_store_${handle}"
@@ -2135,14 +2135,14 @@ z::kv::save() {
       print "H|${ekey}|${encoded}"
     done
   } > "$tmp" || {
-    z::log::error "zkv: failed to write temp file" handle "$handle" file "$tmp"
+    zlog::error "zkv: failed to write temp file" handle "$handle" file "$tmp"
     command rm -f "$tmp" 2>/dev/null
     return $Z_ERR_GENERAL
   }
 
   # Atomic rename — avoids partial reads by other processes.
   command mv -f "$tmp" "$file" || {
-    z::log::error "zkv: atomic rename failed" handle "$handle" src "$tmp" dst "$file"
+    zlog::error "zkv: atomic rename failed" handle "$handle" src "$tmp" dst "$file"
     command rm -f "$tmp" 2>/dev/null
     return $Z_ERR_GENERAL
   }
@@ -2152,7 +2152,7 @@ z::kv::save() {
   _zkv_aset "_zkv_state_${handle}" dirty 0
 
   _zkv_alen "$_store_n"
-  z::log::info "zkv: store saved" handle "$handle" file "$file" string_keys "$REPLY"
+  zlog::info "zkv: store saved" handle "$handle" file "$file" string_keys "$REPLY"
 
   return 0
 }
@@ -2176,7 +2176,7 @@ z::kv::flush() {
   [[ -z $file ]] && return 0
 
   if ! _zkv_state_dirty "$handle"; then
-    z::log::debug "zkv: flush no-op (clean)" handle "$handle"
+    zlog::debug "zkv: flush no-op (clean)" handle "$handle"
     return 0
   fi
 
@@ -2214,12 +2214,12 @@ z::kv::load() {
   done < "$file"
 
   if [[ ! $file_version =~ '^[0-9]+$' ]]; then
-    z::log::error "zkv: dump version unreadable" file "$file"
+    zlog::error "zkv: dump version unreadable" file "$file"
     return $Z_ERR_GENERAL
   fi
 
   if (( file_version > ZKV_PERSIST_FORMAT_VERSION )); then
-    z::log::error "zkv: dump format too new" \
+    zlog::error "zkv: dump format too new" \
       file "$file" file_version "$file_version" supported "$ZKV_PERSIST_FORMAT_VERSION"
     return $Z_ERR_GENERAL
   fi
@@ -2233,7 +2233,7 @@ z::kv::load() {
 
   _zkv_aset "$_cfg_n" auto_persist 0
 
-  z::log::info "zkv: loading store" handle "$handle" file "$file" format_version "$file_version"
+  zlog::info "zkv: loading store" handle "$handle" file "$file" format_version "$file_version"
 
   local _store_n="_zkv_store_${handle}"
   local _lists_n="_zkv_lists_${handle}"
@@ -2373,7 +2373,7 @@ z::kv::load() {
         ;;
 
       *)
-        z::log::warn "zkv: unknown record type in dump" \
+        zlog::warn "zkv: unknown record type in dump" \
           handle "$handle" file "$file" type "$rtype"
         ;;
     esac
@@ -2382,7 +2382,7 @@ z::kv::load() {
   _zkv_aset "$_cfg_n" auto_persist "$saved_auto"
   _zkv_aset "_zkv_state_${handle}" dirty 0
 
-  z::log::info "zkv: store loaded" handle "$handle" file "$file" records "$loaded"
+  zlog::info "zkv: store loaded" handle "$handle" file "$file" records "$loaded"
   return 0
 }
 
@@ -2404,7 +2404,7 @@ z::kv::enable_persist() {
   _zkv_aset "$_cfg_n" persist_file "$file"
 
   _zkv_aget "$_cfg_n" persist_debounce
-  z::log::info "zkv: auto-persistence enabled" handle "$handle" file "$file" debounce "${REPLY}s"
+  zlog::info "zkv: auto-persistence enabled" handle "$handle" file "$file" debounce "${REPLY}s"
 
   return 0
 }
@@ -2421,7 +2421,7 @@ z::kv::disable_persist() {
 
   _zkv_aset "_zkv_cfg_${handle}" auto_persist 0
 
-  z::log::info "zkv: auto-persistence disabled" handle "$handle"
+  zlog::info "zkv: auto-persistence disabled" handle "$handle"
   return 0
 }
 
@@ -2469,11 +2469,11 @@ z::kv::lock() {
     _z::kv::epoch || return $?
 
     if (( REPLY < prev_expire )); then
-      z::log::debug "zkv: lock held" handle "$handle" lock "$lock_name" owner "$prev_owner"
+      zlog::debug "zkv: lock held" handle "$handle" lock "$lock_name" owner "$prev_owner"
       return $Z_ERR_PERM
     fi
 
-    z::log::debug "zkv: lock expired, taking over" handle "$handle" lock "$lock_name"
+    zlog::debug "zkv: lock expired, taking over" handle "$handle" lock "$lock_name"
   fi
 
   _z::kv::epoch || return $?
@@ -2481,7 +2481,7 @@ z::kv::lock() {
 
   _zkv_aset "$_locks_n" "$lock_name" "${owner}${_ZKV_RECSEP}${expire}"
 
-  z::log::debug "zkv: lock acquired" handle "$handle" lock "$lock_name" owner "$owner" ttl "${ttl}s"
+  zlog::debug "zkv: lock acquired" handle "$handle" lock "$lock_name" owner "$owner" ttl "${ttl}s"
   return 0
 }
 
@@ -2508,14 +2508,14 @@ z::kv::unlock() {
   local prev_owner="${data%%${_ZKV_RECSEP}*}"
 
   if [[ $prev_owner != $owner ]]; then
-    z::log::error "zkv: unlock owner mismatch" handle "$handle" lock "$lock_name" \
+    zlog::error "zkv: unlock owner mismatch" handle "$handle" lock "$lock_name" \
       expected "$prev_owner" got "$owner"
     return $Z_ERR_PERM
   fi
 
   _zkv_adel "$_locks_n" "$lock_name"
 
-  z::log::debug "zkv: lock released" handle "$handle" lock "$lock_name"
+  zlog::debug "zkv: lock released" handle "$handle" lock "$lock_name"
   return 0
 }
 
@@ -2535,7 +2535,7 @@ z::kv::lock_wait() {
   z::ensure::int   "$attempts_raw" "attempts" || return $Z_ERR_INPUT
 
   if [[ ! $interval_raw == (<->|<->.<->) ]]; then
-    z::log::error "zkv: invalid interval" interval "$interval_raw"
+    zlog::error "zkv: invalid interval" interval "$interval_raw"
     return $Z_ERR_INPUT
   fi
 
@@ -2584,7 +2584,7 @@ z::kv::watch() {
   z::ensure::nonempty  "$handler" "handler" || return $Z_ERR_INPUT
 
   if ! z::is::func "$handler"; then
-    z::log::error "zkv: watcher handler not found" handle "$handle" handler "$handler"
+    zlog::error "zkv: watcher handler not found" handle "$handle" handler "$handler"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -3377,7 +3377,7 @@ z::kv::zadd() {
   _z::kv::reserve_type   "$handle" "$key" zset  || return $?
 
   _z::kv::zentry_pack "$score_raw" "$member" || {
-    z::log::error "zkv: invalid score" handle "$handle" key "$key" score "$score_raw"
+    zlog::error "zkv: invalid score" handle "$handle" key "$key" score "$score_raw"
     return $Z_ERR_INPUT
   }
 
@@ -3810,7 +3810,7 @@ z::kv::hmset() {
   _z::kv::validate_key   "$key" "$handle" || return $?
 
   if (( $# % 2 != 0 )); then
-    z::log::error "zkv: hmset requires even field-value count" \
+    zlog::error "zkv: hmset requires even field-value count" \
       handle "$handle" key "$key" received "$#"
     return $Z_ERR_INPUT
   fi
@@ -4131,7 +4131,7 @@ z::kv::snapshot_create() {
       fi
     done
 
-    z::log::warn "zkv: snapshot cap reached, evicting oldest" \
+    zlog::warn "zkv: snapshot cap reached, evicting oldest" \
       handle "$handle" id "$oldest" cap "$_max_snaps"
 
     z::kv::snapshot_delete "$handle" "$oldest"
@@ -4157,7 +4157,7 @@ z::kv::snapshot_create() {
 
   REPLY="$snap_id"
 
-  z::log::info "zkv: snapshot created" handle "$handle" id "$snap_id" label "$label"
+  zlog::info "zkv: snapshot created" handle "$handle" id "$snap_id" label "$label"
   return 0
 }
 
@@ -4177,7 +4177,7 @@ z::kv::snapshot_restore() {
   _zkv_aget "$_snaps_n" "${snap_id}.label"
 
   if [[ -z $REPLY ]]; then
-    z::log::error "zkv: snapshot not found" handle "$handle" id "$snap_id"
+    zlog::error "zkv: snapshot not found" handle "$handle" id "$snap_id"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -4188,7 +4188,7 @@ z::kv::snapshot_restore() {
     _zkv_acopy  "_zkv_${suffix}_${handle}" "_zkv_snap_${suffix}_${snap_id}_${handle}"
   done
 
-  z::log::info "zkv: snapshot restored" handle "$handle" id "$snap_id"
+  zlog::info "zkv: snapshot restored" handle "$handle" id "$snap_id"
   return 0
 }
 
@@ -4237,7 +4237,7 @@ z::kv::snapshot_list() {
     _zkv_aget "$_snaps_n" "${snap_id}.timestamp"
     ts="$REPLY"
 
-    z::log::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
+    zlog::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
     ts_str="$REPLY"
 
     print "  ${snap_id}: ${label} [${ts_str}]"
@@ -4278,7 +4278,7 @@ z::kv::snapshot_delete() {
     unset "_zkv_snap_${suffix}_${snap_id}_${handle}"
   done
 
-  z::log::info "zkv: snapshot deleted" handle "$handle" id "$snap_id"
+  zlog::info "zkv: snapshot deleted" handle "$handle" id "$snap_id"
   return 0
 }
 
@@ -4334,7 +4334,7 @@ z::kv::batch() {
     case "$cmd" in
       set)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch set requires key and value" line "$line"
+          zlog::warn "zkv: batch set requires key and value" line "$line"
           (( failed += 1 ))
         else
           z::kv::set "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4343,7 +4343,7 @@ z::kv::batch() {
 
       del)
         if (( ${#parts} < 2 )); then
-          z::log::warn "zkv: batch del requires key" line "$line"
+          zlog::warn "zkv: batch del requires key" line "$line"
           (( failed += 1 ))
         else
           z::kv::del "$handle" "${parts[2]}" || (( failed += 1 ))
@@ -4352,7 +4352,7 @@ z::kv::batch() {
 
       incr)
         if (( ${#parts} < 2 )); then
-          z::log::warn "zkv: batch incr requires key" line "$line"
+          zlog::warn "zkv: batch incr requires key" line "$line"
           (( failed += 1 ))
         else
           z::kv::incr "$handle" "${parts[2]}" "${parts[3]:-1}" || (( failed += 1 ))
@@ -4361,7 +4361,7 @@ z::kv::batch() {
 
       decr)
         if (( ${#parts} < 2 )); then
-          z::log::warn "zkv: batch decr requires key" line "$line"
+          zlog::warn "zkv: batch decr requires key" line "$line"
           (( failed += 1 ))
         else
           z::kv::decr "$handle" "${parts[2]}" "${parts[3]:-1}" || (( failed += 1 ))
@@ -4370,7 +4370,7 @@ z::kv::batch() {
 
       expire)
         if (( ${#parts} < 2 )); then
-          z::log::warn "zkv: batch expire requires key" line "$line"
+          zlog::warn "zkv: batch expire requires key" line "$line"
           (( failed += 1 ))
         else
           z::kv::expire "$handle" "${parts[2]}" "${parts[3]:-0}" || (( failed += 1 ))
@@ -4379,7 +4379,7 @@ z::kv::batch() {
 
       persist)
         if (( ${#parts} < 2 )); then
-          z::log::warn "zkv: batch persist requires key" line "$line"
+          zlog::warn "zkv: batch persist requires key" line "$line"
           (( failed += 1 ))
         else
           z::kv::persist "$handle" "${parts[2]}" || (( failed += 1 ))
@@ -4388,7 +4388,7 @@ z::kv::batch() {
 
       hset)
         if (( ${#parts} < 4 )); then
-          z::log::warn "zkv: batch hset requires key field value" line "$line"
+          zlog::warn "zkv: batch hset requires key field value" line "$line"
           (( failed += 1 ))
         else
           z::kv::hset "$handle" "${parts[2]}" "${parts[3]}" "${parts[4]}" || (( failed += 1 ))
@@ -4397,7 +4397,7 @@ z::kv::batch() {
 
       hdel)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch hdel requires key field" line "$line"
+          zlog::warn "zkv: batch hdel requires key field" line "$line"
           (( failed += 1 ))
         else
           z::kv::hdel "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4406,7 +4406,7 @@ z::kv::batch() {
 
       lpush)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch lpush requires key value" line "$line"
+          zlog::warn "zkv: batch lpush requires key value" line "$line"
           (( failed += 1 ))
         else
           z::kv::lpush "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4415,7 +4415,7 @@ z::kv::batch() {
 
       rpush)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch rpush requires key value" line "$line"
+          zlog::warn "zkv: batch rpush requires key value" line "$line"
           (( failed += 1 ))
         else
           z::kv::rpush "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4424,7 +4424,7 @@ z::kv::batch() {
 
       sadd)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch sadd requires key value" line "$line"
+          zlog::warn "zkv: batch sadd requires key value" line "$line"
           (( failed += 1 ))
         else
           z::kv::sadd "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4433,7 +4433,7 @@ z::kv::batch() {
 
       srem)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch srem requires key value" line "$line"
+          zlog::warn "zkv: batch srem requires key value" line "$line"
           (( failed += 1 ))
         else
           z::kv::srem "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4442,7 +4442,7 @@ z::kv::batch() {
 
       zadd)
         if (( ${#parts} < 4 )); then
-          z::log::warn "zkv: batch zadd requires key score member" line "$line"
+          zlog::warn "zkv: batch zadd requires key score member" line "$line"
           (( failed += 1 ))
         else
           z::kv::zadd "$handle" "${parts[2]}" "${parts[3]}" "${parts[4]}" || (( failed += 1 ))
@@ -4451,7 +4451,7 @@ z::kv::batch() {
 
       zrem)
         if (( ${#parts} < 3 )); then
-          z::log::warn "zkv: batch zrem requires key member" line "$line"
+          zlog::warn "zkv: batch zrem requires key member" line "$line"
           (( failed += 1 ))
         else
           z::kv::zrem "$handle" "${parts[2]}" "${parts[3]}" || (( failed += 1 ))
@@ -4459,14 +4459,14 @@ z::kv::batch() {
         ;;
 
       *)
-        z::log::warn "zkv: unknown batch command" handle "$handle" command "$cmd"
+        zlog::warn "zkv: unknown batch command" handle "$handle" command "$cmd"
         (( failed += 1 ))
         ;;
     esac
   done
 
   if (( failed > 0 )); then
-    z::log::error "zkv: batch failed, rolling back" handle "$handle" errors "$failed"
+    zlog::error "zkv: batch failed, rolling back" handle "$handle" errors "$failed"
     z::kv::rollback "$handle"
     return $Z_ERR_GENERAL
   fi
@@ -4693,7 +4693,7 @@ z::kv::scan() {
   count="$count_raw"
 
   if (( cursor < 0 || count < 1 )); then
-    z::log::error "zkv: invalid scan bounds" cursor "$cursor" count "$count"
+    zlog::error "zkv: invalid scan bounds" cursor "$cursor" count "$count"
     return $Z_ERR_INPUT
   fi
 
@@ -4745,7 +4745,7 @@ z::kv::config() {
   local _cfg_n="_zkv_cfg_${handle}"
 
   if ! _zkv_ahas "$_cfg_n" "$key"; then
-    z::log::error "zkv: unknown config key" handle "$handle" key "$key"
+    zlog::error "zkv: unknown config key" handle "$handle" key "$key"
     return $Z_ERR_NOTFOUND
   fi
 
@@ -4799,7 +4799,7 @@ z::kv::enable_performance_mode() {
 
   _zkv_perf_mode[$handle]=1
 
-  z::log::info "zkv: performance mode enabled" handle "$handle" \
+  zlog::info "zkv: performance mode enabled" handle "$handle" \
     note "validation, watchers, TTL checks, and auto-persist are partially bypassed for direct string writes"
 
   return 0
@@ -4817,7 +4817,7 @@ z::kv::disable_performance_mode() {
 
   unset "_zkv_perf_mode[$handle]"
 
-  z::log::info "zkv: performance mode disabled" handle "$handle"
+  zlog::info "zkv: performance mode disabled" handle "$handle"
   return 0
 }
 
@@ -5176,7 +5176,7 @@ z::kv::export() {
 
   _z::kv::require_handle "$handle" || return $?
 
-  z::log::get_timestamp "human"
+  zlog::get_timestamp "human"
   local ts="$REPLY"
 
   print "# zkv export [${handle}] — ${ts}"

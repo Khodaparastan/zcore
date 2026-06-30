@@ -24,7 +24,7 @@
 #   emit_async — backgrounded dispatch with PID tracking, prunable, joinable.
 #
 # Requires:
-#   zlog  — must be sourced before zbus (provides z::log::*)
+#   zlog  — must be sourced before zbus (provides zlog::*)
 #   zbase — must be sourced before zbus (provides z::ensure::*, z::is::*, z::get::*)
 #   zkv   — v4+ must be sourced before zbus (provides z::kv::*)
 # =============================================================================
@@ -34,7 +34,7 @@
 # RUNTIME DEPENDENCY CHECKS
 # -----------------------------------------------------------------------------
 
-if (( ! ${+functions[z::log::info]} )); then
+if (( ! ${+functions[zlog::info]} )); then
   print -u2 "zbus: fatal: zlog must be sourced before zbus"; return 1
 fi
 if (( ! ${+functions[z::ensure::nonempty]} )); then
@@ -193,7 +193,7 @@ _z::bus::validate_event() {
   local name="$1"
   z::ensure::nonempty "$name" "event name" || return $Z_ERR_INPUT
   if [[ ! $name =~ '^[a-zA-Z0-9_:*.-]+$' ]]; then
-    z::log::error "zbus: invalid event name" name "$name" allowed "a-zA-Z0-9_:*.-"
+    zlog::error "zbus: invalid event name" name "$name" allowed "a-zA-Z0-9_:*.-"
     return $Z_ERR_INPUT
   fi
   return 0
@@ -205,7 +205,7 @@ _z::bus::validate_handler() {
   local func="$1"
   z::ensure::nonempty "$func" "handler" || return $Z_ERR_INPUT
   if ! z::is::func "$func"; then
-    z::log::error "zbus: handler function not defined" handler "$func"
+    zlog::error "zbus: handler function not defined" handler "$func"
     return $Z_ERR_NOTFOUND
   fi
   return 0
@@ -458,13 +458,13 @@ _z::bus::dispatch_one_sync() {
   local once_flag="${_zbus_handler_meta[${hid}.once]:-false}"
 
   if [[ -z $handler_func ]]; then
-    z::log::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
+    zlog::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
       "zbus: missing handler metadata" id "$hid"
     REPLY="remove"
     return 0
   fi
   if ! z::is::func "$handler_func"; then
-    z::log::once "zbus-handler-missing-${handler_func}" warn \
+    zlog::once "zbus-handler-missing-${handler_func}" warn \
       "zbus: handler no longer defined" handler "$handler_func" id "$hid"
     REPLY="remove"
     return 0
@@ -493,13 +493,13 @@ _z::bus::dispatch_one_safe() {
   local once_flag="${_zbus_handler_meta[${hid}.once]:-false}"
 
   if [[ -z $handler_func ]]; then
-    z::log::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
+    zlog::rate_limit "zbus-meta-missing-${hid}" 1 60 warn \
       "zbus: missing handler metadata" id "$hid"
     REPLY="remove"
     return 0
   fi
   if ! z::is::func "$handler_func"; then
-    z::log::once "zbus-handler-missing-${handler_func}" warn \
+    zlog::once "zbus-handler-missing-${handler_func}" warn \
       "zbus: handler no longer defined" handler "$handler_func" id "$hid"
     REPLY="remove"
     return 0
@@ -559,7 +559,7 @@ _z::bus::dispatch() {
   _z::bus::ensure_init                    || return $?
   _z::bus::validate_event "$event_name"   || return $?
 
-  z::log::debug "zbus: dispatch" event "$event_name" mode "$mode" argc "$#"
+  zlog::debug "zbus: dispatch" event "$event_name" mode "$mode" argc "$#"
   _z::bus::update_stats "$event_name" "emitted"
   _z::bus::add_history  "$event_name" "$@"
 
@@ -567,7 +567,7 @@ _z::bus::dispatch() {
   _z::bus::collect_handlers "$event_name" all_handler_ids
 
   if (( ${#all_handler_ids} == 0 )); then
-    z::log::debug "zbus: no handlers" event "$event_name"
+    zlog::debug "zbus: no handlers" event "$event_name"
     return 0
   fi
   _z::bus::sort_by_priority all_handler_ids
@@ -600,7 +600,7 @@ _z::bus::dispatch() {
         ;;
       timeout)
         (( failed += 1 ))
-        z::log::error "zbus: handler timed out" \
+        zlog::error "zbus: handler timed out" \
           handler "$handler_func" event "$event_name" \
           timeout "${timeout_val}s"
         _z::bus::update_stats "$event_name" "timeout"
@@ -608,7 +608,7 @@ _z::bus::dispatch() {
         ;;
       fail)
         (( failed += 1 ))
-        z::log::rate_limit "zbus-handler-fail-${handler_func}" 5 60 warn \
+        zlog::rate_limit "zbus-handler-fail-${handler_func}" 5 60 warn \
           "zbus: handler failed" \
           handler "$handler_func" event "$event_name" \
           exit_code "$exit_code"
@@ -623,7 +623,7 @@ _z::bus::dispatch() {
     _z::bus::remove_handler_by_id "$rid"
   done
 
-  z::log::debug "zbus: dispatch complete" \
+  zlog::debug "zbus: dispatch complete" \
     event "$event_name" handled "$handled" failed "$failed"
 
   REPLY=$failed
@@ -707,7 +707,7 @@ z::bus::init() {
         shift
         ;;
       *)
-        z::log::warn "zbus: unknown init option" option "$1"
+        zlog::warn "zbus: unknown init option" option "$1"
         shift
         ;;
     esac
@@ -732,7 +732,7 @@ z::bus::init() {
     _zbus_history_count=${#snapshot}
   fi
 
-  z::log::debug "zbus: initialized" store "$_ZBUS_STORE" \
+  zlog::debug "zbus: initialized" store "$_ZBUS_STORE" \
     history "$_zbus_flag_history" stats "$_zbus_flag_stats" \
     wildcards "$_zbus_flag_wildcards"
 
@@ -776,7 +776,7 @@ z::bus::on() {
         shift
         ;;
       *)
-        z::log::warn "zbus: unknown on option" option "$1"
+        zlog::warn "zbus: unknown on option" option "$1"
         shift
         ;;
     esac
@@ -796,7 +796,7 @@ z::bus::on() {
   _z::bus::parse_handler_list "$existing_list" existing_handlers
 
   if (( ${#existing_handlers} >= _zbus_cfg_max_handlers )); then
-    z::log::error "zbus: handler limit reached" \
+    zlog::error "zbus: handler limit reached" \
       event "$event_name" limit "$_zbus_cfg_max_handlers"
     return $Z_ERR_PERM
   fi
@@ -823,7 +823,7 @@ z::bus::on() {
   fi
 
   REPLY="$hid"
-  z::log::debug "zbus: subscribed" \
+  zlog::debug "zbus: subscribed" \
     event "$event_name" handler "$handler" id "$hid" \
     priority "$priority" once "$once"
   return 0
@@ -888,7 +888,7 @@ z::bus::off() {
   done
 
   REPLY=$removed
-  z::log::debug "zbus: off complete" pattern "$event_pattern" removed "$removed"
+  zlog::debug "zbus: off complete" pattern "$event_pattern" removed "$removed"
   (( removed > 0 )) && return 0 || return $Z_ERR_NOTFOUND
 }
 
@@ -903,12 +903,12 @@ z::bus::off_id() {
   _z::bus::ensure_init || return $?
 
   if [[ -z ${_zbus_handler_meta[${hid}.function]:-} ]]; then
-    z::log::warn "zbus: handler ID not found" id "$hid"
+    zlog::warn "zbus: handler ID not found" id "$hid"
     return $Z_ERR_NOTFOUND
   fi
 
   _z::bus::remove_handler_by_id "$hid"
-  z::log::debug "zbus: handler removed by id" id "$hid"
+  zlog::debug "zbus: handler removed by id" id "$hid"
   return 0
 }
 
@@ -955,12 +955,12 @@ z::bus::emit_async() {
   _z::bus::prune_async_pids
 
   if (( ${#_zbus_async_pids} >= _ZBUS_ASYNC_PID_CAP )); then
-    z::log::error "zbus: async PID cap reached" \
+    zlog::error "zbus: async PID cap reached" \
       cap "$_ZBUS_ASYNC_PID_CAP" event "$event_name"
     return $Z_ERR_PERM
   fi
 
-  z::log::debug "zbus: emit_async" event "$event_name"
+  zlog::debug "zbus: emit_async" event "$event_name"
 
   # Use & (not &!) so we can capture the PID for tracking.
   # The job runs in a forked subshell with a snapshot of the handler registry.
@@ -1126,7 +1126,7 @@ z::bus::list() {
     _z::bus::parse_handler_list "$handler_list" handlers
     _z::bus::sort_by_priority handlers
 
-    z::log::colorize blue "$event_pattern"
+    zlog::colorize blue "$event_pattern"
     colored_event="$REPLY"
     print "\nEvent: ${colored_event}  (${#handlers} handler(s))"
 
@@ -1136,7 +1136,7 @@ z::bus::list() {
       local once="${_zbus_handler_meta[${hid}.once]:-false}"
       line="  • ${func}  [id=${hid} priority=${prio}]"
       if [[ $once == "true" ]]; then
-        z::log::colorize yellow "[once]"
+        zlog::colorize yellow "[once]"
         line+=" $REPLY"
       fi
       print "$line"
@@ -1203,11 +1203,11 @@ z::bus::history() {
 
     formatted="$ts"
     if [[ $ts =~ '^[0-9]+$' ]]; then
-      z::log::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
+      zlog::format_epoch "$ts" "%Y-%m-%d %H:%M:%S"
       formatted="$REPLY"
     fi
 
-    z::log::colorize blue "$event_name"
+    zlog::colorize blue "$event_name"
     colored_event="$REPLY"
 
     print "${display_idx}. [${formatted}] ${colored_event}"
@@ -1281,7 +1281,7 @@ z::bus::stats() {
     failed=${_zbus_stats[${event}.failed]:-0}
     timeout=${_zbus_stats[${event}.timeout]:-0}
 
-    z::log::colorize blue "$event"
+    zlog::colorize blue "$event"
     colored_name="$REPLY"
 
     print "\n${colored_name}"
@@ -1304,7 +1304,7 @@ z::bus::clear_history() {
   _zbus_history_ring=()
   _zbus_history_head=0
   _zbus_history_count=0
-  z::log::debug "zbus: history cleared"
+  zlog::debug "zbus: history cleared"
   return 0
 }
 
@@ -1315,7 +1315,7 @@ z::bus::clear_stats() {
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
   _z::bus::ensure_init || return $?
   _zbus_stats=()
-  z::log::debug "zbus: stats cleared"
+  zlog::debug "zbus: stats cleared"
   return 0
 }
 
@@ -1374,7 +1374,7 @@ z::bus::config() {
       cfg_key="$ZBUS_CFG_ENABLE_WILDCARDS"
       ;;
     *)
-      z::log::error "zbus: unknown config key" key "$key"
+      zlog::error "zbus: unknown config key" key "$key"
       return $Z_ERR_NOTFOUND
       ;;
   esac
@@ -1388,7 +1388,7 @@ z::bus::config() {
     z::bus::clear_history
   fi
 
-  z::log::debug "zbus: config updated" key "$key" value "$value"
+  zlog::debug "zbus: config updated" key "$key" value "$value"
   return 0
 }
 
@@ -1412,7 +1412,7 @@ z::bus::get_config() {
     enable_stats)           (( _zbus_flag_stats ))     && REPLY="true" || REPLY="false" ;;
     enable_wildcards)       (( _zbus_flag_wildcards )) && REPLY="true" || REPLY="false" ;;
     *)
-      z::log::error "zbus: unknown config key" key "$key"
+      zlog::error "zbus: unknown config key" key "$key"
       return $Z_ERR_NOTFOUND
       ;;
   esac
@@ -1474,7 +1474,7 @@ z::bus::reset() {
   z::bus::clear_history 2>/dev/null || true
   z::bus::clear_stats   2>/dev/null || true
 
-  z::log::always "zbus: bus reset" component "zbus"
+  zlog::always "zbus: bus reset" component "zbus"
   return 0
 }
 
@@ -1498,7 +1498,7 @@ z::bus::enable_performance_mode() {
   _zbus_perf_mode=1
   typeset -gi _zbus_flag_history=0
   typeset -gi _zbus_flag_stats=0
-  z::log::info "zbus: performance mode enabled" \
+  zlog::info "zbus: performance mode enabled" \
     note "history and stats suspended"
   return 0
 }
@@ -1511,7 +1511,7 @@ z::bus::disable_performance_mode() {
   _z::bus::ensure_init || return $?
   _zbus_perf_mode=0
   _z::bus::cache_config   # restore persisted flag values from zkv
-  z::log::info "zbus: performance mode disabled"
+  zlog::info "zbus: performance mode disabled"
   return 0
 }
 
@@ -1542,7 +1542,7 @@ z::bus::subscribe() {
     local -a current=("${(@ps:$_ZBUS_SEP:)existing}")
     if (( ${current[(Ie)$handler]} )); then
       # (Ie) = case-sensitive exact-match index; non-zero means already present.
-      z::log::debug "zbus: subscribe duplicate ignored" \
+      zlog::debug "zbus: subscribe duplicate ignored" \
         channel "$channel" handler "$handler"
       return 0
     fi
@@ -1551,7 +1551,7 @@ z::bus::subscribe() {
     _zbus_channels[$channel]="$handler"
   fi
 
-  z::log::debug "zbus: subscribed" channel "$channel" handler "$handler"
+  zlog::debug "zbus: subscribed" channel "$channel" handler "$handler"
   return 0
 }
 
@@ -1568,7 +1568,7 @@ z::bus::unsubscribe() {
 
   if [[ -z $handler ]]; then
     unset "_zbus_channels[$channel]"
-    z::log::debug "zbus: all subscribers removed" channel "$channel"
+    zlog::debug "zbus: all subscribers removed" channel "$channel"
     return 0
   fi
 
@@ -1586,7 +1586,7 @@ z::bus::unsubscribe() {
     unset "_zbus_channels[$channel]"
   fi
 
-  z::log::debug "zbus: unsubscribed" channel "$channel" handler "$handler"
+  zlog::debug "zbus: unsubscribed" channel "$channel" handler "$handler"
   return 0
 }
 
@@ -1604,7 +1604,7 @@ z::bus::publish() {
 
   local list="${_zbus_channels[$channel]:-}"
   if [[ -z $list ]]; then
-    z::log::debug "zbus: publish no subscribers" channel "$channel"
+    zlog::debug "zbus: publish no subscribers" channel "$channel"
     return 0
   fi
 
@@ -1616,17 +1616,17 @@ z::bus::publish() {
       rc=0
       "$h" "$channel" "$message" 2>/dev/null || rc=$?
       if (( rc != 0 )); then
-        z::log::rate_limit "zbus-pub-fail-${h}" 5 60 warn \
+        zlog::rate_limit "zbus-pub-fail-${h}" 5 60 warn \
           "zbus: publish handler returned non-zero" \
           channel "$channel" handler "$h" rc "$rc"
       fi
     else
-      z::log::once "zbus-pub-missing-${h}" warn \
+      zlog::once "zbus-pub-missing-${h}" warn \
         "zbus: publish handler no longer defined" \
         channel "$channel" handler "$h"
     fi
   done
 
-  z::log::debug "zbus: published" channel "$channel"
+  zlog::debug "zbus: published" channel "$channel"
   return 0
 }
