@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/../zbus"   || { print -u2 "failed to source zbus"; exit 1;
 source "${SCRIPT_DIR}/ztest"     || { print -u2 "failed to source ztest"; exit 1; }
 
 # Quiet zlog while tests run; uncomment for verbose mode
-z::log::set_level error
+zlog::set_level error
 
 # Per-file run: source each test file in a subshell and run its tests.
 # Subshell prevents test_setup/teardown name collisions across files.

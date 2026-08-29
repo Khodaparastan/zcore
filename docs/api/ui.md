@@ -335,7 +335,7 @@ Continuous position: `pos = ⌊current × segments / total⌋`; fill is `━…�
 | `show_progress` config is `"false"` | Explicitly disabled by caller |
 | `__z::progress::should_show` returns `1` | Throttle interval not reached |
 
-Progress output is **independent of `z::log::set_level`** — a quiet `error` console can still show bars when `show_progress` is `"true"`.
+Progress output is **independent of `zlog::set_level`** — a quiet `error` console can still show bars when `show_progress` is `"true"`.
 
 **Config Keys Read**
 
@@ -637,11 +637,11 @@ __z::progress::should_show <current> <total>
 
 | Dependency | Type | Used By | Notes |
 | :--- | :--- | :--- | :--- |
-| `zlog` | Module | `z::progress::show` | Must be loaded first; `z::log::debug` used only for invalid-input diagnostics |
+| `zlog` | Module | `z::progress::show` | Must be loaded first; `zlog::debug` used only for invalid-input diagnostics |
 | `z::cache::get` / `z::cache::set` | Internal module | `z::ui::width` | Key `ui:term_width`, TTL 1 s |
 | `z::config::get` / `z::config::set` | Internal module | `z::progress::*`, `__z::progress::*` | Keys: `show_progress`, `progress_update_interval`, `progress_style`. **`z::config::get` sets `$REPLY`** — do not use `$(z::config::get …)` |
-| `_zlog_colors` | `zlog` | `__z::progress::theme` | Optional ANSI styling when `__z::log::init_colors` has run; respects `NO_COLOR` |
-| `z::log::debug` | `zlog` | `z::progress::show` | Emits debug messages on invalid input (respects log level; does not gate bar output) |
+| `_zlog_colors` | `zlog` | `__z::progress::theme` | Optional ANSI styling when `__zlog::init_colors` has run; respects `NO_COLOR` |
+| `zlog::debug` | `zlog` | `z::progress::show` | Emits debug messages on invalid input (respects log level; does not gate bar output) |
 | `_z_progress_spinner_idx` | Global integer | `z::progress::spinner` | Persists across calls; declared with `typeset -gi` |
 | `tput` | External binary | `z::ui::width`, `z::ui::height` | Optional; queried via `$+commands[tput]` |
 | `clear` | External binary | `z::ui::clear` | Standard POSIX utility |
@@ -649,7 +649,7 @@ __z::progress::should_show <current> <total>
 **Source order** (when loading standalone, outside the framework `init`):
 
 ```zsh
-source ./zlog    # optional; only needed if z::log::debug diagnostics are desired
+source ./zlog    # optional; only needed if zlog::debug diagnostics are desired
 source ./ui      # or via framework init
 ```
 

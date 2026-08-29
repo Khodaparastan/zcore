@@ -513,8 +513,8 @@ z::opt::parse::dryrun  opts; local dry_run=$REPLY
 z::opt::parse::verbose opts; local verbose=$REPLY
 z::opt::parse::quiet   opts; local quiet=$REPLY
 
-(( force   )) && z::log::warn "Force mode active — skipping safety checks"
-(( dry_run )) && z::log::info "Dry run — no changes will be made"
+(( force   )) && zlog::warn "Force mode active — skipping safety checks"
+(( dry_run )) && zlog::info "Dry run — no changes will be made"
 ```
 
 ---
@@ -840,7 +840,7 @@ z::probe::cmd <cmd>
 
 ```zsh
 z::probe::cmd "git"     || { echo "git required"; exit 1; }
-z::probe::cmd "jq"      || z::log::warn "jq not found; JSON output disabled"
+z::probe::cmd "jq"      || zlog::warn "jq not found; JSON output disabled"
 z::probe::cmd "my_func" && my_func --init
 ```
 
@@ -884,7 +884,7 @@ is empty.
 
 ```zsh
 if z::probe::var "MY_CONFIG"; then
-  z::log::debug "Using existing config" value "$MY_CONFIG"
+  zlog::debug "Using existing config" value "$MY_CONFIG"
 fi
 
 z::probe::var "PLUGIN_LOADED" || source plugin.zsh
@@ -932,7 +932,7 @@ z::cmd::which "my_func"
 echo "$REPLY2"   # → function
 
 if ! z::cmd::which "required_tool"; then
-  z::log::error "required_tool is not installed"
+  zlog::error "required_tool is not installed"
   exit $ZBASE_ERROR_NOT_FOUND
 fi
 local tool_path="$REPLY"
@@ -1208,7 +1208,7 @@ z::env::path_has <dir>
 
 ```zsh
 if z::env::path_has "/usr/local/bin"; then
-  z::log::debug "Standard local bin already in PATH"
+  zlog::debug "Standard local bin already in PATH"
 fi
 
 z::env::path_has "$HOME/.cargo/bin" || z::env::path_add "$HOME/.cargo/bin"
@@ -1309,7 +1309,7 @@ z::exec::scan <input>
 ```
 
 **Returns:** `0` if no dangerous patterns found, `1` if blocked (also logs
-via `z::log::always`). `ZBASE_ERROR_INVALID_INPUT` if `input` is empty.
+via `zlog::always`). `ZBASE_ERROR_INVALID_INPUT` if `input` is empty.
 
 **Blocked patterns:**
 
@@ -1392,9 +1392,9 @@ z::exec::run "curl -s https://api.example.com/health" 10
 z::exec::run "make -j4" 300
 local rc=$?
 if (( rc == 124 )); then
-  z::log::error "Build timed out after 300s"
+  zlog::error "Build timed out after 300s"
 elif (( rc != 0 )); then
-  z::log::error "Build failed" exit_code "$rc"
+  zlog::error "Build failed" exit_code "$rc"
 fi
 
 z::exec::run "long_running_process" 0   # no timeout
@@ -1505,9 +1505,9 @@ local job_pid="$REPLY"
 on_build_done() {
   local exit_code="$1" output="$2"
   if (( exit_code == 0 )); then
-    z::log::info "Build succeeded"
+    zlog::info "Build succeeded"
   else
-    z::log::error "Build failed" output "$output"
+    zlog::error "Build failed" output "$output"
   fi
 }
 
@@ -1543,7 +1543,7 @@ z::exec::async "job_c.sh"
 z::exec::wait_all
 local rc=$?
 if (( rc != 0 )); then
-  z::log::error "One or more async jobs failed" last_exit_code "$rc"
+  zlog::error "One or more async jobs failed" last_exit_code "$rc"
 fi
 ```
 
@@ -1589,7 +1589,7 @@ z::file::resolve "/etc/localtime"
 echo "$REPLY"   # → /usr/share/zoneinfo/America/New_York
 
 if ! z::file::resolve "$symlink_path"; then
-  z::log::warn "Could not resolve symlink" path "$symlink_path"
+  zlog::warn "Could not resolve symlink" path "$symlink_path"
 fi
 ```
 
@@ -1643,7 +1643,7 @@ z::file::source "setup.zsh" "--env" "production" "--debug"
 
 # Error handling
 if ! z::file::source "$plugin_file"; then
-  z::log::warn "Plugin failed to load" path "$plugin_file"
+  zlog::warn "Plugin failed to load" path "$plugin_file"
 fi
 
 # Conditional sourcing

@@ -739,7 +739,7 @@ events automatically. Subscribe with `z::event::on`.
 
 | Dependency | Required | Used for |
 |---|---|---|
-| `zlog` | Yes | All `z::log::*` calls (must be sourced first) |
+| `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
 | `zbase` | Yes | `ZCORE_ERROR_*` aliases, validation indirectly via zkv |
 | `ui` | Yes* | `z::progress::clear` in trap and die paths |
 | `zkv` | Yes | Config store, profiling store |

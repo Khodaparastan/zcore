@@ -1160,9 +1160,9 @@ Dump files with `version` greater than `ZKV_PERSIST_FORMAT_VERSION` are rejected
 
 | Dependency | Required | Used for |
 |---|---|---|
-| `zlog` | Yes | All `z::log::*` calls (must be sourced first) |
+| `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
 | `zbase` | Yes | `z::validate::*`, `z::probe::*`, `Z_SEP`/`Z_RECSEP`/`Z_ESC`, `ZBASE_ERROR_*` |
-| `zsh/datetime` | Optional | `$EPOCHSECONDS` for TTL (falls back to `z::log::get_timestamp epoch`) |
+| `zsh/datetime` | Optional | `$EPOCHSECONDS` for TTL (falls back to `zlog::get_timestamp epoch`) |
 | `zsh/zselect` | Optional | Sub-second sleep in `z::kv::lock_wait` (falls back to `sleep`) |
 
 **Source order:**

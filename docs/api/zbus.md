@@ -739,7 +739,7 @@ my_handler() {
 
 - Handlers marked `--once` are removed after dispatch, regardless of exit code.
 - Handlers whose function is no longer defined at dispatch time are removed
-  automatically (logged once via `z::log::once`).
+  automatically (logged once via `zlog::once`).
 - In safe mode, a handler that exceeds `handler_timeout` is killed with
   `SIGTERM` then `SIGKILL`; counted as both `timeout` and `failed`.
 
@@ -774,7 +774,7 @@ with `enable_wildcards false`.
 
 | Dependency | Required | Used for |
 |---|---|---|
-| `zlog` | Yes | All `z::log::*` calls (must be sourced first) |
+| `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
 | `zbase` | Yes | `z::validate::*`, `z::probe::func`, `z::time::epoch`, `Z_SEP`/`Z_RECSEP`, `ZBASE_ERROR_*` |
 | `zkv` v4+ | Yes | Internal `__zbus` config store via `z::kv::open`, `z::kv::set`, `z::kv::setnx`, `z::kv::get` |
 
