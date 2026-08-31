@@ -6,9 +6,11 @@
 #               descending priority order, --once handlers unsubscribing
 #               themselves after their first delivery, wildcard patterns
 #               matching only the intended events, emit_safe continuing past
-#               a handler that fails, and the two unsubscribe paths — off,
-#               which reports how many handlers it removed, and off_id, which
-#               removes the single handler whose id was returned by on.
+#               a handler that fails (observed via a temp-file probe because
+#               the fork hides variable mutations), and the two unsubscribe
+#               paths — off, which reports how many handlers it removed, and
+#               off_id, which removes the single handler whose id was
+#               returned by on.
 #
 # Usage:        zsh tests/run_tests.zsh zbus
 #               zsh tests/unit/zbus/test_zbus_dispatch.zsh    # standalone
@@ -59,15 +61,38 @@ test_zbus_wildcard_matches() {
   ztest::assert::eq "2" "$_wc_count"
 }
 
-# emit_safe isolates handlers from each other: a failure must not cut the
-# dispatch chain short for the handlers queued behind it.
-test_zbus_emit_safe_survives_handler_crash() {
+# emit_safe forks each handler, so a probe that survives the fork is a
+# temp file rather than a variable. The path is passed as an emit arg so
+# the child does not depend on the caller's locals.
+_zbus_emit_safe_isolation() {
+  local crash_prio="$1" good_prio="$2"
+  local probe failed
+  probe="$(mktemp -t zcore_zbus_probe.XXXXXX)" \
+    || { ztest::fail "cannot create probe file"; return 1; }
+  command rm -f -- "$probe"
+
   _crashing_h() { return 1; }
-  _good_h() { typeset -gi _good_ran=1; }
-  z::bus::on "evt" _crashing_h --priority 80
-  z::bus::on "evt" _good_h     --priority 20
-  z::bus::emit_safe "evt" || true
-  ztest::assert::eq "1" "$_good_ran" "later handler ran despite earlier crash"
+  _good_h() { : >| "$2"; }
+
+  z::bus::on "evt" _crashing_h --priority "$crash_prio"
+  z::bus::on "evt" _good_h     --priority "$good_prio"
+  z::bus::emit_safe "evt" "$probe" || true
+  failed="$REPLY"
+
+  ztest::assert::eq "1" "$failed" "emit_safe reports exactly one failed handler"
+  ztest::assert::file_exists "$probe" "surviving handler ran despite crash"
+  command rm -f -- "$probe"
+}
+
+# High-priority handler fails; the lower-priority one must still run.
+test_zbus_emit_safe_survives_handler_crash() {
+  _zbus_emit_safe_isolation 80 20
+}
+
+# Isolation is independent of order: a later crash must not rewind a
+# handler that already ran.
+test_zbus_emit_safe_survives_later_handler_crash() {
+  _zbus_emit_safe_isolation 20 80
 }
 
 test_zbus_off_returns_count() {

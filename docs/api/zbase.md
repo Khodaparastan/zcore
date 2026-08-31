@@ -1,17 +1,10 @@
 # zbase API Reference
 
-> Complete reference for all public-facing functions and constants in `zbase`.
-> Every symbol prefixed `z::` or `Z_` is part of the stable public API.
-> Symbols prefixed `_z::` or `_ZBASE_` are private internals — do not call or
-> depend on them directly.
-
-> **⚠️ Stale symbol names.** This document predates the zbase v3.0.0 verb-root
-> rewrite and still uses the previous generation of names (`z::func::list`,
-> `z::exec::run`, `z::file::source`, `ZBASE_ERROR_*`, `_ZBASE_EXEC_*`). The
-> shipped module exposes `z::is:: / z::ensure:: / z::get:: / z::set:: / z::do::`
-> and the flat `Z_ERR_*` codes instead. Behavioural descriptions below are
-> being kept accurate; **treat the symbol names as out of date** and check
-> `zbase` itself. Full rename pending.
+> Complete reference for all public-facing functions and constants in
+> `zbase` v3. Every symbol prefixed `z::is::`, `z::ensure::`, `z::get::`,
+> `z::set::`, `z::do::`, `Z_ERR_`, `Z_SEP`, `Z_RECSEP`, or `Z_ESC` is part
+> of the stable public API. Symbols prefixed `_z::` or `_Z_` are private
+> internals — do not call or depend on them directly.
 
 ---
 
@@ -21,16 +14,13 @@
 2. [Error Codes](#2-error-codes)
 3. [Result Convention](#3-result-convention)
 4. [Binary Separator Constants](#4-binary-separator-constants)
-5. [Time Primitives](#5-time-primitives)
-6. [Option Parsing](#6-option-parsing)
-7. [Validation](#7-validation)
-8. [Filesystem Probes](#8-filesystem-probes)
-9. [Command Introspection](#9-command-introspection)
-10. [Function Utilities](#10-function-utilities)
-11. [Variable Utilities](#11-variable-utilities)
-12. [Environment Management](#12-environment-management)
-13. [Safe Execution](#13-safe-execution)
-14. [File Utilities](#14-file-utilities)
+5. [Time](#5-time)
+6. [Predicates — `z::is::`](#6-predicates--zis)
+7. [Guards — `z::ensure::`](#7-guards--zensure)
+8. [Value Queries — `z::get::`](#8-value-queries--zget)
+9. [Mutators — `z::set::`](#9-mutators--zset)
+10. [Effects — `z::do::`](#10-effects--zdo)
+11. [Dependencies](#11-dependencies)
 
 ---
 
@@ -38,13 +28,22 @@
 
 | Convention | Meaning |
 |---|---|
-| `REPLY` | Functions that return a scalar set `$REPLY` instead of using subshells |
-| `reply` | Functions that return a list set `$reply` (array) |
-| `REPLY2` | Optional secondary scalar; only populated when explicitly documented |
+| `REPLY` | Scalar result channel for functions that document it |
+| `reply` | Array result channel (`z::get::funcs`) |
+| `REPLY2` | Secondary scalar; only populated when documented |
 | Returns `0` | Success; non-zero on validation failure or error |
-| `ZBASE_ERROR_*` | Named error codes returned by all public functions |
+| `Z_ERR_*` | Named error codes returned by public functions |
 | `_z::` prefix | Private internal function — not part of the public API |
-| `_ZBASE_` prefix | Private internal variable — not part of the public API |
+
+The **verb root is the contract**:
+
+| Root | Contract |
+|---|---|
+| `z::is::` | Silent predicate — branch on `$?`, never sets `REPLY` |
+| `z::ensure::` | Guard — returns a code, logs on failure, never sets `REPLY` |
+| `z::get::` | Value query — uses the documented `REPLY`, `reply`, or stdout channel |
+| `z::set::` | State mutator — status only, never sets `REPLY` |
+| `z::do::` | Effects — sets `REPLY` only where documented (`run_async`) |
 
 ---
 
@@ -52,1674 +51,590 @@
 
 ```zsh
 #!/usr/bin/env zsh
+source /path/to/zcore/zcore.zsh
+# or, for zbase alone: source zlog; source zbase
 
-# zlog must be sourced first — zbase depends on it
-source ./zlog
-source ./zbase
+main() {
+  # ── Predicates ───────────────────────────────────────────────
+  z::is::file "$path" || return
+  z::is::int  "$port" || return
 
-# ── Binary-safe encoding ───────────────────────────────────────
-# Use Z_SEP / Z_RECSEP / Z_ESC when building binary-safe records
-local record="${field1}${Z_SEP}${field2}${Z_RECSEP}"
+  # ── Guards (log on failure) ──────────────────────────────────
+  z::ensure::nonempty "$1" "username" || return 1
+  z::ensure::int      "$2" "port"     || return 1
+  z::ensure::enum "dev|staging|prod" "$3" "environment" || return 1
 
-# ── Time primitives ────────────────────────────────────────────
-z::time::epoch;    local ts_s="$REPLY"
-z::time::epoch_ms; local ts_ms="$REPLY"
+  # ── Time ─────────────────────────────────────────────────────
+  z::get::epoch;    local ts_s="$REPLY"
+  z::get::epoch_ms; local ts_ms="$REPLY"
 
-# ── PATH management ────────────────────────────────────────────
-z::env::path_add "$HOME/.local/bin" prepend
-z::env::path_add "/opt/tools/bin"
+  # ── Option parsing ───────────────────────────────────────────
+  local -A opts
+  zparseopts -D -A opts -- f -force v -verbose n -dry-run
+  z::get::flag_force   opts; local force=$REPLY
+  z::get::flag_verbose opts; local verbose=$REPLY
+  z::get::opt opts o output /tmp/out.log
+  local output_file="$REPLY"
 
-# ── Validation ─────────────────────────────────────────────────
-z::validate::nonempty "$1"    "username"    || exit 1
-z::validate::integer  "$2"    "port"        || exit 1
-z::validate::enum "dev|staging|prod" "$3" "environment" || exit 1
+  # ── Paths ────────────────────────────────────────────────────
+  z::get::abspath  ~/src;  local abs="$REPLY"
+  z::get::realpath /usr/bin/python; local real="$REPLY"
 
-# ── Option parsing ─────────────────────────────────────────────
-local -A opts
-zparseopts -D -A opts -- f -force v -verbose n -dry-run
+  # ── Effects ──────────────────────────────────────────────────
+  z::do::run "ls -la /tmp" 10
+  z::do::hook starship
+  z::do::source "$HOME/.config/myapp/config.zsh"
+}
 
-z::opt::parse::force   opts; local force=$REPLY
-z::opt::parse::verbose opts; local verbose=$REPLY
-z::opt::parse::dryrun  opts; local dry_run=$REPLY
-
-z::opt::get opts 'o' 'output' '/tmp/out.log'
-local output_file="$REPLY"
-
-# ── Safe execution ─────────────────────────────────────────────
-z::exec::run "ls -la /tmp" 10
-
-# ── Tool initialization ────────────────────────────────────────
-z::exec::from_hook starship
-z::exec::from_hook mise
-z::exec::from_hook zoxide init zsh
-
-# ── File sourcing ──────────────────────────────────────────────
-z::file::source "$HOME/.config/myapp/config.zsh"
-z::file::source --global "$HOME/.zshenv"
-
-# ── Async jobs ─────────────────────────────────────────────────
-z::exec::async "sleep 2 && echo done" my_callback
-z::exec::wait_all
+main "$@"
 ```
 
 ---
 
 ## 2. Error Codes
 
-All public `z::*` functions return one of these named codes on failure. Both
-`ZBASE_ERROR_*` and `ZCORE_ERROR_*` names refer to the same values —
-`ZCORE_ERROR_*` is a backwards-compatible alias retained for callers that
-predated the zbase rename.
+Public `zbase` functions that can fail use these named codes where their
+individual contract does not specify a plain predicate or command status.
+There are no `ZBASE_ERROR_*` aliases.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `ZBASE_ERROR_GENERAL` | `1` | Unspecified or catch-all failure |
-| `ZBASE_ERROR_INVALID_INPUT` | `2` | Bad argument type, format, or value |
-| `ZBASE_ERROR_NOT_FOUND` | `3` | Resource (file, command, variable) not found |
-| `ZBASE_ERROR_PERMISSION` | `4` | Permission or safety check denied |
+| `Z_ERR_GENERAL` | 1 | Unspecified or catch-all failure |
+| `Z_ERR_INPUT` | 2 | Bad argument type, format, or value |
+| `Z_ERR_NOTFOUND` | 3 | Resource (file, command, variable) not found |
+| `Z_ERR_PERM` | 4 | Permission or safety check denied |
 
-**Example:**
+Most `z::ensure::*` guards return a plain `1` on failure. `z::ensure::cmd`,
+`z::ensure::func`, and `z::ensure::var` return `Z_ERR_INPUT` /
+`Z_ERR_NOTFOUND` instead.
 
 ```zsh
-z::file::source "/etc/missing.zsh"
-local rc=$?
-
-case $rc in
-  $ZBASE_ERROR_NOT_FOUND)     echo "File not found"     ;;
-  $ZBASE_ERROR_PERMISSION)    echo "Permission denied"  ;;
-  $ZBASE_ERROR_INVALID_INPUT) echo "Bad argument"       ;;
-  $ZBASE_ERROR_GENERAL)       echo "Unexpected failure" ;;
-esac
+z::get::realpath "$path" || {
+  case $? in
+    $Z_ERR_INPUT)    print -u2 "empty path" ;;
+    $Z_ERR_GENERAL)  print -u2 "symlink cycle" ;;
+  esac
+  return 1
+}
 ```
+
+Module-specific codes (for example `ZCORE_ERROR_TIMEOUT=124` in `z`) live
+in the module that defines them.
 
 ---
 
 ## 3. Result Convention
 
-Every public function that produces a value uses these globals as its return
-channel. Read the relevant variable **immediately** after the call and before
-invoking any other `z::*` function, which may overwrite it.
-
-| Variable | Type | Description |
-|---|---|---|
-| `REPLY` | scalar | Primary result. Set to `""` on entry; reset to `""` on error |
-| `reply` | array | List result. Set to `()` on entry of every list-returning function |
-| `REPLY2` | scalar | Optional secondary result. Only populated when explicitly documented |
-
-Functions that never produce a value (pure predicates, setters) do not touch
-`REPLY`, `reply`, or `REPLY2`.
-
-**Example:**
-
-```zsh
-# Scalar result
-z::var::get "MY_VAR" "default_value"
-local value="$REPLY"
-local type="$REPLY2"   # e.g. "scalar", "integer", "array", "association"
-
-# Array result
-z::func::list "z::env::*"
-local -a funcs=("${reply[@]}")
-
-# Read immediately — the next z:: call will overwrite REPLY
-z::cmd::which "git"
-local git_path="$REPLY"
-local git_type="$REPLY2"   # "external", "function", "alias", or "builtin"
-```
+- Read `REPLY`, `reply`, and `REPLY2` **immediately** after the call,
+  before calling another zcore function.
+- `z::is::` and `z::ensure::` never use the return channels for a result.
+- Most `z::get::` functions write `REPLY`; list and discovery functions may
+  use `reply` or stdout when documented. Read the function contract rather
+  than inferring the channel from the namespace alone.
+- On error, `REPLY` is `""` or the documented default.
+- Emit-path `zlog` is REPLY-neutral; raising the log level does not change
+  the values your code receives.
 
 ---
 
 ## 4. Binary Separator Constants
 
-Three read-only global constants for binary-safe field and record encoding.
-Chosen from the C0 control range: outside printable ASCII, extremely unlikely
-to appear in real-world values, and safely round-tripped through zsh string
-operations.
+Shared with `zkv` and `zbus` for binary-safe records:
 
-| Constant | Byte | C0 Name | Role |
-|---|---|---|---|
-| `Z_SEP` | `\x01` | US — Unit Separator | Field delimiter |
-| `Z_RECSEP` | `\x02` | STX — Start of Text | Record delimiter |
-| `Z_ESC` | `\x03` | ETX — End of Text | Escape prefix |
-
-All three are declared `typeset -gr` (global, readonly). They are part of the
-public contract consumed by `zkv`, `zbus`, and any component that needs
-binary-safe encoding.
-
-**Examples:**
-
-```zsh
-# Build a binary-safe record
-local record="${key}${Z_SEP}${value}${Z_RECSEP}"
-
-# Split a record on the field separator
-local -a fields=("${(@s:$Z_SEP:)record}")
-
-# Escape a value that may contain Z_SEP
-local safe_value="${value//$Z_SEP/${Z_ESC}${Z_SEP}}"
-```
-
----
-
-## 5. Time Primitives
-
-Zero-dependency, `REPLY`-based time functions. No fork on the hot path when
-`zsh/datetime` is loaded (which zbase attempts at startup). All functions set
-`$REPLY`; they do not print to stdout.
-
----
-
-### `z::time::epoch`
-
-Sets `$REPLY` to the current Unix epoch in whole seconds.
-
-```
-z::time::epoch
-```
-
-**Returns:** `0` always. Sets `$REPLY` to an integer second count.
-
-**Notes:**
-
-- Uses `$EPOCHSECONDS` (from `zsh/datetime`) when available — no fork
-- Falls back to `$(date +%s)` otherwise
-
-**Example:**
-
-```zsh
-z::time::epoch
-local start_ts="$REPLY"
-do_work
-z::time::epoch
-local elapsed=$(( REPLY - start_ts ))
-echo "Elapsed: ${elapsed}s"
-```
-
----
-
-### `z::time::epoch_ms`
-
-Sets `$REPLY` to the current Unix epoch in milliseconds. Uses integer string
-composition to avoid floating-point precision loss.
-
-```
-z::time::epoch_ms
-```
-
-**Returns:** `0` always. Sets `$REPLY` to an integer millisecond count.
-
-**Notes:**
-
-- Uses `$EPOCHREALTIME` (from `zsh/datetime`) when available — no fork
-- `$EPOCHREALTIME` carries a 6-digit microsecond fraction; only the first 3
-  digits (milliseconds) are used
-- Falls back to `date +%s%3N`, then `$(date +%s) * 1000`
-
-**Example:**
-
-```zsh
-z::time::epoch_ms
-local t0="$REPLY"
-do_work
-z::time::epoch_ms
-echo "Elapsed: $(( REPLY - t0 ))ms"
-```
-
----
-
-### `z::time::epoch_ns`
-
-Sets `$REPLY` to the current Unix epoch in nanoseconds.
-
-```
-z::time::epoch_ns
-```
-
-**Returns:** `0` always. Sets `$REPLY` to an integer nanosecond count.
-
-**Notes:**
-
-- Uses `$EPOCHREALTIME` when available. Because `$EPOCHREALTIME` has
-  microsecond precision, the last three nanosecond digits are always `000` —
-  this is a known platform limitation, not a bug
-- Falls back to `date +%s%N`, then `$(date +%s) * 1000000000`
-
-**Example:**
-
-```zsh
-z::time::epoch_ns
-local ns_before="$REPLY"
-do_work
-z::time::epoch_ns
-echo "Elapsed: $(( REPLY - ns_before ))ns"
-```
-
----
-
-### `z::time::monotonic_ms`
-
-Sets `$REPLY` to milliseconds since an arbitrary fixed point. Intended for
-benchmarks where wall-clock jumps would corrupt measurements.
-
-```
-z::time::monotonic_ms
-```
-
-**Returns:** `0` always. Sets `$REPLY` to a millisecond count.
-
-**Notes:**
-
-- **Current limitation:** zsh exposes no native `CLOCK_MONOTONIC` and
-  `$SECONDS` is also wall-clock. Without a compiled C helper, this function
-  falls back to `z::time::epoch_ms`. Callers that require true monotonic
-  behaviour should use a compiled helper
-- The function signature is stable; the implementation will be upgraded if a
-  native monotonic source becomes available
-
-**Example:**
-
-```zsh
-z::time::monotonic_ms; local t0="$REPLY"
-heavy_operation
-z::time::monotonic_ms
-echo "Duration: $(( REPLY - t0 ))ms"
-```
-
----
-
-## 6. Option Parsing
-
-Helpers for reading values out of an associative array populated by
-`zparseopts`. Array keys are the raw flag strings (e.g. `"-v"`, `"--verbose"`).
-
-### Typical Setup
-
-```zsh
-local -A opts
-zparseopts -D -A opts -- \
-  f -force \
-  v -verbose \
-  n -dry-run \
-  o: -output:
-
-# Then use z::opt::* to read from $opts
-```
-
----
-
-### `z::opt::get`
-
-Retrieve the value of a short or long option from a parsed-options map. Sets
-`$REPLY` to the matched value, or to `$default_value` if the flag is absent.
-`REPLY2` and `reply` are cleared on entry but not otherwise populated.
-
-```
-z::opt::get <opts_var> <short_opt> <long_opt> [default_value]
-```
-
-| Parameter | Type | Description |
+| Constant | Byte | Role |
 |---|---|---|
-| `opts_var` | string | Name of the associative array holding parsed flags |
-| `short_opt` | string | Single-character flag name, without leading `"-"` |
-| `long_opt` | string | Long flag name, without leading `"--"` |
-| `default_value` | string | Value to use when the flag is absent (default: `""`) |
+| `Z_SEP` | `\x01` | Field delimiter |
+| `Z_RECSEP` | `\x02` | Record delimiter |
+| `Z_ESC` | `\x03` | Escape prefix |
 
-**Returns:** `0` always. `ZBASE_ERROR_INVALID_INPUT` if `opts_var` is empty.
-
-**Examples:**
-
-```zsh
-local -A opts
-zparseopts -D -A opts -- o: -output: p: -port: e: -env:
-
-# Read --output / -o with a default
-z::opt::get opts 'o' 'output' '/tmp/app.log'
-local output_file="$REPLY"   # → /tmp/app.log  (if flag absent)
-
-# Read --port / -p
-z::opt::get opts 'p' 'port' '8080'
-local port="$REPLY"
-
-# Long-only flag (no short equivalent — pass empty string for short_opt)
-z::opt::get opts '' 'env' 'development'
-local env="$REPLY"
-```
+Declared `typeset -gr`. Callers that build records must encode values that
+contain these bytes.
 
 ---
 
-### `z::opt::has`
+## 5. Time
 
-Predicate: returns `0` if the short or long option is present in the map.
+All four functions always return `0`. They set `REPLY` and clear `REPLY2`
+and `reply`.
 
-```
-z::opt::has <opts_var> <short_opt> <long_opt>
-```
-
-**Returns:** `0` if present, `1` if absent. `ZBASE_ERROR_INVALID_INPUT` if
-`opts_var` is empty. Returns `1` (not an error) if both `short_opt` and
-`long_opt` are empty.
-
-**Examples:**
-
-```zsh
-local -A opts
-zparseopts -D -A opts -- f -force v -verbose
-
-if z::opt::has opts 'f' 'force'; then
-  echo "Force mode enabled"
-fi
-
-if z::opt::has opts 'v' 'verbose'; then
-  echo "Verbose mode enabled"
-fi
-
-# Long-only check
-if z::opt::has opts '' 'dry-run'; then
-  echo "Dry run mode"
-fi
-```
-
----
-
-### `z::opt::parse::bool`
-
-Sets `$REPLY` to `1` if the option is present, `0` if absent. Thin wrapper
-around `z::opt::has` for boolean flag semantics.
-
-```
-z::opt::parse::bool <opts_var> <short_opt> <long_opt>
-```
-
-**Returns:** `0` always. Sets `$REPLY` to `1` or `0`.
-
-**Example:**
-
-```zsh
-local -A opts
-zparseopts -D -A opts -- v -verbose
-
-z::opt::parse::bool opts 'v' 'verbose'
-local is_verbose=$REPLY   # → 1 or 0
-```
-
----
-
-### `z::opt::parse::force`
-
-Sets `$REPLY` to `1` if `-f` or `--force` is present, `0` otherwise.
-
-```
-z::opt::parse::force <opts_var> [default]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `opts_var` | string | required | Name of the associative array |
-| `default` | `0`\|`1` | `0` | Value when flag is absent; must be `0` or `1` |
-
-**Returns:** `0` always. Sets `$REPLY` to `1` or `0`.
-
----
-
-### `z::opt::parse::dryrun`
-
-Sets `$REPLY` to `1` if `-n` or `--dry-run` is present, `0` otherwise.
-
-```
-z::opt::parse::dryrun <opts_var> [default]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `opts_var` | string | required | Name of the associative array |
-| `default` | `0`\|`1` | `0` | Value when flag is absent; must be `0` or `1` |
-
-**Returns:** `0` always. Sets `$REPLY` to `1` or `0`.
-
----
-
-### `z::opt::parse::verbose`
-
-Sets `$REPLY` to `1` if `-v` or `--verbose` is present, `0` otherwise.
-
-```
-z::opt::parse::verbose <opts_var> [default]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `opts_var` | string | required | Name of the associative array |
-| `default` | `0`\|`1` | `0` | Value when flag is absent; must be `0` or `1` |
-
-**Returns:** `0` always. Sets `$REPLY` to `1` or `0`.
-
----
-
-### `z::opt::parse::quiet`
-
-Sets `$REPLY` to `1` if `-q` or `--quiet` is present, `0` otherwise.
-
-```
-z::opt::parse::quiet <opts_var> [default]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `opts_var` | string | required | Name of the associative array |
-| `default` | `0`\|`1` | `0` | Value when flag is absent; must be `0` or `1` |
-
-**Returns:** `0` always. Sets `$REPLY` to `1` or `0`.
-
-**Combined example:**
-
-```zsh
-local -A opts
-zparseopts -D -A opts -- f -force n -dry-run v -verbose q -quiet
-
-z::opt::parse::force   opts; local force=$REPLY
-z::opt::parse::dryrun  opts; local dry_run=$REPLY
-z::opt::parse::verbose opts; local verbose=$REPLY
-z::opt::parse::quiet   opts; local quiet=$REPLY
-
-(( force   )) && zlog::warn "Force mode active — skipping safety checks"
-(( dry_run )) && zlog::info "Dry run — no changes will be made"
-```
-
----
-
-## 7. Validation
-
-Input-validation helpers. Each function logs a structured error and returns
-non-zero on failure, enabling clean `|| return $?` idioms.
-
-### `z::validate::nonempty`
-
-Validates that a value is not an empty string.
-
-```
-z::validate::nonempty <value> [field_name]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `value` | string | Value to check |
-| `field_name` | string | Human-readable label for error messages (default: `"Value"`) |
-
-**Returns:** `0` if non-empty, `1` if empty.
-
-**Examples:**
-
-```zsh
-z::validate::nonempty "$username"    "username"    || return 1
-z::validate::nonempty "$config_path" "config_path" || return $ZBASE_ERROR_INVALID_INPUT
-
-my_func() {
-  local name="${1:-}"
-  z::validate::nonempty "$name" "name" || return $ZBASE_ERROR_INVALID_INPUT
-  echo "Hello, $name"
-}
-```
-
----
-
-### `z::validate::integer`
-
-Validates that a value is a well-formed integer. Accepts negative integers;
-rejects leading zeros on multi-digit values (e.g. `"007"` is rejected).
-
-```
-z::validate::integer <value> [field_name]
-```
-
-**Returns:** `0` if valid, `1` if not an integer.
-
-**Examples:**
-
-```zsh
-z::validate::integer "$port"    "port"    || return 1
-z::validate::integer "$timeout" "timeout" || return 1
-z::validate::integer "-42"      "offset"  # → valid
-z::validate::integer "3.14"     "value"   # → invalid (not an integer)
-z::validate::integer "007"      "value"   # → invalid (leading zero)
-z::validate::integer "0"        "value"   # → valid (literal zero is accepted)
-```
-
----
-
-### `z::validate::integer::range`
-
-Validates that a value is an integer within an inclusive `[min, max]` range.
-Also validates that `min` and `max` are themselves valid integers and that
-`min <= max`. Uses base-10 forced arithmetic to prevent octal interpretation.
-
-```
-z::validate::integer::range <value> <min> <max> [field_name]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `value` | string | Value to validate |
-| `min` | string | Inclusive lower bound |
-| `max` | string | Inclusive upper bound |
-| `field_name` | string | Human-readable label (default: `"Value"`) |
-
-**Returns:** `0` if valid, `1` on any failure (invalid format, out of range,
-or invalid bounds).
-
-**Examples:**
-
-```zsh
-z::validate::integer::range "$port"    1    65535 "port"    || return 1
-z::validate::integer::range "$workers" 1    32    "workers" || return 1
-z::validate::integer::range "$level"   0    3     "level"   || return 1
-z::validate::integer::range "$offset"  -100 100   "offset"  || return 1
-```
-
----
-
-### `z::validate::identifier`
-
-Validates that a value is a non-empty string containing only alphanumerics,
-underscores, and hyphens. Suitable for user-facing identifiers, keys, and
-slugs.
-
-```
-z::validate::identifier <name> [context]
-```
-
-**Returns:** `0` if valid, `1` if invalid.
-
-**Examples:**
-
-```zsh
-z::validate::identifier "$plugin_name" "plugin_name" || return 1
-z::validate::identifier "my-service"   "service"     # → valid
-z::validate::identifier "my service"   "service"     # → invalid (space)
-z::validate::identifier "my.service"   "service"     # → invalid (dot)
-```
-
----
-
-### `z::validate::varname`
-
-Validates that a value is a legal Zsh variable name: must start with a letter
-or underscore, followed by zero or more alphanumerics or underscores.
-
-```
-z::validate::varname <name> [context]
-```
-
-**Returns:** `0` if valid, `1` if invalid.
-
-**Examples:**
-
-```zsh
-z::validate::varname "$target_var" "target_var" || return 1
-z::validate::varname "_MY_VAR"     "var"        # → valid
-z::validate::varname "2bad"        "var"        # → invalid (leading digit)
-z::validate::varname "my-var"      "var"        # → invalid (hyphen not allowed)
-```
-
----
-
-### `z::validate::enum`
-
-Validates that a value is one of a pipe-delimited set of allowed values.
-
-```
-z::validate::enum <allowed_values> <value> [field_name]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `allowed_values` | string | Pipe-delimited list of valid values (e.g. `"a\|b\|c"`) |
-| `value` | string | Value to validate |
-| `field_name` | string | Human-readable label (default: `"Value"`) |
-
-**Returns:** `0` if valid, `1` if not in the allowed set or if
-`allowed_values` is empty.
-
-**Examples:**
-
-```zsh
-z::validate::enum "dev|staging|prod"      "$env"    "environment" || return 1
-z::validate::enum "text|json"             "$format" "format"      || return 1
-z::validate::enum "prepend|append"        "$pos"    "position"    || return 1
-z::validate::enum "error|warn|info|debug" "$level"  "level"       || return 1
-```
-
----
-
-### `z::validate::boolean`
-
-Validates that a value is a recognised boolean representation. Accepted values
-are case-insensitive.
-
-```
-z::validate::boolean <value> [field_name]
-```
-
-| Accepted values | |
+| Function | `REPLY` |
 |---|---|
-| Truthy | `1`, `true`, `yes`, `on` |
-| Falsy | `0`, `false`, `no`, `off` |
+| `z::get::epoch` | Whole seconds since the Unix epoch |
+| `z::get::epoch_ms` | Milliseconds since the epoch |
+| `z::get::epoch_ns` | Nanoseconds since the epoch (last three digits are `0`; zsh has microsecond resolution) |
+| `z::get::mono_ms` | Alias of `z::get::epoch_ms` |
 
-**Returns:** `0` if valid, `1` if not a recognised boolean.
-
-**Examples:**
-
-```zsh
-z::validate::boolean "$enable_feature" "enable_feature" || return 1
-z::validate::boolean "true"   "flag"   # → valid
-z::validate::boolean "True"   "flag"   # → valid (case-insensitive)
-z::validate::boolean "yes"    "flag"   # → valid
-z::validate::boolean "maybe"  "flag"   # → invalid
-```
-
----
-
-## 8. Filesystem Probes
-
-Two tiers of filesystem testing:
-
-**Full functions** (`z::probe::path`, `z::probe::path::readable`,
-`z::probe::path::writable`) — log structured errors and return named error
-codes. Use these when you want automatic error reporting.
-
-**Lightweight predicates** (`z::probe::file`, `z::probe::dir`,
-`z::probe::readable`, `z::probe::writable`) — pure filesystem tests with no
-logging overhead. Use these in hot paths or simple guards.
-
----
-
-### `z::probe::path`
-
-Checks that a path exists and optionally matches a specific filesystem type.
-
-```
-z::probe::path <path> [path_type] [field_name]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `path` | string | required | Filesystem path to check |
-| `path_type` | string | `any` | `"file"`, `"dir"`, or `"any"` |
-| `field_name` | string | `"Path"` | Label for error messages |
-
-**Returns:** `0` if the path exists and matches the type, `1` otherwise.
-
-**Examples:**
+`z::get::mono_ms` is wall-clock time: zsh exposes no monotonic clock, so a
+system clock adjustment can make two successive readings go backwards.
 
 ```zsh
-z::probe::path "/etc/hosts"  file "config file"   || return 1
-z::probe::path "/var/log"    dir  "log directory"  || return 1
-z::probe::path "/tmp/work"   any  "work path"      || return 1
-
-deploy() {
-  z::probe::path "$1" file "deploy script" || return $?
-  z::probe::path "$2" dir  "target dir"    || return $?
-}
+z::get::epoch_ms
+local start=$REPLY
+# ... work ...
+z::get::epoch_ms
+print $(( REPLY - start ))   # elapsed ms
 ```
 
 ---
 
-### `z::probe::path::readable`
+## 6. Predicates — `z::is::`
 
-Checks that a path exists and is readable by the current process.
+Every predicate answers through `$?` alone: no logging, no fork, and the
+return channels are left exactly as the caller left them. A missing or
+empty argument is a "no" (return 1), never an error.
 
-```
-z::probe::path::readable <path> [field_name]
-```
+### Filesystem
 
-**Returns:** `0` if readable, `1` otherwise.
-
-**Examples:**
-
-```zsh
-z::probe::path::readable "/etc/passwd"       "passwd file" || return 1
-z::probe::path::readable "$HOME/.ssh/id_rsa" "private key" || return 1
-```
-
----
-
-### `z::probe::path::writable`
-
-Checks that a path is writable. If the path does not yet exist, checks that
-its parent directory is writable (i.e. the file could be created).
-
-```
-z::probe::path::writable <path> [field_name]
-```
-
-**Returns:** `0` if writable (or creatable), `1` otherwise.
-
-**Examples:**
-
-```zsh
-z::probe::path::writable "/var/log/app.log"          "log file"     || return 1
-z::probe::path::writable "/tmp/new_file.txt"          "output file"  || return 1
-z::probe::path::writable "/data/output/results.csv"   "results file" || return 1
-```
-
----
-
-### Lightweight Predicates
-
-Pure filesystem-test one-liners. No logging, no error codes — just a boolean
-return value. Suitable for guards in hot paths.
-
-| Function | Test | Equivalent |
-|---|---|---|
-| `z::probe::file <path>` | Regular file exists | `[[ -f $path ]]` |
-| `z::probe::dir <path>` | Directory exists | `[[ -d $path ]]` |
-| `z::probe::readable <path>` | Path is readable | `[[ -r $path ]]` |
-| `z::probe::writable <path>` | Path is writable | `[[ -w $path ]]` |
-
-**Examples:**
-
-```zsh
-if z::probe::file "$config"; then
-  source "$config"
-fi
-
-z::probe::dir "$cache_dir" || mkdir -p "$cache_dir"
-
-if ! z::probe::writable "$log_file"; then
-  echo "Cannot write to log" >&2
-  exit 1
-fi
-```
-
----
-
-### `z::probe::cmd`
-
-Returns `0` if a command is resolvable as any of: external binary, function,
-builtin, or alias.
-
-```
-z::probe::cmd <cmd>
-```
-
-**Returns:** `0` if found in any namespace, `1` if not found.
-`ZBASE_ERROR_INVALID_INPUT` if `cmd` is empty.
-
-**Examples:**
-
-```zsh
-z::probe::cmd "git"     || { echo "git required"; exit 1; }
-z::probe::cmd "jq"      || zlog::warn "jq not found; JSON output disabled"
-z::probe::cmd "my_func" && my_func --init
-```
-
----
-
-### `z::probe::func`
-
-Returns `0` if a Zsh function with the given name is currently defined.
-
-```
-z::probe::func <func>
-```
-
-**Returns:** `0` if defined, `1` if not. `ZBASE_ERROR_INVALID_INPUT` if
-`func` is empty.
-
-**Examples:**
-
-```zsh
-if z::probe::func "my_plugin::init"; then
-  my_plugin::init
-fi
-
-z::probe::func "cleanup_handler" && cleanup_handler
-```
-
----
-
-### `z::probe::var`
-
-Returns `0` if a variable with the given name is currently set (any type).
-
-```
-z::probe::var <name>
-```
-
-**Returns:** `0` if set, `1` if unset. `ZBASE_ERROR_INVALID_INPUT` if `name`
-is empty.
-
-**Examples:**
-
-```zsh
-if z::probe::var "MY_CONFIG"; then
-  zlog::debug "Using existing config" value "$MY_CONFIG"
-fi
-
-z::probe::var "PLUGIN_LOADED" || source plugin.zsh
-```
-
----
-
-## 9. Command Introspection
-
-### `z::cmd::which`
-
-Locate a command and report its type. Sets `$REPLY` to the resolved path or
-definition, and `$REPLY2` to the type string.
-
-Resolution order: **function → alias → builtin → external command**
-
-```
-z::cmd::which <cmd>
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_NOT_FOUND` if not found.
-`ZBASE_ERROR_INVALID_INPUT` if `cmd` is empty.
-
-| `$REPLY2` value | Meaning | `$REPLY` content |
-|---|---|---|
-| `function` | Defined Zsh function | Function body source |
-| `alias` | Shell alias | Alias expansion string |
-| `builtin` | Zsh builtin | Command name (same as input) |
-| `external` | Binary on `$PATH` | Absolute path to binary |
-
-**Examples:**
-
-```zsh
-z::cmd::which "ls"
-echo "$REPLY"    # → /bin/ls
-echo "$REPLY2"   # → external
-
-z::cmd::which "cd"
-echo "$REPLY2"   # → builtin
-
-z::cmd::which "ll"
-echo "$REPLY2"   # → alias  (if ll is aliased)
-
-z::cmd::which "my_func"
-echo "$REPLY2"   # → function
-
-if ! z::cmd::which "required_tool"; then
-  zlog::error "required_tool is not installed"
-  exit $ZBASE_ERROR_NOT_FOUND
-fi
-local tool_path="$REPLY"
-```
-
----
-
-## 10. Function Utilities
-
-### `z::func::call`
-
-Call a named function with optional arguments. In debug mode, automatically
-wraps the call with a context logger and benchmark timer for tracing.
-
-```
-z::func::call <func> [args ...]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `func` | string | Name of the function to call |
-| `args` | any | Arguments forwarded to the function |
-
-**Returns:** Exit code of the called function. `ZBASE_ERROR_NOT_FOUND` if the
-function is not defined. `ZBASE_ERROR_INVALID_INPUT` if `func` is empty.
-
-**Examples:**
-
-```zsh
-z::func::call "my_deploy" --env prod --force
-local rc=$?
-
-# Dynamic dispatch
-local handler="handle_${event_type}"
-if z::probe::func "$handler"; then
-  z::func::call "$handler" "$payload"
-fi
-
-# In debug mode, the following are logged automatically:
-# [DEBUG] func=my_deploy | Calling function argc=2
-# [INFO ] Benchmark: z::func::call:my_deploy | duration=245ms
-# [DEBUG] func=my_deploy | Function returned non-zero exit_code=1
-```
-
----
-
-### `z::func::unset`
-
-Remove a function definition from the current shell environment.
-
-```
-z::func::unset <target>
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_NOT_FOUND` if not defined.
-`ZBASE_ERROR_INVALID_INPUT` if `target` is empty. `ZBASE_ERROR_GENERAL` if
-`unfunction` fails unexpectedly.
-
-**Examples:**
-
-```zsh
-z::func::unset "my_temp_func"
-
-if z::probe::func "legacy_init"; then
-  z::func::unset "legacy_init"
-fi
-```
-
----
-
-### `z::func::list`
-
-List all defined functions matching an optional glob pattern. Sets `$reply`
-to the sorted array, one function name per element.
-
-```
-z::func::list [pattern]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `pattern` | glob | `*` | Glob pattern to filter function names |
-
-**Returns:** `0` always. Sets `$reply` to the sorted matching function names,
-one per element. Writes **nothing** to stdout — read `$reply` directly.
-
-**Notes:**
-
-- Passing an explicit empty string as the pattern triggers a one-time warning
-  and defaults to `*`
-
-**Examples:**
-
-```zsh
-# List all functions
-z::func::list
-local -a all_funcs=("${reply[@]}")
-
-# List all z::env:: functions
-z::func::list "z::env::*"
-local -a env_funcs=("${reply[@]}")
-
-# Pipeline use
-z::func::list "z::*" | grep "validate"
-```
-
----
-
-## 11. Variable Utilities
-
-### `z::var::get`
-
-Retrieve the value of a variable by name. Sets `$REPLY` to the value (or
-`$default` if unset) and `$REPLY2` to the Zsh type string.
-
-```
-z::var::get <name> [default]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `name` | string | Variable name to read |
-| `default` | string | Value to return if the variable is unset (default: `""`) |
-
-**Returns:** `0` always. Sets `$REPLY` to the value and `$REPLY2` to the Zsh
-type string (e.g. `"scalar"`, `"array"`, `"integer"`, `"association"`).
-
-**Notes:**
-
-- If `name` is empty, returns immediately with `REPLY=""` and no error
-- `$REPLY2` is the raw `${(tP)name}` type string from zsh, which may include
-  qualifiers such as `"scalar-export"` or `"array-readonly"`
-
-**Examples:**
-
-```zsh
-z::var::get "MY_CONFIG" "/etc/default.conf"
-local config="$REPLY"
-local type="$REPLY2"   # → "scalar" or "scalar-export", etc.
-
-z::var::get "UNSET_VAR" "fallback"
-echo "$REPLY"   # → fallback
-
-z::var::get "MY_ARRAY"
-if [[ $REPLY2 == *array* ]]; then
-  echo "It's an array"
-fi
-```
-
----
-
-### `z::var::set`
-
-Set a global variable by name. Validates the name before assignment.
-
-```
-z::var::set <name> [value]
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_INVALID_INPUT` if `name` is not a
-valid Zsh identifier.
-
-**Examples:**
-
-```zsh
-z::var::set "APP_ENV"     "production"
-z::var::set "APP_VERSION" "2.1.0"
-z::var::set "APP_DEBUG"   "0"
-
-local var_name="PLUGIN_${plugin_id}_LOADED"
-z::var::set "$var_name" "1"
-```
-
----
-
-### `z::var::unset`
-
-Remove a variable from the current shell environment. Refuses to unset
-readonly variables.
-
-```
-z::var::unset <target>
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_NOT_FOUND` if not set.
-`ZBASE_ERROR_PERMISSION` if readonly. `ZBASE_ERROR_INVALID_INPUT` if `target`
-is empty. `ZBASE_ERROR_GENERAL` if `unset` fails unexpectedly.
-
-**Examples:**
-
-```zsh
-z::var::unset "TEMP_TOKEN"
-
-if z::probe::var "OLD_CONFIG"; then
-  z::var::unset "OLD_CONFIG"
-fi
-```
-
----
-
-## 12. Environment Management
-
-### `z::env::path_add`
-
-Add a directory to `$PATH` with duplicate detection and optional position
-control. Skips silently if the directory does not exist.
-
-```
-z::env::path_add <dir> [position]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `dir` | string | required | Directory to add. Tilde and relative paths are normalized |
-| `position` | string | `append` | `"prepend"` or `"append"` |
-
-**Returns:** `0` on success or if already in `$PATH`.
-`ZBASE_ERROR_NOT_FOUND` if the directory does not exist.
-`ZBASE_ERROR_INVALID_INPUT` on bad arguments.
-
-**Notes:**
-
-- Tilde expansions (`~`, `~/...`, `~+`, `~-`) are resolved before comparison
-- Relative paths are resolved relative to `$PWD`
-- Invalidates the command hash table (`hash -r`) after modification
-- Duplicate detection uses the normalized absolute path
-
-**Examples:**
-
-```zsh
-z::env::path_add "$HOME/.local/bin" prepend
-z::env::path_add "/opt/homebrew/bin" prepend
-z::env::path_add "/opt/tools/bin"
-z::env::path_add "bin"               # relative → $PWD/bin
-z::env::path_add "~/.cargo/bin" prepend
-```
-
----
-
-### `z::env::path_remove`
-
-Remove all occurrences of a directory from `$PATH`.
-
-```
-z::env::path_remove <dir>
-```
-
-**Returns:** `0` always (removing a non-present directory is a no-op).
-`ZBASE_ERROR_INVALID_INPUT` if `dir` is empty.
-
-**Examples:**
-
-```zsh
-z::env::path_remove "/opt/old-tools/bin"
-z::env::path_remove "$HOME/.rbenv/bin"
-```
-
----
-
-### `z::env::path_has`
-
-Predicate: returns `0` if a directory is currently in `$PATH`.
-
-```
-z::env::path_has <dir>
-```
-
-**Returns:** `0` if present, `1` if absent. `ZBASE_ERROR_INVALID_INPUT` if
-`dir` is empty.
-
-**Examples:**
-
-```zsh
-if z::env::path_has "/usr/local/bin"; then
-  zlog::debug "Standard local bin already in PATH"
-fi
-
-z::env::path_has "$HOME/.cargo/bin" || z::env::path_add "$HOME/.cargo/bin"
-```
-
----
-
-### `z::env::alias_set`
-
-Create or update a shell alias. Validates the name and verifies the alias was
-registered after creation.
-
-```
-z::env::alias_set <alias_name> <alias_value>
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_INVALID_INPUT` if either argument is
-empty or the name contains spaces or `=`. `ZBASE_ERROR_GENERAL` if the alias
-was not registered after creation.
-
-**Examples:**
-
-```zsh
-z::env::alias_set "ll"   "ls -lah"
-z::env::alias_set "gs"   "git status"
-z::env::alias_set "k"    "kubectl"
-z::env::alias_set "grep" "grep --color=auto"
-```
-
----
-
-### `z::env::alias_unset`
-
-Remove an alias from the current shell environment.
-
-```
-z::env::alias_unset <alias_name>
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_NOT_FOUND` if the alias is not
-defined. `ZBASE_ERROR_INVALID_INPUT` if `alias_name` is empty.
-`ZBASE_ERROR_GENERAL` if removal fails unexpectedly.
-
-**Examples:**
-
-```zsh
-z::env::alias_unset "ll"
-z::env::alias_unset "old_shortcut"
-```
-
----
-
-### `z::env::export`
-
-Set and export a variable to the environment of child processes. Validates the
-name before assignment.
-
-```
-z::env::export <name> [value]
-```
-
-**Returns:** `0` on success. `ZBASE_ERROR_INVALID_INPUT` if `name` is not a
-valid Zsh identifier.
-
-**Examples:**
-
-```zsh
-z::env::export "APP_ENV"      "production"
-z::env::export "DATABASE_URL" "postgres://localhost/mydb"
-z::env::export "DEBUG"        "0"
-z::env::export "API_KEY"      "$secret_key"
-```
-
----
-
-## 13. Safe Execution
-
-The execution subsystem provides a layered security model for running shell
-commands from strings.
-
-### Security Model
-
-| Layer | Function | What it blocks |
-|---|---|---|
-| Metacharacter check | `z::do::run` | `;` `&` `|` `(` `)` `<` `>` newline `` ` `` — all compound commands, redirection and substitution |
-| Pattern scanner | `z::exec::scan` | Fork bombs, `rm -rf /`, `dd of=/dev/<disk>`, direct shell invocations |
-| Trusted eval | `_z::exec::eval_trusted` | Nothing — explicit trust boundary for known tool output |
-
----
-
-### `z::exec::scan`
-
-Lexically scan a command string for dangerous patterns. Does **not** parse
-shell syntax — uses whitespace tokenization and heuristics.
-
-```
-z::exec::scan <input>
-```
-
-**Returns:** `0` if no dangerous patterns found, `1` if blocked (also logs
-via `zlog::always`). `ZBASE_ERROR_INVALID_INPUT` if `input` is empty.
-
-**Blocked patterns:**
-
-| Pattern | Example |
+| Function | Yes when |
 |---|---|
-| Fork bomb | `:() { :|: & }; :` |
-| Direct shell invocation | `bash script.sh`, `zsh -c "..."` |
-| Dangerous `rm` | `rm -rf /`, `rm -rf ~`, `rm --no-preserve-root -rf /` |
-| Dangerous `dd` | `dd if=/dev/zero of=/dev/sda`, `dd if=x of=/dev/nvme0n1` |
+| `z::is::file <path>` | Regular file (`-f`); follows symlinks |
+| `z::is::dir <path>` | Directory (`-d`); follows symlinks |
+| `z::is::readable <path>` | Readable (`-r`) |
+| `z::is::writable <path>` | Writable (`-w`) |
+| `z::is::exec <path>` | Executable (`-x`) |
 
-**Notes:**
+### Shell tables
 
-- Whitelisted tool-init commands bypass pattern scanning, but only when the
-  input is a **single unchained literal invocation** — every token must be a
-  plain word. Chaining (`;`, `&&`, `|`), redirection and command substitution
-  all disqualify the fast path, so `starship init zsh; rm -rf /` is scanned
-  (and rejected) like any other input.
-- Scanning is lexical, not syntactic: the input is split with zsh's own
-  tokenizer, so control operators and any whitespace run separate words
-  correctly, but quoted arguments keep their quotes and are compared
-  literally. Treat `z::do::scan` as a heuristic, not a safety guarantee.
-
-**Examples:**
-
-```zsh
-if z::exec::scan "$user_input"; then
-  echo "Input is safe"
-else
-  echo "Dangerous input rejected"
-fi
-
-z::exec::is_safe "$user_input" && process_input "$user_input"
-```
-
----
-
-### `z::exec::is_safe`
-
-Alias for `z::exec::scan`. Returns `0` if the input passes all security
-checks.
-
-```
-z::exec::is_safe <input>
-```
-
----
-
-### `z::exec::run`
-
-Execute a command string in a child `zsh -c` process with optional timeout.
-Applies the metacharacter check and security scanner before execution.
-
-```
-z::exec::run <input> [timeout]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `input` | string | required | Command string to execute |
-| `timeout` | int | `30` | Timeout in seconds. `0` = no timeout. Max: `3600` |
-
-**Returns:** Exit code of the command, or:
-
-| Code | Meaning |
+| Function | Yes when |
 |---|---|
-| `ZBASE_ERROR_INVALID_INPUT` | Empty input or invalid/out-of-range timeout |
-| `ZBASE_ERROR_PERMISSION` | Metacharacters or scanner blocked the input |
-| `124` | Command timed out (POSIX `timeout(1)` sentinel) |
+| `z::is::cmd <name>` | External command, function, builtin, or alias (no `$PATH` walk) |
+| `z::is::func <name>` | Function is defined |
+| `z::is::builtin <name>` | Builtin is defined |
+| `z::is::alias <name>` | Alias is defined |
+| `z::is::var <name>` | Parameter is declared (empty still counts) |
+| `z::is::set <name>` | Alias of `z::is::var` |
 
-**Notes:**
+### Values
 
-- Runs in a child `zsh -o pipefail -c` process — **cannot** modify the
-  caller's environment
-- Uses `gtimeout` (preferred on macOS) or `timeout` if available; degrades
-  gracefully without them, logging a one-time debug warning
-- Whitelisted tool-init commands (e.g. `starship init zsh`) bypass **both**
-  the metacharacter check and the pattern scanner. That is why the fast path
-  accepts only a single unchained literal invocation — see `z::do::scan`.
+| Function | Yes when |
+|---|---|
+| `z::is::empty <value>` | The value is the empty string (takes the value, not a name) |
+| `z::is::blank <value>` | Empty or whitespace only |
+| `z::is::int <value>` | Canonical decimal integer: optional minus, no leading zeros, no surrounding whitespace |
+| `z::is::bool <value>` | One of `0`, `1`, `true`, `false`, `yes`, `no`, `on`, `off` (case-insensitive). Tests spelling only |
 
-**Examples:**
+### Types and options
+
+| Function | Yes when |
+|---|---|
+| `z::is::assoc <name>` | Named parameter exists and is an associative array |
+| `z::is::array <name>` | Named parameter exists and is an array. Associative arrays also match — use `z::is::assoc` to tell them apart |
+| `z::is::opt <opts-assoc-name> [short] [long]` | The named assoc holds `-<short>` or `--<long>` |
+| `z::is::path <dir>` | Directory is present in `$path` (absolutised first; compared literally) |
+
+`z::is::path` saves and restores the return channels around an internal
+`z::get::abspath` call, so the `z::is::` contract still holds.
 
 ```zsh
-z::exec::run "ls -la /tmp"
-z::exec::run "curl -s https://api.example.com/health" 10
-
-z::exec::run "make -j4" 300
-local rc=$?
-if (( rc == 124 )); then
-  zlog::error "Build timed out after 300s"
-elif (( rc != 0 )); then
-  zlog::error "Build failed" exit_code "$rc"
-fi
-
-z::exec::run "long_running_process" 0   # no timeout
+z::is::int "$port" || { print -u2 "not an integer"; return 1; }
+z::is::cmd jq     || { print -u2 "jq required";     return 1; }
 ```
 
 ---
 
-### `z::exec::eval`
+## 7. Guards — `z::ensure::`
 
-Thin wrapper around `z::exec::run`. Provided as a semantic alias for callers
-that prefer "eval" terminology. Identical behaviour and return codes.
+Each guard validates one condition, logs through `zlog` on failure, and
+reports only through its exit status. Most take a trailing field name used
+purely to label the log record.
 
-```
-z::exec::eval <input> [timeout]
-```
+Unless noted, failure is a plain `1`.
 
-**Returns:** Same as `z::exec::run`.
-
-**Example:**
-
-```zsh
-z::exec::eval "$dynamic_command" 60
-```
-
----
-
-### `z::exec::from_hook`
-
-Initialize a known shell tool by running its init subcommand and eval'ing the
-output in the **live shell environment**. Skips silently if the tool is not
-installed.
-
-```
-z::exec::from_hook <tool_name> [subcommand] [shell_arg]
-```
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `tool_name` | string | required | Name of the tool binary (looked up via `$commands[]`) |
-| `subcommand` | string | `init` | Subcommand passed as the first argument to the tool |
-| `shell_arg` | string | `zsh` | Shell name passed as the second argument to the tool |
-
-The tool is invoked as: `<tool_name> <subcommand> <shell_arg>`
-
-**Returns:** `0` if initialized successfully, if the tool is not found, or if
-the tool produced no output. `ZBASE_ERROR_GENERAL` if the tool's init output
-fails to eval.
-
-**Notes:**
-
-- The tool's output is eval'd via `_z::exec::eval_trusted`, which runs in the
-  **live shell** without `emulate -L zsh` — tool init code can modify `$PATH`,
-  set hooks, configure the prompt, define functions, etc.
-- The tool binary resolved via `$commands[]` is the trust boundary; its output
-  is **not** pattern-scanned (unlike `z::exec::run`)
-- If the tool exits non-zero but still produces output, the output is eval'd
-  and a debug message is logged
-- In debug mode, wraps the entire init in a benchmark timer
-
-**Examples:**
-
-```zsh
-# Standard two-argument init (tool init zsh)
-z::exec::from_hook starship          # → starship init zsh
-z::exec::from_hook mise              # → mise init zsh
-z::exec::from_hook direnv            # → direnv init zsh
-z::exec::from_hook zoxide            # → zoxide init zsh
-z::exec::from_hook atuin             # → atuin init zsh
-
-# Custom subcommand
-z::exec::from_hook pyenv "init" "-"  # → pyenv init -
-```
-
----
-
-### `z::exec::async`
-
-Run a command string in a background subshell via `z::exec::run`. Tracks the
-PID and optionally calls a callback function when the job completes.
-
-```
-z::exec::async <cmd> [callback]
-```
-
-| Parameter | Type | Description |
+| Function | Requires | Failure |
 |---|---|---|
-| `cmd` | string | Command string to run asynchronously |
-| `callback` | string | Optional function name; called as `callback <exit_code> <output>` |
-
-**Returns:** `0` on success; `$REPLY` = PID of the background job.
-`ZBASE_ERROR_INVALID_INPUT` if `cmd` is empty. `ZBASE_ERROR_GENERAL` if the
-PID cap (`50`) is reached.
-
-**Notes:**
-
-- Dead PIDs are pruned automatically before each new job is launched
-- The callback receives combined stdout+stderr as its second argument
-- Call `z::exec::wait_all` to reap all pending jobs before the shell exits
-
-**Examples:**
+| `z::ensure::set <name> [context]` | Parameter is declared | 1 |
+| `z::ensure::nonempty <value> [field]` | Non-empty value (takes the value, not a name) | 1 |
+| `z::ensure::identifier <name> [context]` | `[[:alnum:]_-]##` — handles and keys; may start with a digit | 1 |
+| `z::ensure::varname <name> [context]` | Legal shell variable name (`[[:alpha:]_][[:alnum:]_]#`) | 1 |
+| `z::ensure::int <value> [field]` | Same grammar as `z::is::int` | 1 |
+| `z::ensure::int_range <value> <min> <max> [field]` | Integer in an inclusive range; boundaries validated first | 1 |
+| `z::ensure::bool <value> [field]` | Accepted truth spelling | 1 |
+| `z::ensure::enum <a\|b\|c> <value> [field]` | Value is a member of the pipe-separated list (literal match, not glob) | 1 |
+| `z::ensure::path <path> [file\|dir\|any] [field]` | Path exists; type defaults to `any` | 1 |
+| `z::ensure::path::readable <path> [field]` | Path exists and is readable | 1 |
+| `z::ensure::path::writable <path> [field]` | Path is writable, or its parent is (so it can be created) | 1 |
+| `z::ensure::cmd <name>` | Name is runnable | `Z_ERR_INPUT` / `Z_ERR_NOTFOUND` |
+| `z::ensure::func <name>` | Function is defined (missing logged at warn) | `Z_ERR_INPUT` / `Z_ERR_NOTFOUND` |
+| `z::ensure::var <name>` | Parameter is declared | `Z_ERR_INPUT` / `Z_ERR_NOTFOUND` |
 
 ```zsh
-# Fire and forget
-z::exec::async "rsync -av /src/ /backup/"
-local job_pid="$REPLY"
+z::ensure::nonempty "$1" "username" || return 1
+z::ensure::int_range "$port" 1 65535 "port" || return 1
+z::ensure::enum "dev|staging|prod" "$env" "environment" || return 1
+z::ensure::path "$cfg" file "config" || return 1
+```
 
-# With callback
-on_build_done() {
-  local exit_code="$1" output="$2"
-  if (( exit_code == 0 )); then
-    zlog::info "Build succeeded"
-  else
-    zlog::error "Build failed" output "$output"
-  fi
-}
+Use `z::ensure::identifier` for store handles and keys; use
+`z::ensure::varname` before any `typeset -g` of a caller-supplied name.
 
-z::exec::async "make -j4" on_build_done
+---
 
-# Multiple parallel jobs
-z::exec::async "process_shard_1.sh"
-z::exec::async "process_shard_2.sh"
-z::exec::async "process_shard_3.sh"
-z::exec::wait_all
+## 8. Value Queries — `z::get::`
+
+Every function in this section sets `REPLY` before returning, on the
+success and the failure path alike.
+
+### Options
+
+Options maps are associative arrays filled by `zparseopts -D -A opts`.
+
+#### `z::get::opt`
+
+```
+z::get::opt <opts-assoc-name> [short-opt] [long-opt] [default]
+```
+
+Look up an option value, preferring the short form. Sets `REPLY` to the
+matched value or to `<default>`; clears `REPLY2` and `reply`.
+
+**Returns:** `0` on success. `Z_ERR_INPUT` when the map name is empty (REPLY
+still holds the default). An absent, non-assoc, or unmatched map is not an
+error and yields the default.
+
+```zsh
+local -A opts
+zparseopts -D -A opts -- o: -output:
+z::get::opt opts o output /tmp/out.log
+local output="$REPLY"
+```
+
+#### `z::get::opt_bool`
+
+```
+z::get::opt_bool <opts-assoc-name> [short-opt] [long-opt]
+```
+
+Sets `REPLY` to `1` when the option is present and `0` otherwise. Always
+returns `0`.
+
+#### `z::get::flag`
+
+```
+z::get::flag <opts-assoc-name> <short-flag> <long-flag> [default] [caller]
+```
+
+Resolve a boolean flag: present means `1`, otherwise `<default>` (must be
+`0` or `1`; anything else is warned about and treated as `0`). Sets
+`REPLY` to `0` or `1`. Returns `Z_ERR_INPUT` when the map name is empty,
+with `REPLY` still holding the default. `<caller>` only labels log records.
+
+Shorthands — each takes `<opts-assoc-name> [default]`:
+
+| Function | Flags |
+|---|---|
+| `z::get::flag_force` | `-f` / `--force` |
+| `z::get::flag_dryrun` | `-n` / `--dry-run` |
+| `z::get::flag_verbose` | `-v` / `--verbose` |
+| `z::get::flag_quiet` | `-q` / `--quiet` |
+
+```zsh
+z::get::flag_force opts
+(( REPLY )) && print "forcing"
+```
+
+### Introspection
+
+#### `z::get::var`
+
+```
+z::get::var <name> [default]
+```
+
+Read a parameter indirectly by name. Sets `REPLY` to the value or to
+`<default>` when unset, and `REPLY2` to the zsh type string (empty when
+unset). Always returns `0`. Distinguish "unset" from "set to the default"
+via `REPLY2`.
+
+#### `z::get::cmd`
+
+```
+z::get::cmd <name>
+```
+
+Resolve how a name would run in this shell. Sets `REPLY2` to the kind and
+`REPLY` to the detail:
+
+| `REPLY2` | `REPLY` |
+|---|---|
+| `function` | Function body |
+| `alias` | Alias expansion |
+| `builtin` | The name itself |
+| `external` | Absolute path |
+
+Resolution order is function, alias, builtin, external. Returns
+`Z_ERR_INPUT` when empty, `Z_ERR_NOTFOUND` when unknown.
+
+#### `z::get::funcs`
+
+```
+z::get::funcs [pattern]
+```
+
+Collect defined function names matching a glob (default `*`). Sets `reply`
+to the sorted matches and clears `REPLY` / `REPLY2`. Nothing is written to
+stdout. Always returns `0`. An explicit empty pattern warns once and
+defaults to `*`.
+
+```zsh
+z::get::funcs 'z::kv::*'
+print -l -- "${reply[@]}"
+```
+
+### Paths
+
+#### `z::get::abspath`
+
+```
+z::get::abspath <path>
+```
+
+Absolutise a path logically: expand a leading `~`, `~+`, or `~-`, prefix a
+relative path with `$PWD`, then collapse `.` and `..`. Symlinks are **not**
+resolved — use `z::get::realpath` for that. Always returns `0`; the path
+need not exist.
+
+#### `z::get::realpath`
+
+```
+z::get::realpath <path>
+```
+
+Resolve a path to its physical form with symlinks followed, in-process.
+Sets `REPLY` to the resolved path.
+
+**Returns:** `0` on success. `Z_ERR_INPUT` on an empty or all-whitespace
+path. `Z_ERR_GENERAL` on a symlink cycle or on exceeding
+`_Z_FILE_SYMLINK_MAX_ITER` hops (default 40) — in both cases `REPLY` holds
+the last path reached, not a resolved one.
+
+```zsh
+z::get::realpath /usr/bin/python || return $?
+local real="$REPLY"
 ```
 
 ---
 
-### `z::exec::wait_all`
+## 9. Mutators — `z::set::`
 
-Wait for all tracked async jobs to complete. Clears the internal PID list.
+These change shell state and report only through their exit status. None
+of them produces a value.
+
+#### `z::set::var` / `z::set::export`
 
 ```
-z::exec::wait_all
+z::set::var    <name> <value>
+z::set::export <name> <value>
 ```
 
-**Returns:** `0` if all jobs succeeded. Non-zero exit code of the last failed
-job. Exit code `127` (already reaped or never existed) is treated as success.
+Define or overwrite a global scalar. `export` also marks it exported. The
+name is validated first (`z::ensure::varname`), so the `typeset -g name=value`
+form cannot be steered into declaring something else.
 
-**Examples:**
+**Returns:** `0` on success; `Z_ERR_INPUT` on an illegal name.
+
+#### `z::set::unset_var`
+
+```
+z::set::unset_var <name>
+```
+
+Remove a parameter. Returns `Z_ERR_INPUT` on an empty name,
+`Z_ERR_NOTFOUND` when it is not declared, `Z_ERR_PERM` when it is
+readonly, and `Z_ERR_GENERAL` if the unset itself fails.
+
+#### `z::set::unset_func`
+
+```
+z::set::unset_func <name>
+```
+
+Remove a function definition. Returns `Z_ERR_INPUT` on an empty name,
+`Z_ERR_NOTFOUND` when no such function exists, `Z_ERR_GENERAL` if
+`unfunction` fails.
+
+#### `z::set::alias` / `z::set::unalias`
+
+```
+z::set::alias   <name> <value>
+z::set::unalias <name>
+```
+
+Define or remove an alias. The name is rejected if it contains whitespace
+or `=`. The registration is read back and verified.
+
+**Returns:** `Z_ERR_INPUT` on bad arguments, `Z_ERR_NOTFOUND` when
+unaliasing a missing name, `Z_ERR_GENERAL` if the alias did not take or
+the removal failed.
+
+#### `z::set::path::add`
+
+```
+z::set::path::add <dir> [prepend|append]
+```
+
+Add a directory to `$path`, absolutising it first and defaulting to
+`append`. Re-hashes the command table so the change takes effect
+immediately. Idempotent: an entry already present is logged once and
+skipped. Compared literally, not as a glob.
+
+**Returns:** `Z_ERR_INPUT` on bad arguments; `Z_ERR_NOTFOUND` when the
+directory does not exist (it is not added).
 
 ```zsh
-z::exec::async "job_a.sh"
-z::exec::async "job_b.sh"
-z::exec::async "job_c.sh"
-
-z::exec::wait_all
-local rc=$?
-if (( rc != 0 )); then
-  zlog::error "One or more async jobs failed" last_exit_code "$rc"
-fi
+z::set::path::add "$HOME/.local/bin" prepend
+z::set::var APP_ENV production
+z::set::export APP_ENV production
 ```
 
 ---
 
-## 14. File Utilities
+## 10. Effects — `z::do::`
 
-### `z::file::resolve`
+Invocation, sourcing, command execution, and the heuristic scanner that
+guards it. Only `z::do::run_async` sets `REPLY`; the rest report through
+their exit status and pass through the status of whatever they ran.
 
-Resolve a path to its physical (non-symlink) location, following symlink
-chains up to 40 steps. Detects and aborts on cycles. Sets `$REPLY` to the
-resolved path.
+#### `z::do::call`
 
 ```
-z::file::resolve <path>
+z::do::call <func> [args ...]
 ```
 
-**Returns:** `0` on success; `$REPLY` = physical path.
-`ZBASE_ERROR_INVALID_INPUT` if path is empty or whitespace-only.
-`ZBASE_ERROR_GENERAL` if max iterations exceeded or a symlink cycle is
-detected (`$REPLY` is set to the last known path before the error).
+Invoke a shell function by name and return its exit status unchanged.
+Returns `Z_ERR_INPUT` on an empty name and `Z_ERR_NOTFOUND` when no such
+function exists. Under a debug log level the call is wrapped in a zlog
+context and benchmark; the context is always removed, even on a non-zero
+status.
 
-**Notes:**
+#### `z::do::source`
 
-- Uses `zsh/stat` (`zstat`) if available (zero-fork); otherwise falls back to
-  `readlink(1)`
-- Tilde and relative paths are normalized before resolution
-- Uses `cd -P && pwd -P` to resolve the physical directory component
-- If neither `zsh/stat` nor `readlink` is available, symlink resolution is
-  skipped and the normalized path is returned as-is
+```
+z::do::source [--global] <file> [args ...]
+```
 
-**Examples:**
+Source a file and return its exit status. Without `--global` the file is
+sourced under `emulate -L zsh`, so option changes it makes do not leak
+into the caller; `--global` runs it in the caller's own option state,
+which is what a file defining shell configuration needs.
+
+**Returns:** `Z_ERR_INPUT` or `Z_ERR_NOTFOUND` from path resolution;
+otherwise the sourced file's status.
 
 ```zsh
-z::file::resolve "/usr/bin/python3"
-local real_path="$REPLY"
-# → /usr/bin/python3.12  (or wherever the chain ends)
+z::do::source "$HOME/.config/myapp/lib.zsh"
+z::do::source --global "$HOME/.zshenv"
+```
 
-z::file::resolve "~/bin/my-script"
-echo "$REPLY"   # → /home/alice/bin/my-script
+#### `z::do::scan`
 
-z::file::resolve "/etc/localtime"
-echo "$REPLY"   # → /usr/share/zoneinfo/America/New_York
+```
+z::do::scan <command-string>
+```
 
-if ! z::file::resolve "$symlink_path"; then
-  zlog::warn "Could not resolve symlink" path "$symlink_path"
-fi
+Scan a command string for the dangerous patterns `z::do::run` refuses.
+Returns `Z_ERR_INPUT` when empty, `1` when a pattern matched, `0`
+otherwise.
+
+A clean result is **not** a certificate that the string is safe to
+execute — the name claims only "I looked".
+
+#### `z::do::run`
+
+```
+z::do::run <command-string> [timeout-seconds]
+```
+
+Execute a command string in a fresh `zsh -o pipefail -c` subshell and
+return its exit status. The timeout defaults to 30 seconds, is capped at
+3600, and `0` disables it. With no timeout binary available (`timeout` on
+Linux, `gtimeout` on macOS) the command still runs, unbounded, and that
+is noted once. A timeout surfaces as exit status `124`.
+
+**Returns:** `Z_ERR_INPUT` on an empty command or a bad timeout,
+`Z_ERR_PERM` when the metacharacter gate rejects the string, `1` when the
+pattern scan does, otherwise the command's status.
+
+The interface is string-in, so the string is parsed a second time by the
+subshell — the gate and the scan are what stand between the caller and
+that reparse. An argv interface would remove the attack class outright;
+the string form is kept for the tool-init call sites in `z::do::hook`.
+
+A bare `<tool> init <shell>` invocation of a known integration tool
+(starship, mise, zoxide, …) skips both the metacharacter gate and the
+pattern scan. Every token must be a plain word — chaining, redirection,
+and command substitution are rejected.
+
+```zsh
+z::do::run "ls -la /tmp" 10
+z::do::run "jq -e . < data.json"
+```
+
+#### `z::do::run_async`
+
+```
+z::do::run_async <command-string> [callback-func]
+```
+
+Launch a command in the background through `z::do::run` and record its
+PID. Sets `REPLY` to the PID.
+
+**Returns:** `0` on launch. `Z_ERR_INPUT` on an empty command.
+`Z_ERR_GENERAL` when 50 live jobs are already outstanding — call
+`z::do::wait` first.
+
+`<callback-func>` is invoked with the exit status and captured output
+**inside the child**, so anything it assigns dies with that subshell and
+can never reach the parent.
+
+#### `z::do::wait`
+
+```
+z::do::wait
+```
+
+Block until every job started by `z::do::run_async` has finished. Returns
+the status of the last job that failed, or `0` if all succeeded. Status
+`127` is ignored because it means the job was already reaped.
+
+```zsh
+z::do::run_async "sleep 2 && echo done"
+z::do::wait
+```
+
+#### `z::do::hook`
+
+```
+z::do::hook <tool-name> [subcommand] [shell-arg]
+```
+
+Initialise a shell integration tool (starship, mise, zoxide, …) from a
+cached copy of its `<tool> <subcommand> <shell>` output, regenerating the
+cache when it is missing or stale. Defaults are `init` and `zsh`.
+
+An absent tool is not an error and returns `0`. `Z_ERR_GENERAL` means the
+tool produced output that could neither be sourced nor evaluated.
+
+The output of a known binary is evaluated unscanned, unlike the strings
+`z::do::run` accepts. The cache directory is `0700` and writes are atomic
+because everything in it is executed. Cache files live under
+`${XDG_CACHE_HOME:-$HOME/.cache}/zsh/hooks/`.
+
+```zsh
+z::do::hook starship
+z::do::hook mise
+z::do::hook zoxide init zsh
 ```
 
 ---
 
-### `z::file::source`
+## 11. Dependencies
 
-Source a file with optional scope control. Validates, normalizes, and
-readability-checks the path before sourcing. In debug mode, wraps the source
-in a benchmark timer.
-
-```
-z::file::source [--global] <file> [args ...]
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `--global` | flag | Source in the live shell scope (no `emulate -L`). Required for files that modify shell options, define hooks, or configure the prompt |
-| `file` | string | Path to the file to source |
-| `args` | any | Additional arguments passed to the sourced file as `$@` |
-
-**Returns:** Exit code of the sourced file, or a `ZBASE_ERROR_*` code on
-failure.
-
-**Scope behaviour:**
-
-| Mode | Shell options | Use case |
-|---|---|---|
-| Default | `emulate -L zsh` + `extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst` | Library files, config files, plugins |
-| `--global` | Live shell environment (no emulate) | `.zshenv`, tool init files, prompt themes |
-
-**Notes:**
-
-- Symlink resolution is skipped when `_ZBASE_PERF_MODE=1`
-- The file must exist as a regular file and be readable; a warning is logged
-  and `ZBASE_ERROR_NOT_FOUND` is returned otherwise
-
-**Examples:**
+`zlog` must already be sourced, or the load aborts with a fatal message
+on stderr. Loading is idempotent (`_Z_BASE_LOADED`).
 
 ```zsh
-# Standard isolated scope
-z::file::source "$HOME/.config/myapp/config.zsh"
-z::file::source "/usr/local/lib/mylib.zsh"
-
-# Live shell scope — needed for files that set options or hooks
-z::file::source --global "$HOME/.zshenv"
-z::file::source --global "/etc/zsh/zshrc.d/prompt.zsh"
-
-# Pass arguments to the sourced file ($@ inside the file will be set)
-z::file::source "setup.zsh" "--env" "production" "--debug"
-
-# Error handling
-if ! z::file::source "$plugin_file"; then
-  zlog::warn "Plugin failed to load" path "$plugin_file"
-fi
-
-# Conditional sourcing
-local extra_config="$HOME/.zshrc.local"
-z::probe::file "$extra_config" && z::file::source "$extra_config"
+source /path/to/zcore/zcore.zsh
+# or:
+source ./zlog
+source ./zbase
 ```
-
----
-
-## Function & Constant Index
-
-| Symbol | Category | Description |
-|---|---|---|
-| `Z_SEP` | Constants | Field delimiter (`\x01`) |
-| `Z_RECSEP` | Constants | Record delimiter (`\x02`) |
-| `Z_ESC` | Constants | Escape prefix (`\x03`) |
-| `z::time::epoch` | Time | Current Unix epoch in seconds |
-| `z::time::epoch_ms` | Time | Current Unix epoch in milliseconds |
-| `z::time::epoch_ns` | Time | Current Unix epoch in nanoseconds |
-| `z::time::monotonic_ms` | Time | Monotonic milliseconds (falls back to epoch_ms) |
-| `z::opt::get` | Options | Get option value from parsed-opts map |
-| `z::opt::has` | Options | Check if option is present |
-| `z::opt::parse::bool` | Options | Parse any flag as boolean |
-| `z::opt::parse::force` | Options | Parse `-f` / `--force` |
-| `z::opt::parse::dryrun` | Options | Parse `-n` / `--dry-run` |
-| `z::opt::parse::verbose` | Options | Parse `-v` / `--verbose` |
-| `z::opt::parse::quiet` | Options | Parse `-q` / `--quiet` |
-| `z::validate::nonempty` | Validation | Reject empty strings |
-| `z::validate::integer` | Validation | Validate integer format |
-| `z::validate::integer::range` | Validation | Validate integer within bounds |
-| `z::validate::identifier` | Validation | Validate alphanumeric/hyphen/underscore |
-| `z::validate::varname` | Validation | Validate Zsh variable name |
-| `z::validate::enum` | Validation | Validate against allowed values |
-| `z::validate::boolean` | Validation | Validate boolean representation |
-| `z::probe::path` | Probes | Check path existence and type |
-| `z::probe::path::readable` | Probes | Check path is readable |
-| `z::probe::path::writable` | Probes | Check path is writable or creatable |
-| `z::probe::file` | Probes | Lightweight regular-file test |
-| `z::probe::dir` | Probes | Lightweight directory test |
-| `z::probe::readable` | Probes | Lightweight readable test |
-| `z::probe::writable` | Probes | Lightweight writable test |
-| `z::probe::cmd` | Probes | Check command exists in any namespace |
-| `z::probe::func` | Probes | Check function is defined |
-| `z::probe::var` | Probes | Check variable is set |
-| `z::cmd::which` | Introspection | Locate command and report type |
-| `z::func::call` | Functions | Call function with debug tracing |
-| `z::func::unset` | Functions | Remove function definition |
-| `z::func::list` | Functions | List functions by glob pattern |
-| `z::var::get` | Variables | Get variable value by name |
-| `z::var::set` | Variables | Set global variable by name |
-| `z::var::unset` | Variables | Remove variable |
-| `z::env::path_add` | Environment | Add directory to `$PATH` |
-| `z::env::path_remove` | Environment | Remove directory from `$PATH` |
-| `z::env::path_has` | Environment | Check directory is in `$PATH` |
-| `z::env::alias_set` | Environment | Create or update alias |
-| `z::env::alias_unset` | Environment | Remove alias |
-| `z::env::export` | Environment | Set and export variable |
-| `z::exec::scan` | Execution | Scan command string for dangerous patterns |
-| `z::exec::is_safe` | Execution | Predicate alias for `z::exec::scan` |
-| `z::exec::run` | Execution | Run command string in child shell |
-| `z::exec::eval` | Execution | Semantic alias for `z::exec::run` |
-| `z::exec::from_hook` | Execution | Initialize tool via its init subcommand |
-| `z::exec::async` | Execution | Run command in background with PID tracking |
-| `z::exec::wait_all` | Execution | Wait for all async jobs |
-| `z::file::resolve` | Files | Resolve path through symlink chain |
-| `z::file::source` | Files | Source file with scope control |

@@ -48,7 +48,7 @@
 | `reply` | Array result channel (lists of keys, members, scan pages, etc.) |
 | `REPLY2` | Secondary scalar; used by `z::kv::get` for the stored type name |
 | Returns `0` | Success; non-zero on validation failure or error |
-| `ZBASE_ERROR_*` | Named error codes from `zbase` (required dependency) |
+| `Z_ERR_*` | Named error codes from `zbase` (required dependency) |
 | `_z::kv::*` | Private internal function — not part of the public API |
 | `_zkv_*` | Private internal variable — not part of the public API |
 
@@ -60,7 +60,7 @@ Read `REPLY`, `reply`, and `REPLY2` **immediately** after each call. Subsequent
 ### Structure Types
 
 Every key has exactly one structure. Mixing operations across structures on the
-same key returns `ZBASE_ERROR_PERMISSION`.
+same key returns `Z_ERR_PERM`.
 
 | Structure | Metadata type | Storage |
 |---|---|---|
@@ -76,10 +76,10 @@ After `z::kv::del`, a key may be reused with any structure.
 
 | Constant | Typical zkv usage |
 |---|---|
-| `ZBASE_ERROR_INVALID_INPUT` | Bad handle/key/value, malformed arguments |
-| `ZBASE_ERROR_NOT_FOUND` | Unknown handle, missing key, absent snapshot |
-| `ZBASE_ERROR_PERMISSION` | Type collision, `setnx` on existing key, lock held, CAS mismatch, duplicate set member |
-| `ZBASE_ERROR_GENERAL` | Save/load failure, batch rollback, epoch unavailable |
+| `Z_ERR_INPUT` | Bad handle/key/value, malformed arguments |
+| `Z_ERR_NOTFOUND` | Unknown handle, missing key, absent snapshot |
+| `Z_ERR_PERM` | Type collision, `setnx` on existing key, lock held, CAS mismatch, duplicate set member |
+| `Z_ERR_GENERAL` | Save/load failure, batch rollback, epoch unavailable |
 
 ---
 
@@ -88,10 +88,8 @@ After `z::kv::del`, a key may be reused with any structure.
 ```zsh
 #!/usr/bin/env zsh
 
-# zlog and zbase must be sourced first
-source ./zlog
-source ./zbase
-source ./zkv
+source /path/to/zcore/zcore.zsh
+# or, for zkv alone: source zlog; source zbase; source zkv
 
 # ── Open a store ───────────────────────────────────────────────
 z::kv::open myapp --auto-persist "$HOME/.cache/myapp.kv"
@@ -160,8 +158,8 @@ z::kv::open <name> [options...]
 | `--auto-persist` | path | — | Enable auto-persistence to the given file |
 
 **Returns:** `0` on success. Sets `$REPLY` to `<name>`.
-`ZBASE_ERROR_INVALID_INPUT` on bad name or options.
-`ZBASE_ERROR_GENERAL` if `--auto-persist` path setup fails.
+`Z_ERR_INPUT` on bad name or options.
+`Z_ERR_GENERAL` if `--auto-persist` path setup fails.
 
 **Notes:**
 
@@ -186,7 +184,7 @@ Flush pending auto-persist writes, free all per-store state, and unregister the 
 z::kv::close <handle>
 ```
 
-**Returns:** `0` on success. `ZBASE_ERROR_NOT_FOUND` if handle is unknown.
+**Returns:** `0` on success. `Z_ERR_NOTFOUND` if handle is unknown.
 
 **Notes:**
 
@@ -226,8 +224,8 @@ z::kv::set <handle> <key> <value> [--ttl <seconds>] [--type <type>]
 | `--type` | string | `string` | Metadata type: `string`, `int`, `bool`, `array` |
 
 **Returns:** `0` on success.
-`ZBASE_ERROR_INVALID_INPUT` if value exceeds `max_value_length` or type is non-scalar.
-`ZBASE_ERROR_PERMISSION` on structure type collision.
+`Z_ERR_INPUT` if value exceeds `max_value_length` or type is non-scalar.
+`Z_ERR_PERM` on structure type collision.
 
 **Notes:**
 
@@ -254,7 +252,7 @@ z::kv::get <handle> <key>
 ```
 
 **Returns:** `0` on success.
-`ZBASE_ERROR_NOT_FOUND` if the key is absent or expired.
+`Z_ERR_NOTFOUND` if the key is absent or expired.
 
 **Example:**
 
@@ -275,7 +273,7 @@ z::kv::del <handle> <key>
 ```
 
 **Returns:** `0` on success.
-`ZBASE_ERROR_NOT_FOUND` if the key does not exist (non-transactional path).
+`Z_ERR_NOTFOUND` if the key does not exist (non-transactional path).
 
 ---
 
@@ -320,7 +318,7 @@ z::kv::get_int <handle> <key>
 ```
 
 `get_int` sets `$REPLY` to the integer string.
-`ZBASE_ERROR_INVALID_INPUT` if the stored value is not a valid integer.
+`Z_ERR_INPUT` if the stored value is not a valid integer.
 
 ---
 
@@ -432,7 +430,7 @@ z::kv::expire <handle> <key> <ttl-seconds>
 | `> 0` | Expire after N seconds from now |
 | `≤ 0` | Remove expiry (make persistent) |
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if the key does not exist.
+**Returns:** `Z_ERR_NOTFOUND` if the key does not exist.
 
 ---
 
@@ -507,7 +505,7 @@ Set only if the key does **not** exist (SET if Not eXists).
 z::kv::setnx <handle> <key> <value>
 ```
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if the key already exists.
+**Returns:** `Z_ERR_PERM` if the key already exists.
 
 ---
 
@@ -519,7 +517,7 @@ Set only if the key **does** exist (SET if eXists).
 z::kv::setxx <handle> <key> <value>
 ```
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if the key is absent.
+**Returns:** `Z_ERR_NOTFOUND` if the key is absent.
 
 ---
 
@@ -531,7 +529,7 @@ Compare-And-Swap: set `<new-value>` only when the current value equals `<expecte
 z::kv::cas <handle> <key> <expected> <new-value>
 ```
 
-**Returns:** `ZBASE_ERROR_PERMISSION` on mismatch.
+**Returns:** `Z_ERR_PERM` on mismatch.
 An absent key is treated as having current value `""`.
 
 ---
@@ -548,7 +546,7 @@ are not supported.
 z::kv::begin <handle>
 ```
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if a transaction is already active.
+**Returns:** `Z_ERR_PERM` if a transaction is already active.
 
 ---
 
@@ -614,8 +612,8 @@ Expired keys are skipped.
 z::kv::save <handle> <file>
 ```
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if the parent directory is not writable.
-`ZBASE_ERROR_GENERAL` on write or rename failure.
+**Returns:** `Z_ERR_PERM` if the parent directory is not writable.
+`Z_ERR_GENERAL` on write or rename failure.
 
 ---
 
@@ -631,13 +629,15 @@ z::kv::load <handle> <file> [--clear]
 |---|---|
 | `--clear` | Wipe the store before loading |
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if the file is unreadable.
-`ZBASE_ERROR_GENERAL` if the format version is unreadable or newer than supported.
+**Returns:** `Z_ERR_NOTFOUND` if the file is unreadable.
+`Z_ERR_GENERAL` if the format version is unreadable or newer than supported.
 
 **Notes:**
 
 - `auto_persist` is suppressed during bulk load to avoid per-key disk writes
 - Dump files with `version` greater than `ZKV_PERSIST_FORMAT_VERSION` are rejected
+- Without `--clear`, loaded keys overwrite same-name keys while unrelated live
+  keys remain in the store. With `--clear`, the dump replaces store contents.
 
 ---
 
@@ -669,7 +669,9 @@ not automatic — the path or its parent must exist and be writable).
 
 ## 12. Locks
 
-Named locks with TTL-based expiry. Expired locks are silently taken over.
+Named cooperative locks with TTL-based expiry. Lock records live in the open
+store inside the current Zsh process; they do not coordinate separate processes
+or provide operating-system file locking. Expired locks are silently taken over.
 
 ### `z::kv::lock`
 
@@ -682,7 +684,7 @@ z::kv::lock <handle> <lock-name> [<ttl>] [<owner>]
 | `ttl` | `10` | Lock expiry in seconds |
 | `owner` | `""` | Owner identifier stored with the lock |
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if the lock is held and not expired.
+**Returns:** `Z_ERR_PERM` if the lock is held and not expired.
 
 ---
 
@@ -692,8 +694,8 @@ z::kv::lock <handle> <lock-name> [<ttl>] [<owner>]
 z::kv::unlock <handle> <lock-name> [<owner>]
 ```
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if lock absent.
-`ZBASE_ERROR_PERMISSION` if `owner` does not match the recorded owner.
+**Returns:** `Z_ERR_NOTFOUND` if lock absent.
+`Z_ERR_PERM` if `owner` does not match the recorded owner.
 
 ---
 
@@ -712,7 +714,7 @@ z::kv::lock_wait <handle> <lock-name> [<ttl>] [<attempts>] [<interval>] [<owner>
 
 Uses `zselect` for sub-second sleep when `zsh/zselect` is available; falls back to `sleep`.
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if all attempts fail.
+**Returns:** `Z_ERR_PERM` if all attempts fail.
 
 ---
 
@@ -743,7 +745,7 @@ handler <handle> <key> <value> <op>
 | `lupdate`, `supdate`, `zupdate`, `hupdate` | Collection committed in transaction |
 | `rename_from`, `rename_to`, `copy` | Key rename/copy |
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if the handler function is not defined.
+**Returns:** `Z_ERR_NOTFOUND` if the handler function is not defined.
 
 **Notes:**
 
@@ -780,16 +782,16 @@ Ordered collections. Indices are 0-based; negative indices count from the end.
 | `z::kv::lindex <handle> <key> [<index>]` | Element at index (default `0`) | `$REPLY` |
 | `z::kv::lset <handle> <key> <index> <value>` | Replace element at index | — |
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` for pop/index on empty or missing lists.
-`ZBASE_ERROR_PERMISSION` on type collision.
-`ZBASE_ERROR_INVALID_INPUT` for out-of-range `lset` index.
+**Returns:** `Z_ERR_NOTFOUND` for pop/index on empty or missing lists.
+`Z_ERR_PERM` on type collision.
+`Z_ERR_INPUT` for out-of-range `lset` index.
 
 **Example:**
 
 ```zsh
-z::kv::lpush myapp "jobs" "third"
-z::kv::lpush myapp "jobs" "second"
 z::kv::lpush myapp "jobs" "first"
+z::kv::lpush myapp "jobs" "second"
+z::kv::lpush myapp "jobs" "third"
 z::kv::rpop myapp "jobs"   # REPLY → first  (FIFO dequeue)
 ```
 
@@ -810,8 +812,8 @@ Unordered collections of unique members (case-sensitive).
 | `z::kv::sinter <handle> <key> [<key> ...]` | Intersection | `$reply` |
 | `z::kv::sdiff <handle> <key> [<key> ...]` | First set minus others | `$reply` |
 
-**Returns:** `ZBASE_ERROR_PERMISSION` if `sadd` member already exists.
-`ZBASE_ERROR_NOT_FOUND` if `srem` member or set not found.
+**Returns:** `Z_ERR_PERM` if `sadd` member already exists.
+`Z_ERR_NOTFOUND` if `srem` member or set not found.
 
 ---
 
@@ -844,6 +846,20 @@ z::kv::zrange myapp "leaderboard" 0 -1
 z::kv::zrange_withscores myapp "leaderboard" 0 -1 --rev
 # reply → (bob 250.000000 alice 100.000000)
 ```
+
+**Returns:** `Z_ERR_INPUT` from `zadd` when `<score>` is not a
+number or falls outside the range above, and from `zrangebyscore` when `<min>`
+or `<max>` is not a number. The upper bound is at the limit of double
+precision, so `999999999999.999999` canonicalises to `1000000000000.000000`.
+
+> **Migrating dumps written before the sort key was fixed.** Sorted-set
+> entries are stored with a numeric sort key derived from the score. Earlier
+> releases computed that key with a math function that was never loaded, so
+> every entry was written with the same key and `zrange` returned insertion
+> order. The broken keys carry no ordering information and cannot be
+> repaired in place — a dump produced by an affected release must be reloaded
+> and each member re-added with `z::kv::zadd`, which rewrites the key. Only
+> the `Z` records of a dump are affected; every other type loads unchanged.
 
 ---
 
@@ -899,7 +915,7 @@ Replace the live store with a snapshot's data.
 z::kv::snapshot_restore <handle> <snapshot-id>
 ```
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if snapshot ID is unknown.
+**Returns:** `Z_ERR_NOTFOUND` if snapshot ID is unknown.
 
 ---
 
@@ -952,9 +968,13 @@ EOF
 | `zadd` | `<key> <score> <member>` |
 | `zrem` | `<key> <member>` |
 
-Lines starting with `#` and blank lines are ignored.
+Lines starting with `#` and blank lines are ignored. Input is split with zsh's
+shell-word tokenizer and one layer of quotes is removed, so spaces can be
+preserved with ordinary shell quoting. Lines are **not evaluated**: parameter,
+command, arithmetic, glob, and redirection syntax is not expanded or executed.
+Only the arguments shown above are consumed.
 
-**Returns:** `ZBASE_ERROR_GENERAL` if any command failed (transaction rolled back).
+**Returns:** `Z_ERR_GENERAL` if any command failed (transaction rolled back).
 
 ---
 
@@ -994,7 +1014,7 @@ Return a uniformly random live key via `$REPLY`.
 z::kv::randomkey <handle>
 ```
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` if the store has no live keys.
+**Returns:** `Z_ERR_NOTFOUND` if the store has no live keys.
 
 ---
 
@@ -1015,6 +1035,10 @@ z::kv::scan <handle> [<cursor>] [<pattern>] [<count>]
 **Returns:** `0` on success.
 Sets `$REPLY` to the **next cursor** (`0` = iteration complete).
 Sets `$reply` to the current page of keys.
+
+The cursor is a positional offset into a newly sorted live-key view on every
+call. Avoid adding or deleting matching keys during an iteration; mutation can
+shift offsets and cause keys to be repeated or skipped.
 
 **Example:**
 
@@ -1052,8 +1076,8 @@ Update a single configuration key at runtime.
 z::kv::config <handle> <key> <value>
 ```
 
-**Returns:** `ZBASE_ERROR_NOT_FOUND` for unknown config keys.
-`ZBASE_ERROR_INVALID_INPUT` / `ZBASE_ERROR_PERMISSION` on validation failure.
+**Returns:** `Z_ERR_NOTFOUND` for unknown config keys.
+`Z_ERR_INPUT` / `Z_ERR_PERM` on validation failure.
 
 ---
 
@@ -1161,13 +1185,15 @@ Dump files with `version` greater than `ZKV_PERSIST_FORMAT_VERSION` are rejected
 | Dependency | Required | Used for |
 |---|---|---|
 | `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
-| `zbase` | Yes | `z::validate::*`, `z::probe::*`, `Z_SEP`/`Z_RECSEP`/`Z_ESC`, `ZBASE_ERROR_*` |
+| `zbase` | Yes | `z::ensure::*`, `z::is::*`, `z::get::epoch*`, `Z_SEP`/`Z_RECSEP`/`Z_ESC`, `Z_ERR_*` |
 | `zsh/datetime` | Optional | `$EPOCHSECONDS` for TTL (falls back to `zlog::get_timestamp epoch`) |
 | `zsh/zselect` | Optional | Sub-second sleep in `z::kv::lock_wait` (falls back to `sleep`) |
 
 **Source order:**
 
 ```zsh
+source /path/to/zcore/zcore.zsh
+# or:
 source ./zlog
 source ./zbase
 source ./zkv

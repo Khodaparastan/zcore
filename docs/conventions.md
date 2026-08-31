@@ -3,26 +3,35 @@
 Conventions shared across all zcore modules. Follow these when adding or
 extending APIs.
 
-**Scope.** These conventions govern the files this repository owns: `zbase`,
-`ui`, `zkv`, `zbus`, `z`, `lib/<module>/`, `bin/`, and `tests/`. `zlog` is a
-[git submodule](../lib/zsh-log) with its own upstream and its own house style;
-do not reformat it here.
+**Scope.** These conventions govern the files this repository owns: `zcore.zsh`,
+`zbase`, `ui`, `zkv`, `zbus`, `z`, `lib/<module>/`, `bin/`, and `tests/`. `zlog`
+is a [git submodule](../lib/zsh-log) with its own upstream and its own house
+style; do not reformat it here.
 
 ## Return channel: `REPLY`, `reply`, `REPLY2`
 
-Public functions that produce values use global return channels (documented in zbase):
+Many public functions that produce values use global return channels
+(documented in zbase). This is a function-level contract, not a rule that
+every namespace must follow: cache reads and terminal formatters, for example,
+print to stdout so they compose naturally with command substitution.
 
 | Variable | Type | Usage |
 |----------|------|-------|
-| `REPLY` | scalar | Primary result; reset to `""` on entry |
-| `reply` | array | List results; reset to `()` on entry |
+| `REPLY` | scalar | Primary result; reset on entry by functions that own it |
+| `reply` | array | List result; reset on entry by functions that own it |
 | `REPLY2` | scalar | Secondary detail when documented |
 
 **Rules:**
 
 - Read return values immediately after the call, before calling another zcore function.
-- Functions that return nothing (pure predicates, setters) do not touch these globals.
-- On error, `REPLY` is reset to `""` or the documented default.
+- Pure predicates and status-only mutators do not touch these globals unless
+  their individual contract explicitly says otherwise.
+- On error, a value-producing function resets its owned channel to the
+  documented empty or default value.
+- Emit-path `zlog` (`info`, `warn`, `error`, `debug`, `always`, `once`,
+  `rate_limit`, `log`, and the `printf` variants) is **REPLY-neutral** and
+  will not clobber these channels. Accessors such as `zlog::with_context`
+  still return through `REPLY` by contract.
 
 ## Error codes
 
@@ -45,7 +54,7 @@ Public zbase APIs use verb roots that encode return-channel contracts:
 |------|----------|
 | `z::is::` | Silent predicate — branch on `$?`, never sets REPLY |
 | `z::ensure::` | Guard — returns code, logs on failure, never sets REPLY |
-| `z::get::` | Value query — always sets `REPLY` (or `reply=` for lists) |
+| `z::get::` | Value query — sets `REPLY` or, where documented, `reply`/stdout |
 | `z::set::` | State mutator — status only, never sets REPLY |
 | `z::do::` | Effects (run, source, call) — sets REPLY only where documented |
 
@@ -56,7 +65,7 @@ Public zbase APIs use verb roots that encode return-channel contracts:
 | `z::ns::name` | Public API | `z::kv::get` |
 | `_z::ns::name` | Module-private | `_z::kv::epoch` |
 | `__z::ns::name` | Module-private | `__z::cache::check_ttl` |
-| `_module_*` / `__zlog*` | Internal state | `_zkv_handles`, `_zcore_subsys` |
+| Module-specific `_prefix_*` / `__zlog*` | Internal state | `_zkv_handles`, `_zcore_subsys` |
 
 Namespaces use lowercase segments separated by `::`. Use verbs for actions (`get`, `set`, `emit`), nouns for accessors.
 
@@ -125,8 +134,8 @@ Every module must be safe to source twice. Guard before the first
 `typeset -gr`, because re-assigning a readonly constant aborts the load:
 
 ```zsh
-(( ${+_ZKV_LOADED} )) && return 0
-typeset -gi _ZKV_LOADED=1
+(( ${_zkv_loaded:-0} )) && return 0
+typeset -gi _zkv_loaded=1
 typeset -gri ZKV_VERSION=4
 ```
 
@@ -135,18 +144,33 @@ sourced, hence `return 0 2>/dev/null || exit 0`. For a split module the same
 guard appears in the head part and in the loader — see
 [Split-source layout](#split-source-layout).
 
-## `${0:A:h}` idiom
+## Locating sibling files
 
-Resolve the directory containing the current file, following symlinks:
+Choose the path expression from how the file is entered. Confusing an
+executed script with a sourced module makes the result depend on the caller's
+working directory or script path.
+
+| File behavior | Directory expression | Why |
+| :--- | :--- | :--- |
+| Sourced module or loader | `${${(%):-%x}:A:h}` | `%x` identifies the file currently being sourced |
+| Executed script or test | `${0:A:h}` | `$0` identifies the executable script |
+
+For a sourceable loader:
 
 ```zsh
-local _root="${0:A:h}"
+typeset -g _root="${${(%):-%x}:A:h}"
 source "${_root}/ui"
 ```
 
-Use this wherever a file must locate its siblings — test suites that need `ui`
-or `z` do exactly this — so the code works regardless of install path or how
-it was invoked.
+For a test file that is always executed:
+
+```zsh
+source "${0:A:h}/../../bootstrap.zsh"
+```
+
+Apply `:A` before `:h` to normalize the path and follow symlinks. Do not use
+`${0:A:h}` inside a generally sourceable file: there `$0` identifies the
+caller rather than the file being loaded.
 
 ## `z::result` pattern
 
@@ -172,8 +196,12 @@ Values containing these bytes must be encoded via `_z::kv::encode_value` / decod
 ## Logging
 
 - Use `zlog::{error,warn,info,debug}` with structured key-value pairs.
+- Emit-path functions leave the caller's `REPLY` / `reply` untouched.
+  Accessors (`with_context`, `get_timestamp`, `benchmark_start`, …) still
+  return through `REPLY`.
 - Module load may use `zlog::once` to avoid duplicate startup noise.
-- Tests typically call `zlog::set_level error`.
+- Tests typically call `zlog::set_level error`. Raising the log level in
+  application code must change only verbosity, never return values.
 
 ## Testing
 
@@ -281,7 +309,7 @@ z::kv::set() {
   prose, not five.
 - A run of trivial one-line predicates may share a single subsection banner
   instead of repeating a block per function.
-- Private functions (`_z::*`, `__z::*`, `_mod_*`) are documented identically;
+- Private functions (`_z::*`, `__z::*`, module-specific `_prefix_*`) are documented identically;
   they have readers too.
 
 ### 4. Test files and standalone scripts

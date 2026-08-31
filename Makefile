@@ -21,6 +21,9 @@ ZSHDIR  := $(PREFIX)/share/zcore
 # lib/zsh-log submodule and is installed by resolving it (cp -L).
 MODULES := zlog zbase ui zkv zbus z
 
+# Single-file loader; installed alongside the modules.
+LOADER  := zcore.zsh
+
 # Modules owned by this repository. zlog is excluded: it is a git submodule
 # tracking its own upstream and follows that project's conventions.
 OWNED := zbase ui zkv zbus z
@@ -29,7 +32,7 @@ OWNED := zbase ui zkv zbus z
 SPLIT := z
 
 .PHONY: help bundle bundle-check test test-unit test-integration \
-        test-module lint lint-style install clean
+        test-module lint lint-style install uninstall clean
 
 help:
 	@echo "zcore v$(VERSION)"
@@ -42,6 +45,7 @@ help:
 	@echo "  make lint              Syntax check plus bundle and style checks"
 	@echo "  make lint-style        Comment and header standard only"
 	@echo "  make install           Install to $(ZSHDIR)"
+	@echo "  make uninstall         Remove files installed to $(ZSHDIR)"
 	@echo "  make clean             Remove temp files"
 
 # Parts are canonical: edit lib/<module>/*.zsh, then regenerate.
@@ -71,6 +75,7 @@ test-module:
 # syntax errors without executing anything.
 lint: bundle-check
 	@for f in $(MODULES); do zsh -n $$f || exit 1; done
+	@zsh -n $(LOADER)
 	@for f in lib/*/*.zsh; do zsh -n "$$f" || exit 1; done
 	@zsh -n bin/zbundle
 	@zsh -n bin/zlint-comments
@@ -83,7 +88,7 @@ lint: bundle-check
 
 # Enforces docs/conventions.md — see "File header & comment standard".
 lint-style:
-	@zsh bin/zlint-comments $(OWNED) bin/zbundle bin/zlint-comments \
+	@zsh bin/zlint-comments $(OWNED) $(LOADER) bin/zbundle bin/zlint-comments \
 	  --module lib/z/header.zsh \
 	  --part lib/z/debug.zsh lib/z/cache.zsh lib/z/sys.zsh lib/z/config.zsh \
 	         lib/z/help.zsh lib/z/event.zsh lib/z/init.zsh \
@@ -93,9 +98,16 @@ lint-style:
 
 install: bundle-check
 	@install -d $(ZSHDIR)
-	@for f in $(MODULES); do cp -L $$f $(ZSHDIR)/; done
+	@for f in $(MODULES) $(LOADER); do cp -L $$f $(ZSHDIR)/; done
 	@chmod 644 $(ZSHDIR)/*
 	@echo "Installed zcore v$(VERSION) to $(ZSHDIR)"
+
+# Remove exactly the files install wrote. rmdir leaves ZSHDIR alone when the
+# user has placed other files there.
+uninstall:
+	@for f in $(MODULES) $(LOADER); do rm -f -- $(ZSHDIR)/$$f; done
+	@rmdir $(ZSHDIR) 2>/dev/null || true
+	@echo "Removed zcore v$(VERSION) from $(ZSHDIR)"
 
 clean:
 	rm -rf _tmp

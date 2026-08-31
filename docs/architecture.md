@@ -1,47 +1,56 @@
-# zcore Architecture
+# zcore architecture
 
-## Overview
+zcore is a modular, process-local runtime for Zsh. Its modules form a strict
+prerequisite chain for state and validation, with optional integration edges
+for richer behavior. Keeping those two relationship types separate explains
+why the full loader has a fixed order while selected modules can still run
+without the entire stack.
 
-zcore is a layered Zsh framework. Each layer depends only on the layers below
-it. The public API (`zlog::*` and `z::namespace::*`) is stable; internal
-helpers use `_z::namespace::*`, `__z::namespace::*`, or `_module_*` prefixes
-and may change without notice.
+| Module | Strict prerequisite | Optional integration |
+| :--- | :--- | :--- |
+| `zlog` | None | — |
+| `zbase` | `zlog` | — |
+| `ui` | No load-time check; load `zlog` for diagnostics | Uses `z` cache/config services when available |
+| `zkv` | `zlog`, `zbase` | — |
+| `zbus` | `zlog`, `zbase`, `zkv` v4+ | — |
+| `z` | `zlog`, `zbase`, `zkv` | Adds UI behavior when `ui` exists and event wrappers when `zbus` exists |
 
-```
-┌─────────────────────────────────────────┐
-│  z          integration (cache, config) │
-├─────────────────────────────────────────┤
-│  zbus       event bus, pub/sub          │
-├─────────────────────────────────────────┤
-│  zkv        in-memory KV + structures   │
-├─────────────────────────────────────────┤
-│  ui         terminal, progress, spinner │
-├─────────────────────────────────────────┤
-│  zbase      validation, probes, effects │
-├─────────────────────────────────────────┤
-│  zlog       structured logging          │
-└─────────────────────────────────────────┘
-```
+The supported full-stack entry point is [`zcore.zsh`](../zcore.zsh). It always
+loads all six modules, including `ui` and `zbus`, in an order that satisfies
+the strict prerequisites and makes both optional integrations available.
 
-`ui` sits above `zbase` because it reads configuration through `z` when that
-module is present; it degrades to built-in defaults when it is not, so the
-dependency is soft in both directions.
+## Runtime boundaries
+
+zcore runs inside the shell that sourced it. This is an intentional boundary,
+not an implementation detail:
+
+- zkv stores, bus handlers, channels, cache entries, profiling state, and
+  configuration are represented by globals in the current process.
+- A subshell receives a copy-on-fork snapshot. Mutations in safe event handlers,
+  command substitutions, or background jobs do not flow back to the parent.
+- Normal event dispatch runs in the current process, so handler side effects
+  are visible. Safe dispatch trades that capability for watchdog isolation.
+- Persistence is explicit. zkv dump/load and auto-persist options write store
+  data to disk; registering a process-local handler is never persistent.
+- Shared `REPLY` channels are likewise process-local and intentionally
+  ephemeral. Consume a result before invoking another framework function.
 
 ## Source layout
 
-Every module is a single sourceable file at the repository root. A module may
-additionally be **split into parts** under `lib/<module>/`, in which case the
-parts are canonical and the root file is generated from them by
-`bin/zbundle` — see [Split modules](#split-modules) below.
+Every module is a single sourceable file at the repository root. A module
+may additionally be **split into parts** under `lib/<module>/`, in which
+case the parts are canonical and the root file is generated from them by
+`bin/zbundle` — see [Split modules](#split-modules).
 
-| File | Version constant | Responsibility |
+| File | Version source | Responsibility |
 |---|---|---|
-| `zlog` | `_ZLOG_VERSION` (1.0.0) | Structured logging — symlink into `lib/zsh-log` |
-| `zbase` | `_Z_BASE_VERSION` (3.0.0) | Verb-root primitives, error codes, separators |
-| `ui` | — | Terminal capabilities, progress bars, spinners |
-| `zkv` | `ZKV_VERSION` (4) | KV store: strings, lists, sets, zsets, hashes, TTL, transactions |
-| `zbus` | `ZBUS_VERSION` (3) | Event bus: priority dispatch, wildcards, channels, history |
-| `z` | `ZCORE_VERSION` (0.6.0) | Cache, configuration, system, event and debug namespaces |
+| `zcore.zsh` | [`VERSION`](../VERSION) | Loader: sources the six modules in dependency order |
+| `zlog` | `_ZLOG_VERSION` | Structured logging — symlink into `lib/zsh-log` |
+| `zbase` | `_Z_BASE_VERSION` | Verb-root primitives, error codes, separators |
+| `ui` | Framework version | Terminal capabilities, formatting, progress tracks, spinners |
+| `zkv` | `ZKV_VERSION` | Typed KV data, collections, TTL, transactions, observation, persistence |
+| `zbus` | `ZBUS_VERSION` | Priority/wildcard events, isolated dispatch, channels, history and stats |
+| `z` | `ZCORE_VERSION` | Cache, configuration, system, event, debug and help namespaces |
 
 `zlog` is a [git submodule](../lib/zsh-log) tracking its own upstream
 repository. It is the only module exempt from this repository's
@@ -78,43 +87,89 @@ development. `test_bundle.zsh` asserts that both define the same API.
 
 ## Load order
 
-Always source in this order:
+```zsh
+source /path/to/zcore/zcore.zsh
+```
+
+The loader is idempotent and sources all six modules in this order. Source
+files by hand only when you intentionally need a subset:
 
 1. `zlog`
 2. `zbase` — requires zlog
-3. `ui` — optional; requires zlog, uses `z` lazily when loaded
+3. `ui` — has no load-time check; uses zlog diagnostics and `z` services at call time
 4. `zkv` — requires zlog and zbase
-5. `zbus` — optional; requires zlog, zbase, and zkv v4+
+5. `zbus` — requires zlog, zbase, and zkv v4+
 6. `z` — requires zlog, zbase, and zkv
 
-`z` enforces its own prerequisites: it probes for `zlog::info`,
-`z::ensure::nonempty`, `z::kv::open`, and `Z_ERR_GENERAL`, and aborts with a
-message on stderr if any is missing. `ui` and `zbus` are never enforced —
-every call site guards their absence instead.
+`z` enforces its hard prerequisites by probing for `zlog::info`,
+`z::ensure::nonempty`, `z::kv::open`, and `Z_ERR_GENERAL`; it aborts with a
+message on stderr if any is missing. It does not require `ui` or `zbus` when
+loaded as a subset. Without `zbus`, no `z::event::*` wrappers are installed.
+Without `ui`, fatal exits simply skip progress cleanup.
+
+`ui` is the unusual edge: it is loaded before `z`, then detects `z` services
+when functions run later. Dimension queries work without the cache. Progress
+queries fall back to built-in defaults when configuration is unavailable, but
+`z::progress::enable` and `z::progress::disable` need `z::config::set`.
+
+A missing or failed module aborts the loader with a fatal message on
+stderr. Sourcing the loader after the modules are already present is a
+no-op at the module level.
 
 ## Load guards
 
 Each module returns early when it has already been sourced, using a module
-flag: `_Z_BASE_LOADED`, `_zkv_loaded`, `_zbus_loaded`, `_zcore_loaded`; `zlog`
-guards on `_ZLOG_VERSION` itself. The guard runs before any `typeset -gr`
-executes, since re-assigning a readonly constant would abort the load. `ui`
-currently has no guard; it is idempotent because it only defines functions and
-assigns non-readonly globals.
+flag: `_Z_BASE_LOADED`, `_zkv_loaded`, `_zbus_loaded`, `_zcore_loaded`;
+`zlog` guards on `_ZLOG_VERSION` itself. The guard runs before any
+`typeset -gr` executes, since re-assigning a readonly constant would abort
+the load. `ui` currently has no guard; it is idempotent because it only
+defines functions and assigns non-readonly globals.
+
+The loader has its own flag, `_zcore_zsh_loaded`, set only after every
+module has sourced successfully, so a failed load can be retried.
 
 ## Optional subsystems
 
 `z` records what is actually available in the `_zcore_subsys` map (`kv`,
-`bus`, `cache`) during initialization, and every optional-subsystem call site
-tests that map rather than probing the function table repeatedly. When `zbus`
-was sourced first, `z` installs thin `z::event::*` wrappers over `z::bus::*`
-so subsystem code never names the bus module directly.
+`bus`, `cache`) during initialization, and every optional-subsystem call
+site tests that map rather than probing the function table repeatedly.
+When `zbus` was sourced first, `z` installs thin `z::event::*` wrappers
+over `z::bus::*` so subsystem code never names the bus module directly.
+
+`ui` treats `z::cache::*` the same way: it uses the cache when
+`${+functions[z::cache::get]}` is set, and falls through to direct
+detection otherwise. There is no `2>/dev/null` around an undefined
+function.
+
+### Availability versus persistence
+
+Optional means that a caller can omit a module, not that the full loader skips
+it. Persistence means serialized data can survive a shell exit, not that live
+functions or shell state do. In particular:
+
+| Facility | Process-local state | Persistable data |
+| :--- | :--- | :--- |
+| zkv | Open handles, watchers, transaction and lock state | Store values via dump/load or auto-persist |
+| zbus | Handlers, channels, history, statistics, async PIDs | Configuration values held in its zkv store |
+| `z` cache | Values, TTL metadata, counters | None |
+| `z` config | Open backing store and watchers | Key/value data when the backing zkv store is explicitly persisted |
 
 ## Return channels
 
-`REPLY`, `reply`, and `REPLY2` are the shared result channels; which of them a
-function writes is part of its contract and is stated in its doc block. See
-[conventions.md](conventions.md) for the full rules, including the verb-root
-namespace that encodes the contract in the function name.
+`REPLY`, `reply`, and `REPLY2` are the shared result channels; which of
+them a function writes is part of its contract and is stated in its doc
+block. See [conventions.md](conventions.md) for the full rules, including
+the verb-root namespace that encodes the contract in the function name.
+
+Emit-path `zlog` functions (`info`, `warn`, `error`, `debug`, `always`,
+`once`, `rate_limit`, `log`, and the `printf` variants) are
+**REPLY-neutral**: they shadow `REPLY` / `reply` for the duration of the
+call, so logging never perturbs a caller's return value. Accessors such as
+`zlog::with_context` still return through `REPLY` by contract.
+
+Read return values immediately after the call, before calling another
+zcore function. Raising the log level changes only verbosity — never the
+values your code receives.
 
 ## Tests
 
@@ -142,8 +197,9 @@ zsh tests/unit/zkv/test_zkv_tx.zsh 'test_*rollback*'
 ```
 
 Tests needing real process isolation build their child shell with
-`ztest::child_prelude <module> ...`, which resolves the same dependency chain
-into a snippet for `zsh -f -c`, rather than hard-coding a module list.
+`ztest::child_prelude <module> ...`, which resolves the same dependency
+chain into a snippet for `zsh -f -c`, rather than hard-coding a module
+list.
 
 ### Selecting suites
 
@@ -158,28 +214,33 @@ zsh tests/run_tests.zsh zkv -t 'test_zkv_ttl_*'
 A selector is `all`, `unit`, `integration`, a module name, or a path to a
 file or directory; overlapping selectors run each file once. `-t` filters
 test names within the selected files, and a file with no matching test is
-reported as empty rather than failed. An unknown selector, or a `-t` pattern
-that matches nothing anywhere, fails the run.
+reported as empty rather than failed. An unknown selector, or a `-t`
+pattern that matches nothing anywhere, fails the run.
 
 Each suite runs in its own subshell, so the global `test_setup` /
-`test_teardown` hook names cannot collide across files. Counters cross that
-boundary through `ZTEST_STATS_FILE`, which is how the summary reports real
-test and assertion totals rather than a file count.
+`test_teardown` hook names cannot collide across files. Counters cross
+that boundary through `ZTEST_STATS_FILE`, which is how the summary reports
+real test and assertion totals rather than a file count.
 
 ## Versioning
 
-`VERSION` at the repository root tracks the framework as a whole and is what
-`make` reports and installs. Modules additionally carry their own version
-constants (see the table above) and are versioned independently. For a split
-module the constant lives in the head part, so `lib/z/header.zsh` is where
-`ZCORE_VERSION` is bumped — never in the generated root file.
+`VERSION` at the repository root tracks the framework as a whole and is
+what `make` reports and installs. Modules additionally carry their own
+version constants (see the table above) and are versioned independently;
+read the constants rather than copying their values into documentation.
+For a split module the constant lives in the head part, so
+`lib/z/header.zsh` is where `ZCORE_VERSION` is bumped — never in the
+generated root file.
 
 ## Internal vs public API
 
-- **Public:** `zlog::*`, `z::is::*`, `z::ensure::*`, `z::get::*`, `z::set::*`,
-  `z::do::*`, `z::kv::*`, `z::bus::*`, `z::ui::*`, `z::progress::*`,
-  `z::util::*`, `z::cache::*`, `z::config::*`, `z::sys::*`, `z::event::*`,
-  `z::debug::*`.
+- **Public:** `zlog::*`, `z::is::*`, `z::ensure::*`, `z::get::*`,
+  `z::set::*`, `z::do::*`, `z::kv::*`, `z::bus::*`, `z::ui::*`,
+  `z::progress::*`, `z::util::*`, `z::cache::*`, `z::probe::*`,
+  `z::config::*`, `z::sys::*`, `z::event::*`, `z::debug::*`,
+  `z::help::*`. `z::event::*` is a conditional public API, available only
+  when `zbus` was present while `z` initialized. Experimental `zlog` async
+  APIs carry weaker compatibility guarantees in their own reference.
 - **Private:** `_z::*`, `__z::*`, `__zlog*`, and the `_zkv_*` / `_zbus_*` /
   `_zui_*` / `_zprog_*` / `_zcore_*` state variables.
 

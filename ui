@@ -145,32 +145,48 @@ z::ui::supports_unicode() {
 # TERMINAL DIMENSIONS
 # =============================================================================
 
+# __z::ui::have_cache
+# Silent predicate: succeed when the z module's cache is loaded. z::cache::*
+# lives in `z`, which the documented load order sources after this module, so
+# the memoisation below is optional by construction. Testing for the function
+# keeps that optional dependency explicit — the previous `2>/dev/null` on each
+# call swallowed "command not found" and left the cache permanently dead.
+__z::ui::have_cache() {
+  (( ${+functions[z::cache::get]} && ${+functions[z::cache::set]} ))
+}
+
 # z::ui::width
 # Print the terminal width in columns to stdout, preferring $COLUMNS, then
 # tput, and falling back to 80. Memoised in z::cache with a one-second TTL
-# that the resize trap also invalidates.
+# that the resize trap also invalidates, when the z module is loaded.
 z::ui::width() {
   emulate -L zsh
 
+  typeset -i have_cache=0
+  __z::ui::have_cache && have_cache=1
+
   local cached
-  if cached=$(z::cache::get "ui:term_width" 2>/dev/null); then
+  if (( have_cache )) && cached=$(z::cache::get "ui:term_width"); then
     print -r -- "$cached"
     return 0
   fi
 
   typeset -i width=80
   local columns_current=${COLUMNS:-}
+  local tput_width
 
-  if [[ $columns_current == <-> ]]; then
+  # A non-interactive zsh sets COLUMNS=0, and 0 matches <->. Without the
+  # positive test the width becomes 0, the tput and 80 fallbacks are
+  # unreachable, and every consumer renders into a zero-width terminal.
+  if [[ $columns_current == <-> ]] && (( 10#$columns_current > 0 )); then
     ((width = 10#$columns_current))
-  elif (($+commands[tput])); then
-    local tput_width
-    if tput_width=$(tput cols 2>/dev/null) && [[ $tput_width == <-> ]]; then
-      ((width = 10#$tput_width))
-    fi
+  elif (($+commands[tput])) &&
+       tput_width=$(tput cols 2>/dev/null) &&
+       [[ $tput_width == <-> ]] && (( 10#$tput_width > 0 )); then
+    ((width = 10#$tput_width))
   fi
 
-  z::cache::set "ui:term_width" "$width" --ttl 1 2>/dev/null
+  (( have_cache )) && z::cache::set "ui:term_width" "$width" --ttl 1
   print -r -- "$width"
   return 0
 }
@@ -181,25 +197,30 @@ z::ui::width() {
 z::ui::height() {
   emulate -L zsh
 
+  typeset -i have_cache=0
+  __z::ui::have_cache && have_cache=1
+
   local cached
-  if cached=$(z::cache::get "ui:term_height" 2>/dev/null); then
+  if (( have_cache )) && cached=$(z::cache::get "ui:term_height"); then
     print -r -- "$cached"
     return 0
   fi
 
   typeset -i rows=24
   local lines_current=${LINES:-}
+  local tput_height
 
-  if [[ $lines_current == <-> ]]; then
+  # $LINES is 0 in a non-interactive shell for the same reason $COLUMNS is;
+  # see z::ui::width.
+  if [[ $lines_current == <-> ]] && (( 10#$lines_current > 0 )); then
     ((rows = 10#$lines_current))
-  elif (($+commands[tput])); then
-    local tput_height
-    if tput_height=$(tput lines 2>/dev/null) && [[ $tput_height == <-> ]]; then
-      ((rows = 10#$tput_height))
-    fi
+  elif (($+commands[tput])) &&
+       tput_height=$(tput lines 2>/dev/null) &&
+       [[ $tput_height == <-> ]] && (( 10#$tput_height > 0 )); then
+    ((rows = 10#$tput_height))
   fi
 
-  z::cache::set "ui:term_height" "$rows" --ttl 1 2>/dev/null
+  (( have_cache )) && z::cache::set "ui:term_height" "$rows" --ttl 1
   print -r -- "$rows"
   return 0
 }
@@ -210,14 +231,19 @@ z::ui::height() {
 # exists, so a caller's own handler is never overwritten.
 z::ui::watch_resize() {
   emulate -L zsh
+  # `emulate -L` turns on LOCAL_TRAPS, which would discard the handler defined
+  # below the moment this function returns, leaving the resize watch silently
+  # uninstalled. The trap has to outlive the call to be of any use.
+  setopt no_local_traps
 
   if (( ${+functions[TRAPWINCH]} )); then
     return 0
   fi
 
   TRAPWINCH() {
-    z::cache::del "ui:term_width" 2>/dev/null
-    z::cache::del "ui:term_height" 2>/dev/null
+    (( ${+functions[z::cache::del]} )) || return 0
+    z::cache::del "ui:term_width"
+    z::cache::del "ui:term_height"
   }
   return 0
 }

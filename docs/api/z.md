@@ -34,13 +34,9 @@
 ```zsh
 #!/usr/bin/env zsh
 
-# Source prerequisites in dependency order
-source ./zlog
-source ./zbase
-source ./ui      # required for progress/trap paths used by z::sys::*
-source ./zkv
-source ./zbus    # optional; enables z::event::* wrappers
-source ./z
+source /path/to/zcore/zcore.zsh
+# or, for a subset, source in dependency order:
+#   zlog, zbase, ui, zkv, zbus (optional), z
 
 # ── Platform detection ─────────────────────────────────────────
 z::sys::platform
@@ -164,7 +160,13 @@ to `1` until detection runs.
 
 `z` initializes automatically when sourced. No explicit init call is required.
 
-**Source order** (enforced by dependency checks and `init` loader):
+**Source order** (enforced by dependency checks). Prefer the loader:
+
+```zsh
+source /path/to/zcore/zcore.zsh
+```
+
+Or source by hand:
 
 ```zsh
 source ./zlog
@@ -244,8 +246,8 @@ z::cache::get <key>
 local width
 width=$(z::cache::get "ui:term_width") || width=80
 
-if z::cache::get "api:token" 2>/dev/null; then
-  token=$(z::cache::get "api:token")
+if token=$(z::cache::get "api:token" 2>/dev/null); then
+  use_token "$token"
 fi
 ```
 
@@ -344,8 +346,8 @@ z::cache::memoize "app:version" 300 _fetch_version
 ## 7. Configuration
 
 KV-backed configuration stored in the zkv `config` handle. Defaults are written
-only for keys that do not already exist, so user values persist across sessions
-when zkv auto-persist is enabled.
+only for keys that do not already exist. Values remain process local unless the
+application explicitly enables zkv persistence for that backing store.
 
 ### Default Keys
 
@@ -408,9 +410,15 @@ Emits `config:changed` on the event bus when active.
 
 ```zsh
 z::config::set show_progress false
-z::config::set timeout_default 120
+z::config::set request_timeout 120
 z::config::set progress_style "minimal"
 ```
+
+Type inference is suffix based, not schema based. The built-in
+`timeout_default` starts as an integer because initialization seeds it with a
+typed setter, but its name does not end in `*_timeout`; updating it through
+`z::config::set` stores a string. Use a matching suffix for application keys
+whose stored type matters.
 
 ---
 
@@ -712,8 +720,9 @@ Functions containing `::_` (private/internal) are excluded.
 
 ### `z::help::quick`
 
-Print a quick-reference header to stdout. Currently outputs the title banner
-only — extend as needed.
+Print the built-in quick-reference title banner to stdout. For function-level
+help, use `z::help::list` and the API pages; this function intentionally does
+not duplicate the full reference.
 
 ```
 z::help::quick
@@ -750,17 +759,19 @@ events automatically. Subscribe with `z::event::on`.
 |---|---|---|
 | `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
 | `zbase` | Yes | `Z_ERR_*` codes, `z::is::int` validation, probes |
-| `ui` | Yes* | `z::progress::clear` in trap and die paths |
+| `ui` | No | Progress cleanup in trap and die paths when available |
 | `zkv` | Yes | Config store, profiling store |
 | `zbus` | No | Event integration via `z::event::*` wrappers |
 | `zsh/datetime` | Optional | `$EPOCHSECONDS` / `$EPOCHREALTIME` for TTL and profiling |
 
-\* `ui` is not checked at load time but is required at runtime for interrupt
-and fatal-exit paths. The framework `init` loader always sources `ui` before `z`.
+`zcore.zsh` always sources `ui` before `z`, but subset loading is supported:
+interrupt and fatal-exit paths guard progress cleanup when `ui` is absent.
 
 **Source order:**
 
 ```zsh
+source /path/to/zcore/zcore.zsh
+# or:
 source ./zlog
 source ./zbase
 source ./ui
@@ -768,9 +779,6 @@ source ./zkv
 source ./zbus    # optional
 source ./z
 ```
-
-**Framework init:** In a full Zcore shell, all of the above is handled by
-`init` via `z::interactive::load_libs`.
 
 ---
 

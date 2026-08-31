@@ -1,8 +1,10 @@
-# ui API Reference
+# ui guide and API reference
 
-> Complete reference for all public-facing functions in `ui`.
-> Every symbol prefixed `z::ui::`, `z::progress::` or `z::util::` is part of
-> the stable public API.
+> Detailed reference for the core `ui` functions, plus a complete public
+> surface map for the richer formatting and multi-progress APIs.
+> Documented symbols prefixed `z::ui::`, `z::progress::` or `z::util::` are
+> part of the stable public API; double-underscore names remain internal even
+> when nested under a public namespace.
 > Symbols prefixed `__z::ui::`, `__z::progress::`, `_zui_` or `_zprog_` are
 > private internals — do not call or depend on them directly.
 
@@ -40,6 +42,22 @@
 | `z::util::*` | General-purpose formatting utilities |
 | `__z::progress::*` | Private throttle, bar geometry, theming — internal use only |
 
+### Public surface map
+
+| Area | Functions |
+| :--- | :--- |
+| Terminal capabilities | `z::ui::is_tty`, `z::ui::supports_color`, `z::ui::supports_unicode` |
+| Dimensions and screen | `z::ui::width`, `z::ui::height`, `z::ui::watch_resize`, `z::ui::clear_line`, `z::ui::clear` |
+| Presentation | `z::ui::box`, `z::util::comma`, `z::util::truncate`, `z::util::duration` |
+| Single progress | `z::progress::phase`, `z::progress::show`, `z::progress::indeterminate`, `z::progress::finish`, `z::progress::clear` |
+| Multi-progress | `z::progress::track`, `z::progress::track_update`, `z::progress::track_clear` |
+| Spinner lifecycle | `z::progress::spinner`, `z::progress::spinner_start`, `z::progress::spinner_stop`, `z::progress::spinner_done` |
+| Session control | `z::progress::enable`, `z::progress::disable` |
+
+The source doc block above each function is authoritative for functions not yet
+expanded below. All progress renderers are stderr/TTY aware and preserve a
+plain, non-animated path for non-interactive callers.
+
 All public functions begin with `emulate -L zsh`, enforcing strict Zsh emulation in a local scope. Terminal dimension queries (`z::ui::width`, `z::ui::height`) and number formatting (`z::util::comma`) print results to **stdout**. Progress bars, spinners, and line clearing write to **stderr**.
 
 ---
@@ -48,7 +66,8 @@ All public functions begin with `emulate -L zsh`, enforcing strict Zsh emulation
 
 ---
 
-### `z::ui::width` {#zui-width}
+<a id="zui-width"></a>
+### `z::ui::width`
 
 Returns the current terminal column width as a plain integer.
 
@@ -74,14 +93,20 @@ Prints a single integer representing the terminal width in columns.
 
 | Priority | Source | Condition |
 | :---: | :--- | :--- |
-| 1 | `z::cache` (`ui:term_width`) | Cache hit with TTL ≤ 1 s |
-| 2 | `$COLUMNS` | Set and matches `<->` (pure integer) |
-| 3 | `tput cols` | `tput` is in `$PATH` and returns a valid integer |
+| 1 | `z::cache` (`ui:term_width`) | `z` is loaded and there is a cache hit with TTL ≤ 1 s |
+| 2 | `$COLUMNS` | Set, matches `<->` (pure integer), **and is greater than 0** |
+| 3 | `tput cols` | `tput` is in `$PATH` and returns an integer greater than 0 |
 | 4 | Hardcoded default `80` | All above fail |
+
+> **Why the value must be positive.** A non-interactive zsh sets `COLUMNS=0`, and `0` matches the `<->` integer pattern. Without the `> 0` test a script or pipeline resolves to a width of 0 and steps 3 and 4 are never reached, which silently degrades every consumer — `z::ui::box`, for one, then clamps to its 10-column minimum and truncates its content.
 
 **Caching**
 
 Result is written to the framework cache under the key `ui:term_width` with a TTL of **1 second**. Subsequent calls within that window skip all detection and return the cached value immediately.
+
+The cache is an **optional dependency**: `z::cache::*` is provided by the `z` module, which loads *after* `ui`. When `ui` is loaded on its own the cache is skipped entirely and detection runs on every call — no error is reported, because the absence is expected rather than a fault.
+
+> **Note:** the value is printed to stdout, so the usual `width=$(z::ui::width)` runs the function in a subshell and the cache write does not reach the parent. Call it directly (`z::ui::width > /dev/null`) if you want to prime the cache for the current shell.
 
 **Example**
 
@@ -93,7 +118,8 @@ width=$(z::ui::width)
 
 ---
 
-### `z::ui::height` {#zui-height}
+<a id="zui-height"></a>
+### `z::ui::height`
 
 Returns the current terminal row height as a plain integer.
 
@@ -119,11 +145,14 @@ Prints a single integer representing the terminal height in rows.
 
 | Priority | Source | Condition |
 | :---: | :--- | :--- |
-| 1 | `$LINES` | Set and matches `<->` (pure integer) |
-| 2 | `tput lines` | `tput` is in `$PATH` and returns a valid integer |
-| 3 | Hardcoded default `24` | All above fail |
+| 1 | `z::cache` (`ui:term_height`) | `z` is loaded and there is a cache hit with TTL ≤ 1 s |
+| 2 | `$LINES` | Set, matches `<->` (pure integer), **and is greater than 0** |
+| 3 | `tput lines` | `tput` is in `$PATH` and returns an integer greater than 0 |
+| 4 | Hardcoded default `24` | All above fail |
 
-> **Note:** Unlike `z::ui::width`, height is **not cached**. Each call performs a fresh resolution. This is intentional — terminal height changes are less frequent and height is queried far less often than width.
+`$LINES` is `0` in a non-interactive shell for the same reason `$COLUMNS` is; see the note under [`z::ui::width`](#zui-width).
+
+Height is cached under `ui:term_height` on exactly the same terms as width — same 1-second TTL, same optional dependency on `z`, and the same invalidation from `z::ui::watch_resize`.
 
 **Example**
 
@@ -135,7 +164,8 @@ height=$(z::ui::height)
 
 ---
 
-### `z::ui::clear_line` {#zui-clear_line}
+<a id="zui-clear_line"></a>
+### `z::ui::clear_line`
 
 Erases the current terminal line on stderr and optionally emits a newline.
 
@@ -183,7 +213,8 @@ z::ui::clear_line --force --no-newline
 
 ---
 
-### `z::ui::clear` {#zui-clear}
+<a id="zui-clear"></a>
+### `z::ui::clear`
 
 Clears the entire terminal screen.
 
@@ -213,7 +244,8 @@ Calls the system `clear` command only when stdout is an interactive terminal (`[
 
 ---
 
-### `z::progress::show` {#zprogress-show}
+<a id="zprogress-show"></a>
+### `z::progress::show`
 
 Renders a progress bar to stderr for a given `current / total` position.
 
@@ -341,7 +373,7 @@ Progress output is **independent of `zlog::set_level`** — a quiet `error` cons
 | :--- | :--- | :--- | :--- |
 | `show_progress` | string | `true` | Master on/off switch (`"true"` / `"false"` string comparison) |
 | `progress_update_interval` | integer | `10` | Throttle interval (delegated to `__z::progress::should_show`) |
-| `progress_style` | string | `classic` | Bar style: `classic`, `minimal`, or `blocks` |
+| `progress_style` | string | `classic` | `classic` uses state glyphs; `minimal` removes bar decoration; `blocks` uses solid fill cells |
 
 **Examples**
 
@@ -381,7 +413,8 @@ done
 
 ---
 
-### `z::progress::clear` {#zprogress-clear}
+<a id="zprogress-clear"></a>
+### `z::progress::clear`
 
 Erases the progress bar line from stderr without advancing to a new line. No-op when `show_progress` is `"false"`.
 
@@ -415,9 +448,12 @@ print "Done."
 
 ---
 
-### `z::progress::enable` {#zprogress-enable}
+<a id="zprogress-enable"></a>
+### `z::progress::enable`
 
 Sets the `show_progress` config key to `true`, re-enabling progress output.
+This session control requires the `z` integration module; it is not available
+when `ui` is sourced as a standalone subset.
 
 **Signature**
 
@@ -435,7 +471,8 @@ z::progress::enable
 
 ---
 
-### `z::progress::disable` {#zprogress-disable}
+<a id="zprogress-disable"></a>
+### `z::progress::disable`
 
 Sets the `show_progress` config key to `false`, suppressing all progress output.
 
@@ -463,7 +500,8 @@ z::progress::enable
 
 ---
 
-### `z::progress::spinner` {#zprogress-spinner}
+<a id="zprogress-spinner"></a>
+### `z::progress::spinner`
 
 Advances and renders a single braille-dot spinner frame to stderr.
 
@@ -525,7 +563,8 @@ z::progress::clear
 
 ---
 
-### `z::util::comma` {#zutil-comma}
+<a id="zutil-comma"></a>
+### `z::util::comma`
 
 Formats an integer with thousands-separator commas.
 
@@ -588,7 +627,8 @@ z::util::comma "n/a"     # → n/a
 
 ---
 
-### `__z::progress::should_show` {#zprogress-should_show}
+<a id="zprogress-should_show"></a>
+### `__z::progress::should_show`
 
 Throttle gate — determines whether a progress update should be rendered for a given `current / total` pair.
 
@@ -637,18 +677,26 @@ __z::progress::should_show <current> <total>
 | :--- | :--- | :--- | :--- |
 | `zlog` | Module | `z::progress::show` | Must be loaded first; `zlog::debug` used only for invalid-input diagnostics |
 | `z::cache::get` / `z::cache::set` | Internal module | `z::ui::width` | Key `ui:term_width`, TTL 1 s |
-| `z::config::get` / `z::config::set` | Internal module | `z::progress::*`, `__z::progress::*` | Keys: `show_progress`, `progress_update_interval`, `progress_style`. **`z::config::get` sets `$REPLY`** — do not use `$(z::config::get …)` |
+| `z::config::get` / `z::config::set` | Optional integration | `z::progress::*`, `__z::progress::*` | Reads fall back to defaults when absent; `enable`/`disable` require `z::config::set` |
 | `_zlog_colors` | `zlog` | `__z::progress::theme` | Optional ANSI styling when `__zlog::init_colors` has run; respects `NO_COLOR` |
 | `zlog::debug` | `zlog` | `z::progress::show` | Emits debug messages on invalid input (respects log level; does not gate bar output) |
 | `_z_progress_spinner_idx` | Global integer | `z::progress::spinner` | Persists across calls; declared with `typeset -gi` |
 | `tput` | External binary | `z::ui::width`, `z::ui::height` | Optional; queried via `$+commands[tput]` |
 | `clear` | External binary | `z::ui::clear` | Standard POSIX utility |
 
-**Source order** (when loading standalone, outside the framework `init`):
+**Source order.** Prefer the loader:
 
 ```zsh
-source ./zlog    # optional; only needed if zlog::debug diagnostics are desired
-source ./ui      # or via framework init
+source /path/to/zcore/zcore.zsh
+```
+
+Or load the supported standalone subset. This provides dimensions, formatting,
+and rendering with built-in defaults; cache-backed dimensions and session-level
+`enable`/`disable` become available after `z` loads:
+
+```zsh
+source ./zlog
+source ./ui
 ```
 
 ---

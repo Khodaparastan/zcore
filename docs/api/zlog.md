@@ -1,7 +1,9 @@
 # zlog API Reference
 
-> Complete reference for all public-facing functions and constants in `zlog`.
-> Every symbol prefixed `zlog::` or `_ZLOG_` is part of the stable public API.
+> Complete reference for the documented public functions in `zlog`.
+> Stable functions use the `zlog::` namespace; async logging is explicitly
+> experimental. Undocumented `_ZLOG_*` constants are implementation details
+> except for the published version and level constants described here.
 > Symbols prefixed `__zlog` or `_zlog_` are private internals — do not call or
 > depend on them directly.
 
@@ -39,7 +41,9 @@
 
 | Convention | Meaning |
 |---|---|
-| `REPLY` | Functions that return a value set `$REPLY` instead of using subshells |
+| Value output | Context, timestamp, color, and benchmark helpers use `$REPLY`; configuration getters documented with stdout compose through command substitution |
+| Emit path | `info` `warn` `error` `debug` `always` `once` `rate_limit` `log` and the `printf` variants are **REPLY-neutral** — they do not change the caller's `REPLY` / `reply` |
+| Accessors | `with_context` `remove_context` `get_timestamp` `format_epoch` `colorize` `benchmark_start` `benchmark_end` still return through `REPLY` |
 | `[key val ...]` | Optional trailing key-value pairs appended to the log line |
 | Returns `0` | Success; non-zero on validation failure |
 | Level names | Case-insensitive: `error`, `warn` (or `warning`), `info`, `debug` (or `0`–`3`) |
@@ -618,7 +622,8 @@ zlog_ctx_67890_1704110446_1234 db=postgres host=db.prod
 
 ## 8. Benchmarking
 
-All benchmarking functions are **no-ops** when INFO level is disabled, adding zero overhead in production.
+Benchmark logging is skipped when INFO level is disabled. The level check still
+has a small function-call cost, but no timer or log record is created.
 
 ### `zlog::benchmark`
 
@@ -892,14 +897,14 @@ zlog::format_epoch <epoch> [format]
 **Examples:**
 
 ```zsh
-zlog::format_epoch 1704067200
-echo "$REPLY"   # 2026-03-01 00:00:00
+TZ=UTC zlog::format_epoch 1704067200
+echo "$REPLY"   # 2024-01-01 00:00:00
 
-zlog::format_epoch 1704067200 "%Y-%m-%d"
-echo "$REPLY"   # 2026-03-01
+TZ=UTC zlog::format_epoch 1704067200 "%Y-%m-%d"
+echo "$REPLY"   # 2024-01-01
 
-zlog::format_epoch 1704067200 "%b %d, %Y at %I:%M %p"
-echo "$REPLY"   # Jan 01, 2026 at 12:00 AM
+TZ=UTC zlog::format_epoch 1704067200 "%b %d, %Y at %I:%M %p"
+echo "$REPLY"   # Jan 01, 2024 at 12:00 AM
 ```
 
 ---
@@ -1506,7 +1511,7 @@ zlog::is_async
 
 ```zsh
 if zlog::is_async; then
-  echo "Async worker PID: ${_zlog_config[async_pid]}"
+  echo "Async logging is active"
 fi
 ```
 
@@ -1516,7 +1521,10 @@ fi
 
 ### `zlog::enable_performance_mode`
 
-Hot-swap the logging engine with a faster implementation that skips recursion checking, level validation, and error handling. Provides ~3–4× speed improvement.
+Hot-swap the logging engine with a lower-overhead implementation that skips
+recursion checking, per-call level validation, and some error handling.
+Throughput gains are workload, destination, buffering, and platform dependent;
+benchmark the real application before enabling it.
 
 ```
 zlog::enable_performance_mode
@@ -1842,7 +1850,8 @@ zlog::is_debug_mode
 
 ```zsh
 #!/usr/bin/env zsh
-source ./zlog
+source /path/to/zcore/zcore.zsh
+# or: source ./zlog
 
 # ── Configuration ──────────────────────────────────────────────
 zlog::setup "/var/log/myapp.log" info text

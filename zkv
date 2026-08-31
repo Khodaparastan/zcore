@@ -2582,7 +2582,9 @@ z::kv::lock_wait() {
   attempts="$attempts_raw"
 
   # zselect -t takes centiseconds; clamp to at least 1 to avoid a busy loop.
-  (( centi = int(interval_raw * 100) ))
+  # Assigning to an integer truncates, so no zsh/mathfunc int() is needed —
+  # that module is never loaded, and calling int() raised "unknown function".
+  (( centi = interval_raw * 100 ))
   (( centi < 1 )) && centi=1
 
   for (( attempt = 1; attempt <= attempts; attempt++ )); do
@@ -2781,7 +2783,9 @@ z::kv::lpop() {
 
   (( ${#items} == 0 )) && return $Z_ERR_NOTFOUND
 
-  REPLY="${items[1]}"
+  # The write-back below returns the re-encoded remainder through REPLY, so
+  # the popped element is held aside and published only once that is done.
+  local popped="${items[1]}"
 
   if (( ${#items} > 1 )); then
     rest=( "${(@)items[2,-1]}" )
@@ -2792,6 +2796,8 @@ z::kv::lpop() {
   fi
 
   _z::kv::auto_persist "$handle"
+
+  REPLY="$popped"
   return 0
 }
 
@@ -2822,7 +2828,9 @@ z::kv::rpop() {
 
   (( ${#items} == 0 )) && return $Z_ERR_NOTFOUND
 
-  REPLY="${items[-1]}"
+  # The write-back below returns the re-encoded remainder through REPLY, so
+  # the popped element is held aside and published only once that is done.
+  local popped="${items[-1]}"
 
   if (( ${#items} > 1 )); then
     rest=( "${(@)items[1,-2]}" )
@@ -2833,6 +2841,8 @@ z::kv::rpop() {
   fi
 
   _z::kv::auto_persist "$handle"
+
+  REPLY="$popped"
   return 0
 }
 
@@ -2891,17 +2901,23 @@ z::kv::llen() {
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
 
-  _z::kv::tx_resolve_read "$handle" lists "$key" || return 0
+  # tx_resolve_read returns the map name through REPLY, so the count is built
+  # in a local and published at the end — an early return would otherwise hand
+  # the caller the internal map name instead of 0.
+  typeset -i count=0
 
-  local _map_n="$REPLY"
-  local _ref="${_map_n}[${key}]"
-  local existing="${(P)_ref}"
+  if _z::kv::tx_resolve_read "$handle" lists "$key"; then
+    local _map_n="$REPLY"
+    local _ref="${_map_n}[${key}]"
+    local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return 0
+    if [[ -n $existing ]]; then
+      _z::kv::split_decoded "$existing"
+      count="${#reply}"
+    fi
+  fi
 
-  _z::kv::split_decoded "$existing"
-  REPLY="${#reply}"
-
+  REPLY=$count
   return 0
 }
 
@@ -3148,17 +3164,23 @@ z::kv::scard() {
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
 
-  _z::kv::tx_resolve_read "$handle" sets "$key" || return 0
+  # tx_resolve_read returns the map name through REPLY, so the count is built
+  # in a local and published at the end — an early return would otherwise hand
+  # the caller the internal map name instead of 0.
+  typeset -i count=0
 
-  local _map_n="$REPLY"
-  local _ref="${_map_n}[${key}]"
-  local existing="${(P)_ref}"
+  if _z::kv::tx_resolve_read "$handle" sets "$key"; then
+    local _map_n="$REPLY"
+    local _ref="${_map_n}[${key}]"
+    local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return 0
+    if [[ -n $existing ]]; then
+      _z::kv::split_decoded "$existing"
+      count="${#reply}"
+    fi
+  fi
 
-  _z::kv::split_decoded "$existing"
-  REPLY="${#reply}"
-
+  REPLY=$count
   return 0
 }
 
@@ -3177,8 +3199,11 @@ z::kv::sunion() {
 
   local -A seen
   local key member existing _map_n _ref
-  local -a members
+  local -a members result
 
+  # Accumulate in a local: the loop calls _z::kv::split_decoded, which returns
+  # through `reply`, so members gathered from earlier keys would be wiped as
+  # soon as the next key is decoded.  Same pattern as sinter and sdiff.
   for key in "$@"; do
     _z::kv::tx_resolve_read "$handle" sets "$key" || continue
 
@@ -3195,11 +3220,12 @@ z::kv::sunion() {
     for member in "${members[@]}"; do
       if (( ! ${+seen[$member]} )); then
         seen[$member]=1
-        reply+=( "$member" )
+        result+=( "$member" )
       fi
     done
   done
 
+  reply=( "${result[@]}" )
   return 0
 }
 
@@ -3294,7 +3320,7 @@ z::kv::sdiff() {
 
   [[ -z $first_existing ]] && return 0
 
-  local -a base others members
+  local -a base others members result
   _z::kv::split_decoded "$first_existing"
   base=( "${reply[@]}" )
   reply=()
@@ -3305,6 +3331,9 @@ z::kv::sdiff() {
   local member key existing
   local found
 
+  # Accumulate in a local: the loop below calls _z::kv::split_decoded, which
+  # returns through `reply`, so anything gathered there would be wiped on the
+  # first subtrahend.  This mirrors how sinter builds its result.
   for member in "${base[@]}"; do
     found=0
 
@@ -3327,9 +3356,10 @@ z::kv::sdiff() {
       fi
     done
 
-    (( ! found )) && reply+=( "$member" )
+    (( ! found )) && result+=( "$member" )
   done
 
+  reply=( "${result[@]}" )
   return 0
 }
 
@@ -3354,6 +3384,16 @@ _z::kv::zscore_pack() {
   local raw="$1"
   local canon
 
+  # printf "%.6f" does not fail on a non-numeric operand — it warns and
+  # formats 0 — so an unvalidated "abc" would be stored as score 0 instead of
+  # rejected.  Check the shape first; the exponent form is accepted because
+  # printf handles it and it round-trips to the same canonical string.
+  if [[ ! $raw =~ '^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$' ]]; then
+    REPLY=""
+    REPLY2=""
+    return $Z_ERR_INPUT
+  fi
+
   LC_NUMERIC=C printf -v canon "%.6f" "$raw" 2>/dev/null || {
     REPLY=""
     REPLY2=""
@@ -3369,10 +3409,29 @@ _z::kv::zscore_pack() {
     return $Z_ERR_INPUT
   fi
 
-  # Shift into unsigned space (add 2e18 microseconds) so lexicographic order
-  # matches numeric order for both positive and negative scores.
+  # canon is a fixed 6-decimal string, so deleting the point yields the score
+  # in microunits exactly.  Deriving the key this way avoids float arithmetic
+  # altogether: f * 1000000 can land a hair below the true value and truncate
+  # one microunit low, which would misorder two adjacent scores.  It also
+  # drops the zsh/mathfunc int() this line used to call — that module is never
+  # loaded, so every zadd raised "unknown function: int" and every score
+  # packed to the same key.
+  local digits="${canon//./}"
+  local sign=""
+
+  if [[ $digits == -* ]]; then
+    sign="-"
+    digits="${digits#-}"
+  fi
+
+  # 10# forces base 10 so a leading zero cannot be read as octal.
   typeset -i micro
-  (( micro = int(f * 1000000) + 2000000000000000000 ))
+  (( micro = 10#${digits} ))
+  [[ -n $sign ]] && (( micro = -micro ))
+
+  # Shift into unsigned space (add 2e18 microunits) so lexicographic order
+  # matches numeric order for both positive and negative scores.
+  (( micro += 2000000000000000000 ))
 
   LC_NUMERIC=C printf -v REPLY "%019d" "$micro"
   REPLY2="$canon"
@@ -3795,17 +3854,23 @@ z::kv::zcard() {
   _z::kv::require_handle "$handle"        || return $?
   _z::kv::validate_key   "$key" "$handle" || return $?
 
-  _z::kv::tx_resolve_read "$handle" zsets "$key" || return 0
+  # tx_resolve_read returns the map name through REPLY, so the count is built
+  # in a local and published at the end — an early return would otherwise hand
+  # the caller the internal map name instead of 0.
+  typeset -i count=0
 
-  local _map_n="$REPLY"
-  local _ref="${_map_n}[${key}]"
-  local existing="${(P)_ref}"
+  if _z::kv::tx_resolve_read "$handle" zsets "$key"; then
+    local _map_n="$REPLY"
+    local _ref="${_map_n}[${key}]"
+    local existing="${(P)_ref}"
 
-  [[ -z $existing ]] && return 0
+    if [[ -n $existing ]]; then
+      _z::kv::split_decoded "$existing"
+      count="${#reply}"
+    fi
+  fi
 
-  _z::kv::split_decoded "$existing"
-  REPLY="${#reply}"
-
+  REPLY=$count
   return 0
 }
 

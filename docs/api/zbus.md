@@ -33,11 +33,8 @@
 ```zsh
 #!/usr/bin/env zsh
 
-# zlog, zbase, and zkv must be sourced first (in that order)
-source ./zlog
-source ./zbase
-source ./zkv
-source ./zbus
+source /path/to/zcore/zcore.zsh
+# or, for zbus alone: source zlog; source zbase; source zkv; source zbus
 
 # ── Initialize (lazy-init also works on first public call) ─────
 z::bus::init
@@ -112,7 +109,7 @@ which invokes `z::bus::init` on first use if the bus has not been initialized.
 | `reply` | Array result channel (handler ID lists) |
 | `REPLY2` | Secondary scalar; used internally by safe dispatch (`ok` / `fail` / `timeout`) |
 | Returns `0` | Success; non-zero on validation failure or partial handler failure |
-| `ZBASE_ERROR_*` | Named error codes from `zbase` (required dependency) |
+| `Z_ERR_*` | Named error codes from `zbase` (required dependency) |
 | `_z::bus::*` | Private internal function — not part of the public API |
 | `_zbus_*` | Private internal variable — not part of the public API |
 
@@ -125,10 +122,10 @@ Read `REPLY`, `reply`, and `REPLY2` **immediately** after each call. Subsequent
 
 | Constant | Typical zbus usage |
 |---|---|
-| `ZBASE_ERROR_INVALID_INPUT` | Bad event name, missing argument, out-of-range config value |
-| `ZBASE_ERROR_NOT_FOUND` | Unknown handler ID, no handlers removed by `z::bus::off`, unknown config key |
-| `ZBASE_ERROR_PERMISSION` | Handler limit reached per event, async PID cap exceeded |
-| `ZBASE_ERROR_GENERAL` | zkv store open failure during init |
+| `Z_ERR_INPUT` | Bad event name, missing argument, out-of-range config value |
+| `Z_ERR_NOTFOUND` | Unknown handler ID, no handlers removed by `z::bus::off`, unknown config key |
+| `Z_ERR_PERM` | Handler limit reached per event, async PID cap exceeded |
+| `Z_ERR_GENERAL` | zkv store open failure during init |
 
 ---
 
@@ -172,8 +169,8 @@ z::bus::init [options...]
 | `--disable-wildcards` | flag | — | Disable wildcard pattern matching |
 | `--reset` | flag | — | Clear all handlers, channels, history, and stats before applying options |
 
-**Returns:** `0` on success; `ZBASE_ERROR_GENERAL` if the zkv store cannot be opened;
-`ZBASE_ERROR_INVALID_INPUT` on invalid option values.
+**Returns:** `0` on success; `Z_ERR_GENERAL` if the zkv store cannot be opened;
+`Z_ERR_INPUT` on invalid option values.
 
 Unknown options are logged as warnings and skipped.
 
@@ -203,7 +200,7 @@ z::bus::on <event> <handler-func> [--priority <0-100>] [--once]
 | `event` | string | required | Exact event name or glob pattern containing `*` |
 | `handler-func` | string | required | Name of a defined function |
 | `--priority` | integer `0..100` | `50` (`ZBUS_PRIORITY_NORMAL`) | Dispatch order; higher runs first |
-| `--once` | flag | — | Remove handler after first successful dispatch |
+| `--once` | flag | — | Remove handler after its first dispatch, regardless of exit status |
 
 **Returns:** `0` on success. Sets `$REPLY` to the opaque handler ID.
 
@@ -211,9 +208,9 @@ z::bus::on <event> <handler-func> [--priority <0-100>] [--once]
 
 | Code | Condition |
 |---|---|
-| `ZBASE_ERROR_INVALID_INPUT` | Invalid event name or priority |
-| `ZBASE_ERROR_NOT_FOUND` | Handler function not defined |
-| `ZBASE_ERROR_PERMISSION` | Handler limit (`max_handlers_per_event`) reached |
+| `Z_ERR_INPUT` | Invalid event name or priority |
+| `Z_ERR_NOTFOUND` | Handler function not defined |
+| `Z_ERR_PERM` | Handler limit (`max_handlers_per_event`) reached |
 
 **Examples:**
 
@@ -253,7 +250,7 @@ z::bus::off <event-pattern> [handler-func]
 | `handler-func` | string | Optional — remove only handlers with this function name |
 
 **Returns:** `0` if at least one handler was removed. Sets `$REPLY` to the count
-of removed handlers. Returns `ZBASE_ERROR_NOT_FOUND` when nothing matched.
+of removed handlers. Returns `Z_ERR_NOTFOUND` when nothing matched.
 
 **Examples:**
 
@@ -274,8 +271,8 @@ Remove a single handler by its opaque ID.
 z::bus::off_id <handler-id>
 ```
 
-**Returns:** `0` on success; `ZBASE_ERROR_INVALID_INPUT` if ID is empty;
-`ZBASE_ERROR_NOT_FOUND` if the ID is unknown.
+**Returns:** `0` on success; `Z_ERR_INPUT` if ID is empty;
+`Z_ERR_NOTFOUND` if the ID is unknown.
 
 ---
 
@@ -353,7 +350,7 @@ z::bus::emit_async <event> [args ...]
 ```
 
 **Returns:** `0` on success. Sets `$REPLY` to the PID of the background dispatcher.
-Returns `ZBASE_ERROR_PERMISSION` when the async PID cap (200) is reached.
+Returns `Z_ERR_PERM` when the async PID cap (200) is reached.
 
 Handler exit codes and side effects are **not** observable by the caller. Use
 `z::bus::wait_all_async` to block until all async jobs complete.
@@ -533,10 +530,11 @@ z::bus::clear_stats
 
 ## 11. Configuration
 
-Configuration is persisted in the internal `__zbus` zkv store and cached in memory
-for hot-path access. Values written via `z::bus::init` options or
-`z::bus::config` survive process restarts when zkv auto-persist is enabled for
-the store.
+Configuration is held in the internal `__zbus` zkv store and cached in memory
+for hot-path access. It remains process local by default. To preserve values
+across restarts, callers must explicitly configure persistence on that internal
+store after bus initialization; merely changing bus options does not write a
+file.
 
 ### Config Keys
 
@@ -563,8 +561,8 @@ in-memory cache.
 z::bus::config <key> <value>
 ```
 
-**Returns:** `0` on success; `ZBASE_ERROR_INVALID_INPUT` on bad value;
-`ZBASE_ERROR_NOT_FOUND` on unknown key.
+**Returns:** `0` on success; `Z_ERR_INPUT` on bad value;
+`Z_ERR_NOTFOUND` on unknown key.
 
 When `max_history` is reduced below the current entry count, the history ring
 is cleared.
@@ -648,8 +646,8 @@ Register a handler to receive messages on a channel.
 z::bus::subscribe <channel> <handler-func>
 ```
 
-**Returns:** `0` on success; `ZBASE_ERROR_INVALID_INPUT` if channel is empty;
-`ZBASE_ERROR_NOT_FOUND` if handler is not defined.
+**Returns:** `0` on success; `Z_ERR_INPUT` if channel is empty;
+`Z_ERR_NOTFOUND` if handler is not defined.
 
 ---
 
@@ -661,7 +659,7 @@ Remove a handler from a channel, or all handlers if no function is specified.
 z::bus::unsubscribe <channel> [handler-func]
 ```
 
-**Returns:** `0` on success; `ZBASE_ERROR_NOT_FOUND` if channel or handler
+**Returns:** `0` on success; `Z_ERR_NOTFOUND` if channel or handler
 not found (when a specific handler is given).
 
 ---
@@ -720,7 +718,8 @@ and are reloaded on the next init.
 
 ### Event handlers
 
-Registered via `z::bus::on`, `z::bus::once`, or `z::bus::off_id`.
+Registered via `z::bus::on` or `z::bus::once`; removed by `z::bus::off` or
+`z::bus::off_id`.
 
 ```zsh
 my_handler() {
@@ -758,7 +757,7 @@ my_subscriber() {
 
 Patterns containing `*` are stored in the wildcard registry and matched via
 zsh glob expansion (`${~pattern}`). Wildcard matching can be disabled globally
-with `enable_wildcards false`.
+with `z::bus::config enable_wildcards false`.
 
 **Examples:**
 
@@ -775,12 +774,14 @@ with `enable_wildcards false`.
 | Dependency | Required | Used for |
 |---|---|---|
 | `zlog` | Yes | All `zlog::*` calls (must be sourced first) |
-| `zbase` | Yes | `z::validate::*`, `z::probe::func`, `z::time::epoch`, `Z_SEP`/`Z_RECSEP`, `ZBASE_ERROR_*` |
+| `zbase` | Yes | `z::ensure::*`, `z::is::func`, `z::get::epoch`, `Z_SEP`/`Z_RECSEP`, `Z_ERR_*` |
 | `zkv` v4+ | Yes | Internal `__zbus` config store via `z::kv::open`, `z::kv::set`, `z::kv::setnx`, `z::kv::get` |
 
 **Source order:**
 
 ```zsh
+source /path/to/zcore/zcore.zsh
+# or:
 source ./zlog
 source ./zbase
 source ./zkv
