@@ -1,3 +1,26 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# test_zkv_type.zsh — Per-key type tagging
+# =============================================================================
+# Description:  A key carries the type of its first write, and a later
+#               operation belonging to a different type family must be
+#               refused with Z_ERR_PERM until the key is deleted. Also checks
+#               that z::kv::get reports the stored type in REPLY2 for the
+#               scalar types that decode on read.
+#
+# Usage:        zsh tests/run_tests.zsh zkv
+#               zsh tests/unit/zkv/test_zkv_type.zsh    # standalone
+#
+# Covers:       z::kv::set, z::kv::set_int, z::kv::set_bool, z::kv::get,
+#               z::kv::del, z::kv::lpush, z::kv::llen, z::kv::sadd,
+#               z::kv::hset
+#
+# Requires:     zkv — loaded by ztest::require below
+# =============================================================================
+
+source "${0:A:h}/../../bootstrap.zsh"
+ztest::require zkv
+
 test_setup() { z::kv::open _ty_test }
 test_teardown() { z::kv::close _ty_test }
 
@@ -40,3 +63,6 @@ test_zkv_get_reply2_for_bool() {
   ztest::assert::eq "true" "$REPLY"
   ztest::assert::eq "bool" "$REPLY2"
 }
+
+# Standalone execution; under the runner ztest::run is called by the runner.
+(( ${ZTEST_RUNNER:-0} )) || ztest::run "${1:-test_*}"

@@ -1,39 +1,66 @@
 #!/usr/bin/env zsh
-##############################################################################
-# ztest — minimal test framework for zsh modules
+# =============================================================================
+# ztest — Minimal test framework for zsh modules
+# =============================================================================
+# Description:  Auto-discovers functions named test_* in the current shell
+#               and runs each one in a forked subshell, so global state
+#               never leaks between tests. A failed assertion prints to
+#               stderr and bumps a per-test counter instead of aborting, so
+#               a single test can report several failures; the test fails if
+#               that counter is non-zero or the function returns non-zero.
+#               Optional hooks are picked up by name: test_setup and
+#               test_teardown run around every test, test_setup_all and
+#               test_teardown_all once per run. Hook names are global, so
+#               when several files are sourced into one shell the last
+#               definition wins — the runner avoids this by sourcing each
+#               file in its own subshell. The framework never changes shell
+#               emulation or options around user code.
 #
-# Conventions:
-#   - Test functions named test_* are auto-discovered
-#   - Each test runs in a forked subshell — global state is isolated
-#   - Failed assertions print to stderr, increment a per-test counter,
-#     and continue (so one test can report multiple failures)
-#   - Optional hooks: test_setup, test_teardown (per-test)
-#                     test_setup_all, test_teardown_all (per-run)
+#               When ZTEST_STATS_FILE names a writable path, ztest::run
+#               appends its counters to it as one line, which is how the
+#               runner recovers totals from a suite that ran in a subshell.
 #
-# Usage:
-#   source ./ztest.zsh
-#   source ./tests/test_my_module.zsh
-#   ztest::run                 # all test_* functions
-#   ztest::run "test_zkv_*"    # filtered
+# Usage:        source ./ztest
+#               source ./tests/unit/zkv/test_zkv_tx.zsh
+#               ztest::run                 # all test_* functions
+#               ztest::run "test_zkv_*"    # filtered
 #
-# Assumptions:
-#   - The framework must not alter shell emulation/options around user code.
-#   - Hook names remain global; if multiple sourced files redefine test_setup
-#     or test_teardown, the last definition still wins.
-##############################################################################
+# Public API:   ztest::run, ztest::assert::*, ztest::fail, ztest::skip
+# Private API:  _ztest_*  (internal — no compatibility guarantee)
+#
+# Requires:     zsh 5.1+, mktemp(1); zlog is optional and only used for
+#               colourised output
+#
+# Provides:     _ztest_pass/_ztest_fail/_ztest_skip counters
+#
+# Version:      0.6.0
+# License:      MIT
+# =============================================================================
 
-# Idempotent load
+# Sourcing twice would reset the counters mid-run.
 if (( ${_ztest_loaded:-0} )); then
     return 0
 fi
 typeset -gi _ztest_loaded=1
 
-# ── Counters ──────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Run-wide counters
+# -----------------------------------------------------------------------------
+# Accumulated by _ztest_run_one in the parent shell and reset by ztest::run.
+# The per-test counters (_ztest_local_*) live in the test subshell instead.
+
 typeset -gi _ztest_pass=0 _ztest_fail=0 _ztest_skip=0
 typeset -gi _ztest_total_assertions=0
 typeset -g _ztest_current=""
 
-# Colors via zlog if available, plain otherwise
+
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+# _ztest_c <color> <text>
+# Print <text> to stdout, colourised through zlog when that module is
+# loaded and verbatim otherwise. Clobbers REPLY.
 _ztest_c() {
     if (( ${+functions[zlog::colorize]} )); then
         zlog::colorize "$1" "$2"
@@ -43,6 +70,10 @@ _ztest_c() {
     fi
 }
 
+# _ztest_mktemp
+# Create a temp file, falling back to an explicit TMPDIR template when the
+# -t form is unavailable. Sets REPLY to the path. Returns 1 if both
+# attempts fail, leaving REPLY untouched.
 _ztest_mktemp() {
     local tmp
     tmp=$(mktemp -t ztest.XXXXXX 2>/dev/null) \
@@ -51,6 +82,10 @@ _ztest_mktemp() {
     REPLY="$tmp"
 }
 
+# _ztest_print_file_indented <file> [prefix] [fd]
+# Echo <file> to file descriptor [fd] (default 2), prefixing every line with
+# [prefix] (default four spaces). A missing or unreadable file is not an
+# error — captured output is often empty.
 _ztest_print_file_indented() {
     local file="$1"
     local prefix="${2:-    }"
@@ -64,6 +99,10 @@ _ztest_print_file_indented() {
     done < "$file"
 }
 
+# _ztest_extract_skip_reason <file>
+# Find the first SKIP: line ztest::skip wrote into the captured stderr and
+# set REPLY to the reason after the marker. Returns 1 when the file is
+# unreadable or holds no marker, leaving REPLY empty.
 _ztest_extract_skip_reason() {
     local file="$1"
     local line
@@ -81,16 +120,24 @@ _ztest_extract_skip_reason() {
     return 1
 }
 
-##############################################################################
-# Assertions — print to stderr on fail, bump counter, return non-zero.
-# Each test should `return 0` at the end; assertion failures propagate via
-# the per-test counter that's checked in _ztest_run_one.
-#
-# Note:
-#   ztest::assert::true/false accept callable command forms only.
-#   They cannot directly take raw `[[ ... ]]` or `(( ... ))` syntax as argv.
-##############################################################################
 
+# =============================================================================
+# ASSERTIONS
+# =============================================================================
+# Every assertion bumps _ztest_local_assertions, and on failure prints a
+# diagnostic to stderr, bumps _ztest_local_fails, and returns 1. Nothing
+# aborts the test: _ztest_run_one fails it later from that counter, so one
+# test may report several failures in a single pass.
+#
+# Comparing assertions take the expected value first and the actual value
+# second; swapping them only shows up as a reversed diagnostic.
+#
+# NOTE: ztest::assert::true/false take a callable command and its arguments,
+# not shell syntax — `[[ ... ]]` and `(( ... ))` cannot be passed as argv.
+# Wrap such a condition in a helper function instead.
+
+# ztest::assert::eq <expected> <actual> [message]
+# Assert the two strings are equal. Prints both values on failure.
 ztest::assert::eq() {
     local expected="$1" actual="$2" msg="${3:-}"
     (( _ztest_local_assertions += 1 ))
@@ -106,6 +153,8 @@ ztest::assert::eq() {
     return 1
 }
 
+# ztest::assert::ne <not_expected> <actual> [message]
+# Assert the two strings differ.
 ztest::assert::ne() {
     local notexp="$1" actual="$2" msg="${3:-}"
     (( _ztest_local_assertions += 1 ))
@@ -120,6 +169,8 @@ ztest::assert::ne() {
     return 1
 }
 
+# ztest::assert::true <command> [args...]
+# Assert <command> exits zero. Its output is not suppressed.
 ztest::assert::true() {
     (( _ztest_local_assertions += 1 ))
 
@@ -132,6 +183,9 @@ ztest::assert::true() {
     return 1
 }
 
+# ztest::assert::false <command> [args...]
+# Assert <command> exits non-zero. Its stderr is discarded, since a command
+# expected to fail usually complains.
 ztest::assert::false() {
     (( _ztest_local_assertions += 1 ))
 
@@ -144,6 +198,10 @@ ztest::assert::false() {
     return 1
 }
 
+# ztest::assert::returns <expected_rc> <command> [args...]
+# Assert <command> exits with exactly <expected_rc>. Its stderr is
+# discarded. Prefer this over assert::false when the specific error code is
+# part of the contract.
 ztest::assert::returns() {
     local expected_rc="$1"
     shift
@@ -162,6 +220,9 @@ ztest::assert::returns() {
     return 1
 }
 
+# ztest::assert::contains <haystack> <needle>
+# Assert <haystack> contains <needle> as a substring. The container comes
+# first here, unlike the expected-first comparing assertions.
 ztest::assert::contains() {
     local haystack="$1" needle="$2"
     (( _ztest_local_assertions += 1 ))
@@ -177,6 +238,78 @@ ztest::assert::contains() {
     return 1
 }
 
+# ztest::assert::not_contains <haystack> <needle>
+# Assert <haystack> does not contain <needle>. Argument order matches
+# assert::contains; use this rather than wrapping a substring test in a
+# throwaway function for assert::false.
+ztest::assert::not_contains() {
+    local haystack="$1" needle="$2"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ "$haystack" != *"$needle"* ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::not_contains failed"
+    print -u2 -r -- "      haystack: '$haystack'"
+    print -u2 -r -- "      needle:   '$needle'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+# ztest::assert::matches <string> <pattern>
+# Assert <string> matches the zsh glob <pattern> (`<->` for an integer,
+# `z::is::*` for a prefix). Prefer this over wrapping a `[[ ]]` test in a
+# throwaway function for assert::true: the failure message shows the value.
+ztest::assert::matches() {
+    local string="$1" pattern="$2"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ "$string" == ${~pattern} ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::matches failed"
+    print -u2 -r -- "      value:   '$string'"
+    print -u2 -r -- "      pattern: '$pattern'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+# ztest::assert::file_exists <path>
+# Assert <path> exists and is readable.
+ztest::assert::file_exists() {
+    local path="$1"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ -r $path ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::file_exists failed: '$path'"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+# ztest::assert::file_absent <path>
+# Assert nothing exists at <path>. Used by tests that prove a command was
+# never executed, where a marker file appearing is the failure.
+ztest::assert::file_absent() {
+    local path="$1"
+    (( _ztest_local_assertions += 1 ))
+
+    if [[ ! -e $path ]]; then
+        return 0
+    fi
+
+    print -u2 -r -- "  ✗ assert::file_absent failed: '$path' exists"
+    (( _ztest_local_fails += 1 ))
+    return 1
+}
+
+# ztest::assert::set <varname>
+# Assert the named variable exists. Pass the name, not its value; a
+# declared but empty variable counts as set.
 ztest::assert::set() {
     local var="$1"
     (( _ztest_local_assertions += 1 ))
@@ -190,6 +323,10 @@ ztest::assert::set() {
     return 1
 }
 
+# ztest::assert::array_eq <expected_name> <actual_name>
+# Assert two arrays match element for element, expected first. Both
+# arguments are variable names, not expansions. Reports the first differing
+# index, or both arrays when the lengths differ.
 ztest::assert::array_eq() {
     local exp_name="$1" act_name="$2"
     local -a exp act
@@ -219,21 +356,36 @@ ztest::assert::array_eq() {
     return 1
 }
 
+# ztest::fail [message]
+# Record a failure without an assertion, for conditions the assert helpers
+# cannot express. Does not abort the test and is not counted as an
+# assertion; return explicitly if the test must stop.
 ztest::fail() {
     print -u2 -r -- "  ✗ ${1:-explicit fail}"
     (( _ztest_local_fails += 1 ))
     return 1
 }
 
+# ztest::skip [reason]
+# Abandon the current test and report it as skipped. Exits the test
+# subshell with status 77, which _ztest_run_one translates into a skip;
+# calling it outside a test would exit the caller's shell.
 ztest::skip() {
     print -u2 -r -- "SKIP:${1:-no reason}"
     exit 77
 }
 
-##############################################################################
-# Runner
-##############################################################################
 
+# =============================================================================
+# RUNNER
+# =============================================================================
+
+# _ztest_run_one <test_name>
+# Run one test in a subshell with stdout and stderr captured, print the
+# pass/skip/fail line, and fold its assertion count into the run totals.
+# Subshell status 77 means skipped, 0 passed, anything else failed —
+# captured output is replayed only for a failure. Updates _ztest_pass,
+# _ztest_fail, _ztest_skip and _ztest_total_assertions.
 _ztest_run_one() {
     local test_name="$1"
     local tmp_base tmp_err tmp_out tmp_count
@@ -257,6 +409,8 @@ _ztest_run_one() {
         typeset -gi _ztest_local_assertions=0
         _ztest_current="$test_name"
 
+        # The count has to cross the subshell boundary on disk, and it must
+        # survive ztest::skip, which leaves via exit.
         TRAPEXIT() {
             print -r -- "$_ztest_local_assertions" >| "$tmp_count"
         }
@@ -314,10 +468,30 @@ _ztest_run_one() {
     rm -f -- "$tmp_err" "$tmp_out" "$tmp_count"
 }
 
+# _ztest_publish_stats
+# Append "<pass> <fail> <skip> <assertions>" to ZTEST_STATS_FILE when that
+# variable names a path, so a caller that ran this suite in a subshell can
+# still add its counters to a combined total. A no-op otherwise.
+_ztest_publish_stats() {
+    [[ -n ${ZTEST_STATS_FILE:-} ]] || return 0
+    print -r -- "$_ztest_pass $_ztest_fail $_ztest_skip $_ztest_total_assertions" \
+        >> "$ZTEST_STATS_FILE" 2>/dev/null
+    return 0
+}
+
+# ztest::run [pattern]
+# Run every function matching [pattern] (default test_*) in sorted order,
+# honouring the test_setup_all/test_teardown_all hooks, and print a summary.
+# Resets the run counters first, and publishes them to ZTEST_STATS_FILE when
+# that is set. Returns 1 when a test failed, 2 when the pattern matched
+# nothing, 0 otherwise; skips do not fail the run. The distinct code for an
+# empty selection lets a caller running a name filter across many files tell
+# "this file has nothing to contribute" from "this file is broken".
 ztest::run() {
     local pattern="${1:-test_*}"
     local -a tests
 
+    # The hooks match test_* as well, so they are filtered out by name.
     tests=(${(M)${(k)functions}:#${~pattern}})
     tests=(${tests:#test_setup})
     tests=(${tests:#test_teardown})
@@ -327,7 +501,11 @@ ztest::run() {
 
     if (( ${#tests} == 0 )); then
         print -u2 -r -- "ztest: no tests matching '$pattern'"
-        return 1
+        # Publish zeros rather than a synthetic failure: no test ran, and the
+        # caller reports the empty selection from the return code instead.
+        _ztest_pass=0 _ztest_fail=0 _ztest_skip=0 _ztest_total_assertions=0
+        _ztest_publish_stats
+        return 2
     fi
 
     _ztest_pass=0
@@ -357,6 +535,8 @@ ztest::run() {
 
     print -r -- "──────────────────────────────────────────────────────────"
     local total=$(( _ztest_pass + _ztest_fail + _ztest_skip ))
+
+    _ztest_publish_stats
 
     if (( _ztest_fail == 0 )); then
         _ztest_c green "✓ ${_ztest_pass}/${total} passed (${_ztest_total_assertions} assertions, ${_ztest_skip} skipped)"

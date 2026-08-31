@@ -1,3 +1,24 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# test_zkv_tx.zsh — Transaction semantics
+# =============================================================================
+# Description:  Covers begin/commit/rollback for strings and for every
+#               container type, the visibility of uncommitted writes to reads
+#               inside the same transaction, set-then-delete and
+#               delete-then-set collapsing within one transaction, and the
+#               z::kv::tx wrapper rolling back when its callback fails.
+#
+# Usage:        zsh tests/run_tests.zsh zkv
+#               zsh tests/unit/zkv/test_zkv_tx.zsh    # standalone
+#
+# Covers:       z::kv::begin, z::kv::commit, z::kv::rollback, z::kv::tx
+#
+# Requires:     zkv — loaded by ztest::require below
+# =============================================================================
+
+source "${0:A:h}/../../bootstrap.zsh"
+ztest::require zkv
+
 test_setup() {
   z::kv::open _tx_test
 }
@@ -26,7 +47,8 @@ test_zkv_tx_string_commit() {
   ztest::assert::eq "modified" "$REPLY"
 }
 
-# Critical: this was BROKEN in v3
+# Rollback must restore container contents, not just scalar values: the
+# journal has to capture the whole list, not the key's presence.
 test_zkv_tx_list_rollback() {
   z::kv::lpush _tx_test "mylist" "live1"
   z::kv::begin _tx_test
@@ -92,3 +114,6 @@ test_zkv_tx_tx_helper_rolls_back_on_failure() {
   z::kv::get _tx_test "k"
   ztest::assert::eq "original" "$REPLY" "tx() rolls back on cb failure"
 }
+
+# Standalone execution; under the runner ztest::run is called by the runner.
+(( ${ZTEST_RUNNER:-0} )) || ztest::run "${1:-test_*}"

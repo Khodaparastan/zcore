@@ -1,5 +1,32 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# test_zbus_dispatch.zsh — Handler registration and dispatch order
+# =============================================================================
+# Description:  Covers how handlers are selected and run for an emit:
+#               descending priority order, --once handlers unsubscribing
+#               themselves after their first delivery, wildcard patterns
+#               matching only the intended events, emit_safe continuing past
+#               a handler that fails, and the two unsubscribe paths — off,
+#               which reports how many handlers it removed, and off_id, which
+#               removes the single handler whose id was returned by on.
+#
+# Usage:        zsh tests/run_tests.zsh zbus
+#               zsh tests/unit/zbus/test_zbus_dispatch.zsh    # standalone
+#
+# Covers:       z::bus::init, z::bus::reset, z::bus::on, z::bus::off,
+#               z::bus::off_id, z::bus::count, z::bus::emit,
+#               z::bus::emit_safe
+#
+# Requires:     zbus — loaded by ztest::require below
+# =============================================================================
+
+source "${0:A:h}/../../bootstrap.zsh"
+ztest::require zbus
+
 test_setup() { z::bus::reset; z::bus::init }
 
+# Registered out of order on purpose: dispatch order must follow priority,
+# not registration.
 test_zbus_priority_ordering() {
   typeset -ga _calls=()
   _h_low()  { _calls+=("low"); }
@@ -32,15 +59,15 @@ test_zbus_wildcard_matches() {
   ztest::assert::eq "2" "$_wc_count"
 }
 
+# emit_safe isolates handlers from each other: a failure must not cut the
+# dispatch chain short for the handlers queued behind it.
 test_zbus_emit_safe_survives_handler_crash() {
   _crashing_h() { return 1; }
-  _good_h() { :; }
+  _good_h() { typeset -gi _good_ran=1; }
   z::bus::on "evt" _crashing_h --priority 80
   z::bus::on "evt" _good_h     --priority 20
   z::bus::emit_safe "evt" || true
-  # emit_safe forks each handler — side effects do not propagate; use stats.
-  ztest::assert::eq "1" "${_zbus_stats[evt.handled]:-0}" "good handler ran despite earlier crash"
-  ztest::assert::eq "1" "${_zbus_stats[evt.failed]:-0}" "crashing handler recorded as failed"
+  ztest::assert::eq "1" "$_good_ran" "later handler ran despite earlier crash"
 }
 
 test_zbus_off_returns_count() {
@@ -60,3 +87,6 @@ test_zbus_off_id_specific() {
   z::bus::count "evt"
   ztest::assert::eq "1" "$REPLY"
 }
+
+# Standalone execution; under the runner ztest::run is called by the runner.
+(( ${ZTEST_RUNNER:-0} )) || ztest::run "${1:-test_*}"

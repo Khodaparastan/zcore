@@ -1,3 +1,26 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# test_zkv_encode.zsh — Value escaping round trips
+# =============================================================================
+# Description:  Every value is escaped before it reaches the on-disk format,
+#               so decode(encode(v)) must return v for any input. Exercises
+#               the escape byte itself, backslashes, newlines, pipes and the
+#               Z_SEP/Z_RECSEP separators, the empty string, a persisted
+#               Windows-style path, and 50 randomly assembled strings mixing
+#               all of those bytes.
+#
+# Usage:        zsh tests/run_tests.zsh zkv
+#               zsh tests/unit/zkv/test_zkv_encode.zsh    # standalone
+#
+# Covers:       _z::kv::encode_value, _z::kv::decode_value, z::kv::save,
+#               z::kv::load, z::kv::set, z::kv::get, z::kv::clear
+#
+# Requires:     zkv — loaded by ztest::require below
+# =============================================================================
+
+source "${0:A:h}/../../bootstrap.zsh"
+ztest::require zkv
+
 test_setup_all() {
   z::kv::open _enc_test
 }
@@ -6,7 +29,8 @@ test_teardown_all() {
   z::kv::close _enc_test 2>/dev/null
 }
 
-# ─── The regression that caused this whole thing ─────────────────────────
+# A backslash is both a literal value byte and the escape character, so it
+# is the one input where a naive encoder loses information.
 test_zkv_encode_backslash_roundtrip() {
   local original='path\to\file'
   _z::kv::encode_value "$original"
@@ -49,6 +73,8 @@ test_zkv_encode_persist_load_backslash() {
   rm -f "$tmp"
 }
 
+# The hand-written cases cover the dangerous bytes individually; this one
+# looks for combinations of them that break the escaping.
 test_zkv_encode_fuzz_random_strings() {
   local i original
   for (( i = 0; i < 50; i++ )); do
@@ -76,3 +102,6 @@ test_zkv_encode_fuzz_random_strings() {
   done
   return 0
 }
+
+# Standalone execution; under the runner ztest::run is called by the runner.
+(( ${ZTEST_RUNNER:-0} )) || ztest::run "${1:-test_*}"

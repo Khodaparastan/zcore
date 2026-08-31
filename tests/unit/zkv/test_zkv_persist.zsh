@@ -1,3 +1,29 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# test_zkv_persist.zsh — Dump and restore
+# =============================================================================
+# Description:  Saves a store holding one key of every type, reloads it into
+#               a second store and checks each value and its type survived.
+#               Also pins the two edges of the format: a dump declaring a
+#               newer format version is rejected with Z_ERR_GENERAL, and
+#               values containing newlines, pipes and backslashes — the
+#               record and field separators of the on-disk format — round
+#               trip unchanged.
+#
+# Usage:        zsh tests/run_tests.zsh zkv
+#               zsh tests/unit/zkv/test_zkv_persist.zsh    # standalone
+#
+# Covers:       z::kv::save, z::kv::load, z::kv::open, z::kv::close,
+#               z::kv::clear, z::kv::set, z::kv::get, z::kv::set_int,
+#               z::kv::get_int, z::kv::lpush, z::kv::llen, z::kv::sadd,
+#               z::kv::sismember, z::kv::hset, z::kv::hget
+#
+# Requires:     zkv — loaded by ztest::require below
+# =============================================================================
+
+source "${0:A:h}/../../bootstrap.zsh"
+ztest::require zkv
+
 test_zkv_persist_save_load_roundtrip() {
   local tmp=$(mktemp -t zkv.XXXX)
   z::kv::open _ps_a
@@ -40,8 +66,9 @@ EOF
   rm -f "$tmp"
 }
 
+# End-to-end counterpart to test_zkv_encode: escaping must hold across a
+# real save/load cycle, not only in the encoder round trip.
 test_zkv_persist_save_load_dangerous_chars() {
-  # Regression: this is exactly the scenario the v3 backslash bug corrupted
   local tmp=$(mktemp -t zkv.XXXX)
   local val='line1
 line2|pipe\backslash'
@@ -55,3 +82,6 @@ line2|pipe\backslash'
   z::kv::close _ps_d
   rm -f "$tmp"
 }
+
+# Standalone execution; under the runner ztest::run is called by the runner.
+(( ${ZTEST_RUNNER:-0} )) || ztest::run "${1:-test_*}"
