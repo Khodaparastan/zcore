@@ -1,25 +1,58 @@
+#!/usr/bin/env zsh
 # =============================================================================
-# z::ui / z::progress / z::util — Terminal UI Primitives
+# ui — Terminal capability detection, progress bars, and spinners
 # =============================================================================
-# Description: Terminal introspection, progress bars, spinners, formatting.
+# Description:  Terminal user-interface primitives for the z framework:
+#               capability detection, cached terminal dimensions, line
+#               clearing, number and duration formatting, boxed output,
+#               determinate and indeterminate progress bars, named progress
+#               tracks, and a self-rescheduling spinner.
+#               Every rendering call writes to stderr and degrades to a
+#               silent no-op when fd 2 is not a terminal or when progress
+#               output is disabled, so callers need not guard their calls.
 #
-# Usage:       Sourced as part of the z-framework; not for direct CLI use.
+# Usage:        source ui           # before z; zlog optional
+#               z::progress::show <current> <total> [label]
+#               z::progress::finish "Loaded" --since "$start"
 #
-# Requires:    z::cache, z::config, zlog (internal framework modules)
-#              tput (optional, fallback for terminal dimension detection)
+# Public API:   z::ui::*, z::util::*, z::progress::*
+# Private API:  __z::ui::*, __z::progress::*, z::progress::__spinner_tick,
+#               _zui_*, _zprog_*  (internal — no compatibility guarantee)
+#
+# Requires:     z     — z::cache::* and z::config::*, resolved lazily at
+#                       call time; built-in defaults apply when z is absent
+#               zlog  — zlog::debug diagnostics and the _zlog_colors palette
+#               tput  — optional; fallback for terminal size detection
+#
+# Version:      0.6.0
+# License:      MIT
 # =============================================================================
 
-# ---------------------------------------------------------------------------
+
+# =============================================================================
 # CAPABILITY DETECTION
-# ---------------------------------------------------------------------------
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# Cached verdicts and the active glyph table
+# -----------------------------------------------------------------------------
+
+# -1 means "not probed yet"; the predicates below latch 0 or 1 on first use.
 typeset -gi _zui_unicode=-1 _zui_color=-1
+
+# Glyph table selected once by __z::ui::init_glyphs. Every renderer reads
+# these instead of embedding literal characters, so a non-UTF-8 terminal is
+# handled in one place.
 typeset -g _zui_glyphs_done="" _zui_glyphs_active_a="" _zui_glyphs_active_b=""
 typeset -g _zui_glyphs_pending="" _zui_glyphs_fail="" _zui_glyphs_skip="" _zui_glyphs_ok=""
 typeset -g _zui_glyphs_fill="" _zui_glyphs_edge="" _zui_glyphs_head="" _zui_glyphs_track=""
 typeset -g _zui_glyphs_frame_l="" _zui_glyphs_frame_r="" _zui_glyphs_sep="" _zui_glyphs_arrow=""
 typeset -g _zui_glyphs_block_fill="" _zui_glyphs_block_empty=""
 
+# __z::ui::init_glyphs
+# Populate the _zui_glyphs_* globals from either the Unicode or the ASCII
+# glyph set, as decided by z::ui::supports_unicode. Run once at load time and
+# safe to re-run after the locale or terminal changes.
 __z::ui::init_glyphs() {
   emulate -L zsh
 
@@ -38,6 +71,13 @@ __z::ui::init_glyphs() {
   fi
 }
 
+# -----------------------------------------------------------------------------
+# Capability predicates
+# -----------------------------------------------------------------------------
+
+# z::ui::is_tty [fd]
+# Test whether the given file descriptor — 1 or 2, default 2 — is attached to
+# a terminal. Any other value returns 1 without being tested.
 z::ui::is_tty() {
   emulate -L zsh
   local stream="${1:-2}"
@@ -48,6 +88,10 @@ z::ui::is_tty() {
   esac
 }
 
+# z::ui::supports_color
+# Report whether colour escapes may be emitted. Honours NO_COLOR, TERM=dumb,
+# a non-terminal stderr, and zlog's already-resolved colour mode. The verdict
+# is latched in _zui_color, so later environment changes are ignored.
 z::ui::supports_color() {
   emulate -L zsh
 
@@ -75,6 +119,9 @@ z::ui::supports_color() {
   return 0
 }
 
+# z::ui::supports_unicode
+# Report whether the locale advertises UTF-8 on a non-dumb terminal. The
+# verdict is latched in _zui_unicode.
 z::ui::supports_unicode() {
   emulate -L zsh
 
@@ -93,10 +140,15 @@ z::ui::supports_unicode() {
   return 1
 }
 
-# ---------------------------------------------------------------------------
-# TERMINAL DIMENSIONS
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# TERMINAL DIMENSIONS
+# =============================================================================
+
+# z::ui::width
+# Print the terminal width in columns to stdout, preferring $COLUMNS, then
+# tput, and falling back to 80. Memoised in z::cache with a one-second TTL
+# that the resize trap also invalidates.
 z::ui::width() {
   emulate -L zsh
 
@@ -123,6 +175,9 @@ z::ui::width() {
   return 0
 }
 
+# z::ui::height
+# Print the terminal height in rows to stdout, preferring $LINES, then tput,
+# and falling back to 24. Cached exactly like z::ui::width.
 z::ui::height() {
   emulate -L zsh
 
@@ -149,6 +204,10 @@ z::ui::height() {
   return 0
 }
 
+# z::ui::watch_resize
+# Install a TRAPWINCH handler that drops the cached width and height so the
+# next query re-measures. Does nothing when a TRAPWINCH function already
+# exists, so a caller's own handler is never overwritten.
 z::ui::watch_resize() {
   emulate -L zsh
 
@@ -163,10 +222,15 @@ z::ui::watch_resize() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# TERMINAL CLEARING
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# TERMINAL CLEARING
+# =============================================================================
+
+# z::ui::clear_line [-f|--force] [-n|--no-newline]
+# Erase the current stderr line with a carriage return and an erase-to-end
+# sequence, then emit a newline unless --no-newline is given. Writes nothing
+# unless fd 2 is a terminal or --force is set. Returns 1 on an unknown flag.
 z::ui::clear_line() {
   emulate -L zsh
 
@@ -197,6 +261,9 @@ z::ui::clear_line() {
   return 0
 }
 
+# z::ui::clear
+# Clear the whole screen and home the cursor: an escape sequence on stderr
+# when fd 2 is a terminal, otherwise clear(1) when stdout is.
 z::ui::clear() {
   emulate -L zsh
 
@@ -209,10 +276,18 @@ z::ui::clear() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# FORMATTING UTILITIES
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# FORMATTING UTILITIES
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Numbers, durations, and text
+# -----------------------------------------------------------------------------
+
+# z::util::comma [number]
+# Print the integer to stdout with thousands separators, preserving a leading
+# minus sign. Anything that is not a run of digits is printed unchanged.
 z::util::comma() {
   emulate -L zsh
   setopt localoptions typeset_silent
@@ -263,6 +338,10 @@ z::util::comma() {
   return 0
 }
 
+# z::util::truncate [text] [max-width]
+# Print text to stdout shortened to max-width characters (default 12) by
+# eliding the middle with a horizontal ellipsis. Returns 1 when max-width is
+# not an integer; widths below 1 are clamped to 1.
 z::util::truncate() {
   emulate -L zsh
 
@@ -290,6 +369,10 @@ z::util::truncate() {
   return 0
 }
 
+# z::util::duration [seconds]
+# Print a human-readable duration to stdout: milliseconds under one second,
+# one decimal place of seconds under a minute, otherwise "Nm SSs". Input that
+# is neither an integer nor a decimal is echoed with an "s" suffix.
 z::util::duration() {
   emulate -L zsh
 
@@ -318,7 +401,10 @@ z::util::duration() {
   return 0
 }
 
-# Elapsed seconds since an EPOCHREALTIME or integer epoch stamp.
+# __z::ui::elapsed_since <stamp>
+# Measure the seconds elapsed since an EPOCHREALTIME or integer epoch stamp.
+# Sets REPLY to the fractional elapsed time, clamped at zero; sets REPLY to
+# "" and returns 1 when stamp is empty.
 __z::ui::elapsed_since() {
   emulate -L zsh
   local since="${1:-}"
@@ -342,6 +428,14 @@ __z::ui::elapsed_since() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Boxed output
+# -----------------------------------------------------------------------------
+
+# z::ui::box <title> <width> [line ...]
+# Draw the given lines inside a box on stderr, with an optional title in the
+# top rule. A width of 0 or a non-integer auto-sizes from the terminal and
+# caps at 80 columns; over-long lines are truncated to the inner width.
 z::ui::box() {
   emulate -L zsh
 
@@ -387,17 +481,34 @@ z::ui::box() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# PROGRESS — CONFIG / STATE
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# PROGRESS — INTERNAL ENGINE
+# =============================================================================
+# Everything below the public API: module state, configuration lookups, bar
+# geometry, bar rendering, colour theming, and the single stderr writer.
+
+# -----------------------------------------------------------------------------
+# Module state
+# -----------------------------------------------------------------------------
+
+# Named tracks, keyed by id, each holding "current|total|label".
 typeset -gA _zprog_tracks=()
+# Number of track lines currently on screen; the redraw walks the cursor back
+# up by exactly this many rows.
 typeset -gi _zprog_track_lines=0
 typeset -gi _z_progress_spinner_idx=0
 typeset -gi _zprog_spinner_active=0
 typeset -g _zprog_spinner_msg=""
 typeset -g _zprog_phase=""
 
+# -----------------------------------------------------------------------------
+# Configuration lookups
+# -----------------------------------------------------------------------------
+
+# __z::progress::is_enabled
+# Succeed when progress output is permitted, that is when the show_progress
+# config key is unset or "true". Clobbers REPLY through z::config::get.
 __z::progress::is_enabled() {
   emulate -L zsh
   local show_progress=""
@@ -409,6 +520,9 @@ __z::progress::is_enabled() {
   [[ -z $show_progress || $show_progress == true ]]
 }
 
+# __z::progress::style
+# Set REPLY to the configured bar style — classic, minimal, or blocks —
+# falling back to classic for unset or unrecognised values.
 __z::progress::style() {
   emulate -L zsh
 
@@ -422,6 +536,11 @@ __z::progress::style() {
   return 0
 }
 
+# __z::progress::should_show <current> <total>
+# Throttle redraws so long runs do not flood the terminal: always succeed on
+# the first and last step and on every step of a short run, then fall back to
+# a stride taken from the progress_update_interval config key. Returns 1 for
+# non-integer arguments.
 __z::progress::should_show() {
   emulate -L zsh
 
@@ -462,6 +581,14 @@ __z::progress::should_show() {
   return 1
 }
 
+# -----------------------------------------------------------------------------
+# Bar geometry
+# -----------------------------------------------------------------------------
+
+# __z::progress::bar_width_for_term [term-width]
+# Set REPLY to the bar width in cells for a terminal of the given width
+# (default 80), after reserving room for the label, percentage, and counters.
+# The result is clamped to the range 8..48.
 __z::progress::bar_width_for_term() {
   emulate -L zsh
   typeset -i term_width="${1:-80}" style_reserved=32 bar_width
@@ -490,6 +617,9 @@ __z::progress::bar_width_for_term() {
   REPLY=$bar_width
 }
 
+# __z::progress::label_width_for_term [term-width]
+# Set REPLY to the width of the label column for the given terminal width
+# (default 80). A REPLY of 0 means the label is dropped entirely.
 __z::progress::label_width_for_term() {
   emulate -L zsh
   typeset -i term_width="${1:-80}"
@@ -505,6 +635,10 @@ __z::progress::label_width_for_term() {
   fi
 }
 
+# __z::progress::pulse_glyph
+# Set REPLY to one of the two "active" glyphs, alternating once per second so
+# the leading cell of a discrete bar appears to pulse without the caller
+# having to keep any animation state.
 __z::progress::pulse_glyph() {
   emulate -L zsh
   typeset -i tick=0
@@ -522,6 +656,9 @@ __z::progress::pulse_glyph() {
   fi
 }
 
+# __z::progress::segment_count <total> <bar-width>
+# Set REPLY to the number of cells the bar should use: one cell per item when
+# a short run fits in the bar, otherwise the full bar width.
 __z::progress::segment_count() {
   emulate -L zsh
   typeset -i total="$1" bar_width="$2"
@@ -533,6 +670,16 @@ __z::progress::segment_count() {
   fi
 }
 
+# -----------------------------------------------------------------------------
+# Bar rendering
+# -----------------------------------------------------------------------------
+
+# __z::progress::render_bar <current> <total> <bar-width>
+#   [active] [fail] [skip]
+# Render the uncoloured bar body and set REPLY to "<filled>|<head>|<empty>",
+# the three pipe-separated segments that __z::progress::format_bar colours
+# independently. A run short enough to get one cell per item is drawn in
+# discrete mode, where the current cell carries the fail or skip glyph.
 __z::progress::render_bar() {
   emulate -L zsh
   typeset -i current="$1" total="$2" bar_width="$3"
@@ -621,6 +768,10 @@ __z::progress::render_bar() {
   REPLY="${fill}|${head}|${empty}"
 }
 
+# __z::progress::render_indeterminate <bar-width>
+# Render a fixed-size window sweeping along the track for work of unknown
+# size and set REPLY to the same "<filled>|<head>|<empty>" form, with the head
+# segment always empty. The window position is driven by $SECONDS.
 __z::progress::render_indeterminate() {
   emulate -L zsh
   typeset -i bar_width="$1"
@@ -655,6 +806,11 @@ __z::progress::render_indeterminate() {
   REPLY="${fill}||"
 }
 
+# __z::progress::format_bar <mode> <seg-a> <seg-b> <seg-c> [fail]
+# Wrap the three rendered segments in frame glyphs and set REPLY to the
+# finished bar. mode is discrete, continuous, or indeterminate and selects
+# which colour roles apply. Falls back to uncoloured text when
+# __z::progress::theme left the palette empty.
 __z::progress::format_bar() {
   emulate -L zsh
   local mode="$1" a="$2" b="$3" c="$4"
@@ -684,6 +840,15 @@ __z::progress::format_bar() {
   fi
 }
 
+# -----------------------------------------------------------------------------
+# Theming and line output
+# -----------------------------------------------------------------------------
+
+# __z::progress::theme <percent> [fail]
+# Set the global _zprog_t_* colour variables for the given completion
+# percentage, shifting to green near completion and to red on failure. All of
+# them are cleared first and stay empty when colour is unavailable, so every
+# renderer can test _zprog_t_dim to pick its plain-text branch.
 __z::progress::theme() {
   emulate -L zsh
   typeset -i percent="$1" complete=0 fail="${2:-0}"
@@ -739,6 +904,10 @@ __z::progress::theme() {
   return 0
 }
 
+# __z::progress::format_timing <since> [current] [total]
+# Set REPLY to the elapsed time and, when a rate can be extrapolated from the
+# counts, an "~ETA" suffix. Sets REPLY to "" and returns 1 when since is not a
+# usable stamp.
 __z::progress::format_timing() {
   emulate -L zsh
   local since="${1:-}" current="${2:-0}" total="${3:-0}"
@@ -768,6 +937,13 @@ __z::progress::format_timing() {
   fi
 }
 
+# __z::progress::print_line [term-width] [percent] [label-width] [newline]
+#   [label] [bar] [current] [total] [timing] [detail]
+# Write one progress line to stderr, choosing between a narrow, a medium, and
+# a wide layout from the terminal width, the label width, and the configured
+# style. The line is always rewritten in place with a carriage return and an
+# erase-to-end; a trailing newline follows when the newline argument is an
+# integer.
 __z::progress::print_line() {
   emulate -L zsh
   typeset -i term_width="${1:-80}" percent_int="${2:-0}" label_width="${3:-0}"
@@ -846,10 +1022,20 @@ __z::progress::print_line() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# PROGRESS — PUBLIC API
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# PROGRESS — PUBLIC API
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Single-bar progress
+# -----------------------------------------------------------------------------
+
+# z::progress::phase [name] [total]
+# Record name as the current phase and print a phase header to stderr, with
+# the item count in parentheses when total is an integer. The name is stored
+# even when stderr is not a terminal or progress output is disabled, so later
+# calls can still refer to it.
 z::progress::phase() {
   emulate -L zsh
 
@@ -878,6 +1064,15 @@ z::progress::phase() {
   return 0
 }
 
+# z::progress::show <current> <total> [label]
+#   [--newline] [--active] [--fail] [--skip] [--since <stamp>]
+#   [--detail <text>]
+# Draw a determinate progress bar on stderr, rewriting the current line and
+# ending it with a newline on the final step. --since enables the elapsed and
+# ETA readout, --active pulses the leading cell, and --fail or --skip mark the
+# current item. Succeeds silently when stderr is not a terminal, when progress
+# output is disabled, or when the redraw throttle skips this step; returns 1
+# on non-integer counts, a current outside 0..total, or an unknown flag.
 z::progress::show() {
   emulate -L zsh
 
@@ -988,6 +1183,10 @@ z::progress::show() {
   return 0
 }
 
+# z::progress::indeterminate [label] [--detail <text>] [--newline]
+# Draw one frame of a sweeping bar on stderr for work whose size is unknown;
+# call it repeatedly to animate. --newline is accepted and ignored. Returns 1
+# on an unrecognised argument.
 z::progress::indeterminate() {
   emulate -L zsh
 
@@ -1043,6 +1242,13 @@ z::progress::indeterminate() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Multi-line tracks
+# -----------------------------------------------------------------------------
+
+# z::progress::track <id> [label]
+# Register a named track for the multi-line display, initialised to 0/0.
+# Returns 1 when id is empty.
 z::progress::track() {
   emulate -L zsh
 
@@ -1053,6 +1259,11 @@ z::progress::track() {
   return 0
 }
 
+# z::progress::track_update <id> <current> <total> [label]
+# Store new counts for a track, creating it if needed, and redraw the whole
+# block on stderr by moving the cursor up over the lines printed last time.
+# Tracks are drawn in sorted key order so the block is stable between frames.
+# Returns 1 on an empty id or non-integer counts.
 z::progress::track_update() {
   emulate -L zsh
 
@@ -1101,6 +1312,9 @@ z::progress::track_update() {
   return 0
 }
 
+# z::progress::track_clear
+# Erase the printed track block by walking the cursor back up over it and
+# discard every registered track.
 z::progress::track_clear() {
   emulate -L zsh
 
@@ -1115,6 +1329,17 @@ z::progress::track_clear() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Completion and global switches
+# -----------------------------------------------------------------------------
+
+# z::progress::finish [label]
+#   [--since <stamp>] [--detail <text>] [--warnings <n>] [--total <n>]
+#   [--loaded <n>] [--no-newline]
+# Tear down any bar or track block and print a final success line on stderr,
+# with a summary assembled from the elapsed time, the counts, the warning
+# count, and the detail text. Clears the recorded phase. Returns 1 on an
+# unknown flag.
 z::progress::finish() {
   emulate -L zsh
 
@@ -1201,26 +1426,41 @@ z::progress::finish() {
   return 0
 }
 
+# z::progress::clear
+# Erase the current progress line on stderr without emitting a newline, so
+# the caller can print over it. No-op when progress output is disabled.
 z::progress::clear() {
   emulate -L zsh
   __z::progress::is_enabled || return 0
   z::ui::clear_line --no-newline
 }
 
+# z::progress::enable
+# Turn progress output on for the rest of the session by setting the
+# show_progress config key to true.
 z::progress::enable() {
   emulate -L zsh
   z::config::set show_progress true
 }
 
+# z::progress::disable
+# Turn progress output off for the rest of the session by setting the
+# show_progress config key to false.
 z::progress::disable() {
   emulate -L zsh
   z::config::set show_progress false
 }
 
-# ---------------------------------------------------------------------------
-# SPINNER
-# ---------------------------------------------------------------------------
 
+# =============================================================================
+# SPINNER
+# =============================================================================
+
+# z::progress::spinner [message]
+# Draw a single spinner frame followed by message on stderr and advance the
+# frame index. Uses Braille frames when the terminal supports Unicode and
+# ASCII ones otherwise. No-op when stderr is not a terminal or progress
+# output is disabled.
 z::progress::spinner() {
   emulate -L zsh
 
@@ -1250,6 +1490,9 @@ z::progress::spinner() {
   return 0
 }
 
+# z::progress::__spinner_tick
+# Redraw the spinner and reschedule itself 0.08 s later while
+# _zprog_spinner_active is set; the sched chain ends as soon as it clears.
 z::progress::__spinner_tick() {
   emulate -L zsh
   (( _zprog_spinner_active )) || return 0
@@ -1257,6 +1500,10 @@ z::progress::__spinner_tick() {
   sched +0.08 z::progress::__spinner_tick
 }
 
+# z::progress::spinner_start [message]
+# Start the self-rescheduling spinner: draw the first frame immediately and
+# arm __spinner_tick through sched. Pair every call with spinner_stop or
+# spinner_done, otherwise the sched chain keeps redrawing.
 z::progress::spinner_start() {
   emulate -L zsh
   _zprog_spinner_msg="${1:-Working...}"
@@ -1266,6 +1513,9 @@ z::progress::spinner_start() {
   return 0
 }
 
+# z::progress::spinner_stop
+# Stop the spinner, cancel its pending sched entry, and erase the line
+# without emitting a newline.
 z::progress::spinner_stop() {
   emulate -L zsh
   typeset -gi _zprog_spinner_active=0
@@ -1274,6 +1524,8 @@ z::progress::spinner_stop() {
   return 0
 }
 
+# z::progress::spinner_done [message]
+# Stop the spinner and replace it with a success line carrying message.
 z::progress::spinner_done() {
   emulate -L zsh
   local message="${1:-Done}"
@@ -1292,9 +1544,12 @@ z::progress::spinner_done() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# INIT
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# MODULE INITIALISATION
+# =============================================================================
+# Run at source time so the glyph table matches the terminal and the cached
+# dimensions are invalidated on resize before any caller renders anything.
 
 __z::ui::init_glyphs
 z::ui::watch_resize

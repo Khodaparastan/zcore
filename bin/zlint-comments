@@ -1,0 +1,213 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# zlint-comments — Enforce the file header and comment standard
+# =============================================================================
+# Description:  Checks zsh sources against the "File header & comment
+#               standard" in docs/conventions.md: shebang on line 1, a banner
+#               whose mandatory fields appear in the prescribed order,
+#               79-column section dividers, no legacy divider styles, comment
+#               lines within 79 columns, and a doc block above every function
+#               definition.
+#
+#               Only the mechanical rules are checked. Whether a comment is
+#               true remains a review responsibility.
+#
+# Usage:        bin/zlint-comments <file> [<file> ...]
+#               bin/zlint-comments --script tests/run_tests.zsh
+#               bin/zlint-comments --part lib/z/cache.zsh
+#               make lint-style
+#
+#               --module (the default), --script and --part select the banner
+#               field set: full for a module, reduced for a test file or
+#               standalone script, part-specific for a split-source part.
+#               Each applies to every file after it on the command line.
+#
+# Public API:   none — standalone script
+# Private API:  lint::*
+#
+# Requires:     zsh 5.x only; sources no framework module
+#
+# Version:      0.6.0
+# License:      MIT
+# =============================================================================
+
+emulate -L zsh
+setopt extendedglob typesetsilent
+
+typeset -gi violations=0
+typeset -gi total=0
+
+# Mandatory banner fields, in order. Modules carry the full set; test files
+# and standalone scripts carry the reduced one.
+typeset -ga LINT_FIELDS_MODULE=(
+  'Description' 'Usage' 'Public API' 'Private API' 'Requires' 'Version'
+  'License'
+)
+typeset -ga LINT_FIELDS_SCRIPT=( 'Description' 'Usage' 'Requires' )
+typeset -ga LINT_FIELDS_PART=( 'Description' 'Part of' 'Requires' )
+
+# lint::report <file> <line> <message>
+# Print one violation and count it against the current file.
+lint::report() {
+  print -r -- "  ${1}:${2}: ${3}"
+  (( violations += 1 ))
+}
+
+# lint::banner <file> <mode> <lines...>
+# Verify the shebang, the opening rule, and that every mandatory field for
+# <mode> (module|script|part) appears exactly once and in order.
+lint::banner() {
+  local file="$1" mode="$2"
+  shift 2
+  local -a lines=( "$@" )
+
+  [[ ${lines[1]} == '#!/usr/bin/env zsh' ]] \
+    || lint::report "$file" 1 "line 1 must be '#!/usr/bin/env zsh'"
+  [[ ${lines[2]} == '# '=## ]] \
+    || lint::report "$file" 2 "banner rule must start on line 2"
+
+  local -a want
+  case "$mode" in
+    script) want=( "${LINT_FIELDS_SCRIPT[@]}" ) ;;
+    part)   want=( "${LINT_FIELDS_PART[@]}" ) ;;
+    *)      want=( "${LINT_FIELDS_MODULE[@]}" ) ;;
+  esac
+
+  # The banner runs from line 2 to the first line that is neither a comment
+  # nor blank; its three rules must not be mistaken for the end.
+  typeset -i limit=${#lines} i
+  for (( i = 3; i <= ${#lines}; i++ )); do
+    if [[ ${lines[i]} != [[:space:]]#'#'* && -n ${lines[i]//[[:space:]]/} ]]; then
+      limit=i
+      break
+    fi
+  done
+
+  local field
+  typeset -i at=2 found
+  for field in "${want[@]}"; do
+    found=0
+    for (( i = at + 1; i <= limit; i++ )); do
+      if [[ ${lines[i]} == "# ${field}:"* ]]; then
+        found=1
+        at=i
+        break
+      fi
+    done
+    (( found )) \
+      || lint::report "$file" 2 "banner field missing or out of order: '${field}:'"
+  done
+}
+
+# lint::dividers <file> <lines...>
+# Reject legacy divider styles and any full-width rule that is not exactly
+# 79 columns.
+lint::dividers() {
+  local file="$1"
+  shift
+  local -a lines=( "$@" )
+  local line
+  typeset -i n
+
+  for (( n = 1; n <= ${#lines}; n++ )); do
+    line="${lines[n]}"
+    # Only comment lines can be dividers; a rule drawn inside a string is data.
+    [[ $line == [[:space:]]#'#'* ]] || continue
+    case "$line" in
+      '####'*|'#'[[:space:]]#'****'*|*'────'*)
+        lint::report "$file" $n "legacy divider style"
+        ;;
+      '# '=##|'# '-##)
+        (( ${#line} == 79 )) \
+          || lint::report "$file" $n "divider is ${#line} columns, want 79"
+        ;;
+    esac
+  done
+}
+
+# lint::width <file> <lines...>
+# Comment lines wrap at 79 columns. Code is not checked: reflowing it would
+# be a behavioural change, not a comment fix.
+lint::width() {
+  local file="$1"
+  shift
+  local -a lines=( "$@" )
+  local line
+  typeset -i n
+
+  for (( n = 1; n <= ${#lines}; n++ )); do
+    line="${lines[n]}"
+    [[ $line == [[:space:]]#'#'* ]] || continue
+    (( ${#line} > 79 )) \
+      && lint::report "$file" $n "comment line is ${#line} columns, want <= 79"
+  done
+}
+
+# lint::functions <file> <lines...>
+# Every function definition needs a doc block. A run of adjacent one-line
+# definitions counts as documented when the run itself is introduced by one,
+# and `test_*` cases are exempt — their names are the documentation.
+lint::functions() {
+  local file="$1"
+  shift
+  local -a lines=( "$@" )
+  local line prev=""
+  typeset -i n
+
+  for (( n = 1; n <= ${#lines}; n++ )); do
+    line="${lines[n]}"
+    if [[ $line == [A-Za-z_]##[A-Za-z0-9_:]#'()'[[:space:]]#'{'* \
+       && $line != 'test_'* ]]; then
+      if [[ $prev != [[:space:]]#'#'* \
+         && $prev != [A-Za-z_]##[A-Za-z0-9_:]#'()'* ]]; then
+        lint::report "$file" $n "undocumented function: ${line%%'('*}"
+      fi
+    fi
+    prev="$line"
+  done
+}
+
+# lint::file <file> <mode>
+# Run every rule against one file and report its verdict.
+lint::file() {
+  local file="$1" mode="$2"
+  local -a lines
+  lines=( "${(@f)$(<$file)}" )
+
+  violations=0
+  lint::banner    "$file" "$mode" "${lines[@]}"
+  lint::dividers  "$file" "${lines[@]}"
+  lint::width     "$file" "${lines[@]}"
+  lint::functions "$file" "${lines[@]}"
+
+  if (( violations )); then
+    print -r -- "✗ ${file} — ${violations} violation(s)"
+    (( total += violations ))
+    return 1
+  fi
+  print -r -- "✓ ${file}"
+  return 0
+}
+
+typeset -i rc=0
+typeset mode=module arg
+for arg in "$@"; do
+  case "$arg" in
+    --script) mode=script ;;
+    --module) mode=module ;;
+    --part)   mode=part ;;
+    *)
+      if [[ ! -r $arg ]]; then
+        print -u2 -r -- "zlint-comments: cannot read: $arg"
+        rc=1
+        continue
+      fi
+      lint::file "$arg" "$mode" || rc=1
+      ;;
+  esac
+done
+
+if (( rc )); then
+  print -r -- "── ${total} violation(s)"
+fi
+exit $rc

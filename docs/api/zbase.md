@@ -5,6 +5,14 @@
 > Symbols prefixed `_z::` or `_ZBASE_` are private internals — do not call or
 > depend on them directly.
 
+> **⚠️ Stale symbol names.** This document predates the zbase v3.0.0 verb-root
+> rewrite and still uses the previous generation of names (`z::func::list`,
+> `z::exec::run`, `z::file::source`, `ZBASE_ERROR_*`, `_ZBASE_EXEC_*`). The
+> shipped module exposes `z::is:: / z::ensure:: / z::get:: / z::set:: / z::do::`
+> and the flat `Z_ERR_*` codes instead. Behavioural descriptions below are
+> being kept accurate; **treat the symbol names as out of date** and check
+> `zbase` itself. Full rename pending.
+
 ---
 
 ## Table of Contents
@@ -1006,8 +1014,7 @@ fi
 ### `z::func::list`
 
 List all defined functions matching an optional glob pattern. Sets `$reply`
-to the sorted array and prints each name on its own line for pipeline
-consumers.
+to the sorted array, one function name per element.
 
 ```
 z::func::list [pattern]
@@ -1017,8 +1024,8 @@ z::func::list [pattern]
 |---|---|---|---|
 | `pattern` | glob | `*` | Glob pattern to filter function names |
 
-**Returns:** `0` always. Sets `$reply` to the sorted matching function names.
-Also prints each name to stdout (one per line) for pipeline use.
+**Returns:** `0` always. Sets `$reply` to the sorted matching function names,
+one per element. Writes **nothing** to stdout — read `$reply` directly.
 
 **Notes:**
 
@@ -1293,7 +1300,7 @@ commands from strings.
 
 | Layer | Function | What it blocks |
 |---|---|---|
-| Metacharacter check | `z::exec::run` | `;` `&` `(` `)` `` ` `` — compound commands and subshells |
+| Metacharacter check | `z::do::run` | `;` `&` `|` `(` `)` `<` `>` newline `` ` `` — all compound commands, redirection and substitution |
 | Pattern scanner | `z::exec::scan` | Fork bombs, `rm -rf /`, `dd of=/dev/<disk>`, direct shell invocations |
 | Trusted eval | `_z::exec::eval_trusted` | Nothing — explicit trust boundary for known tool output |
 
@@ -1322,10 +1329,15 @@ via `zlog::always`). `ZBASE_ERROR_INVALID_INPUT` if `input` is empty.
 
 **Notes:**
 
-- Whitelisted init commands (matching `_ZBASE_EXEC_INIT_CMD_RE`) bypass all
-  pattern scanning
-- Scanning is lexical (whitespace-split), not syntactic; quoted arguments
-  containing spaces may not be detected correctly
+- Whitelisted tool-init commands bypass pattern scanning, but only when the
+  input is a **single unchained literal invocation** — every token must be a
+  plain word. Chaining (`;`, `&&`, `|`), redirection and command substitution
+  all disqualify the fast path, so `starship init zsh; rm -rf /` is scanned
+  (and rejected) like any other input.
+- Scanning is lexical, not syntactic: the input is split with zsh's own
+  tokenizer, so control operators and any whitespace run separate words
+  correctly, but quoted arguments keep their quotes and are compared
+  literally. Treat `z::do::scan` as a heuristic, not a safety guarantee.
 
 **Examples:**
 
@@ -1380,8 +1392,9 @@ z::exec::run <input> [timeout]
   caller's environment
 - Uses `gtimeout` (preferred on macOS) or `timeout` if available; degrades
   gracefully without them, logging a one-time debug warning
-- Shell init commands (matching `_ZBASE_EXEC_INIT_CMD_RE`) bypass the
-  metacharacter check but still go through the pattern scanner
+- Whitelisted tool-init commands (e.g. `starship init zsh`) bypass **both**
+  the metacharacter check and the pattern scanner. That is why the fast path
+  accepts only a single unchained literal invocation — see `z::do::scan`.
 
 **Examples:**
 

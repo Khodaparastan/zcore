@@ -1,16 +1,14 @@
 # ui API Reference
 
-> Complete reference for terminal UI primitives in `ui`.
-> Public API: `z::ui::*`, `z::progress::*`, `z::util::*`.
-> Private API: `__z::progress::*` — do not call directly.
+> Complete reference for all public-facing functions in `ui`.
+> Every symbol prefixed `z::ui::`, `z::progress::` or `z::util::` is part of
+> the stable public API.
+> Symbols prefixed `__z::ui::`, `__z::progress::`, `_zui_` or `_zprog_` are
+> private internals — do not call or depend on them directly.
 
 ---
 
-## API Reference — `z::ui` / `z::progress` / `z::util`
-
----
-
-### Table of Contents
+## Table of Contents
 
 1. [Namespace Overview](#1-namespace-overview)
 2. [z::ui](#2-zui)

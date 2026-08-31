@@ -1,36 +1,39 @@
-#compdef -
+#!/usr/bin/env zsh
 # =============================================================================
 # zkv — In-memory Zsh key/value store
+# =============================================================================
+# Description:  A Redis-inspired, pure-zsh store built on global associative
+#               arrays addressed indirectly by name. Supports strings, lists,
+#               sets, sorted sets (zsets), and hashes, plus transactions,
+#               TTL-based expiry, watchers, snapshots, locks, file
+#               persistence, and a batch command interface. Every store is
+#               reached through a handle returned by z::kv::open; all of its
+#               state lives in globals named after that handle, so stores
+#               are process-local and are not shared with subshells.
 #
-# A Redis-inspired, pure-zsh associative-array store supporting strings,
-# lists, sets, sorted sets (zsets), and hashes. Provides transactions,
-# TTL-based expiry, watchers, snapshots, locks, persistence, and a
-# batch command interface.
-#
-# Usage:
-#   source zkv          # after sourcing zlog and zbase
-#   z::kv::open <name> [options]
-#   z::kv::set  <handle> <key> <value> [--ttl <seconds>]
-#   z::kv::get  <handle> <key>
-#   z::kv::del  <handle> <key>
-#   # ... see Public API below
+# Usage:        source zkv          # after zlog and zbase
+#               z::kv::open <name> [options]
+#               z::kv::set  <handle> <key> <value> [--ttl <seconds>]
+#               z::kv::get  <handle> <key>
+#               z::kv::del  <handle> <key>
 #
 # Public API:   z::kv::*
-# Private API:  _z::kv::*  /  _zkv_*
+# Private API:  _z::kv::*, _zkv_*  (internal — no compatibility guarantee)
 #
-# Requires:
-#   zlog   — must be sourced before zkv (provides zlog::*)
-#   zbase  — must be sourced before zkv (provides z::ensure::*, z::is::*)
+# Requires:     zlog   — structured logging; must be sourced first
+#               zbase  — z::is::*, z::ensure::*, Z_ERR_*, Z_SEP/Z_RECSEP/Z_ESC
 #
-# Constants exported:
-#   ZKV_VERSION                 — module version integer
-#   ZKV_PERSIST_FORMAT_VERSION  — on-disk dump format version
+# Provides:     ZKV_VERSION                 — module version integer
+#               ZKV_PERSIST_FORMAT_VERSION  — on-disk dump format version
+#
+# Version:      4
+# License:      MIT
 # =============================================================================
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # RUNTIME DEPENDENCY CHECKS
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 # Verify zlog is loaded (required for all logging calls throughout this file).
 if (( ! ${+functions[zlog::info]} )); then
@@ -63,9 +66,9 @@ if (( ! ${+Z_ERR_GENERAL} )); then
 fi
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # IDEMPOTENT LOAD GUARD
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 # Prevent double-sourcing; _zkv_loaded is set to 1 on first load.
 if (( ${_zkv_loaded:-0} )); then
@@ -75,9 +78,9 @@ fi
 typeset -gi _zkv_loaded=1
 
 
-# -----------------------------------------------------------------------------
-# MODULE LOAD — zsh/datetime
-# -----------------------------------------------------------------------------
+# =============================================================================
+# MODULE LOAD — ZSH/DATETIME
+# =============================================================================
 
 # zsh/datetime provides $EPOCHSECONDS for cheap epoch reads without forking.
 zmodload zsh/datetime 2>/dev/null
@@ -88,9 +91,9 @@ if (( ! ${+EPOCHSECONDS} )); then
 fi
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # CONSTANTS
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 typeset -gri ZKV_VERSION=4
 typeset -gri ZKV_PERSIST_FORMAT_VERSION=4
@@ -108,9 +111,9 @@ typeset -gr _ZKV_STRUCT_ZSET="zset"
 typeset -gr _ZKV_STRUCT_HASH="hash"
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # GLOBAL REGISTRIES
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 # _zkv_handles: maps open store names → 1 (existence check).
 typeset -gA _zkv_handles
@@ -121,34 +124,38 @@ typeset -gA _zkv_perf_mode
 
 # =============================================================================
 # INDIRECTION HELPERS
-#
+# =============================================================================
 # Zsh does not support passing associative arrays by reference, so all
 # per-store maps are accessed by name via (P) expansion and typeset -g.
-# These six helpers centralise that pattern.
-# =============================================================================
+# These helpers centralise that pattern.
 
-# Read one entry from a named associative array.
+# _zkv_aget <array-name> <key>
+# Sets REPLY to the stored entry, or to "" when the key is absent.
 _zkv_aget() {
   local _r="${1}[${2}]"
   REPLY="${(P)_r}"
 }
 
+# _zkv_aset <array-name> <key> <value>
 # Write one entry to a named associative array.
 _zkv_aset() {
   typeset -g "${1}[${2}]=${3}"
 }
 
+# _zkv_ahas <array-name> <key>
 # Test whether a key exists in a named associative array.
 _zkv_ahas() {
   [[ -v "${1}[${2}]" ]]
 }
 
+# _zkv_adel <array-name> <key>
 # Delete one entry from a named associative array.
 _zkv_adel() {
   unset "${1}[${2}]"
 }
 
-# Return the number of keys in a named associative array via REPLY.
+# _zkv_alen <array-name>
+# Sets REPLY to the number of keys in a named associative array.
 _zkv_alen() {
   local _n="$1"
   local -a _keys
@@ -156,13 +163,15 @@ _zkv_alen() {
   REPLY="${#_keys}"
 }
 
+# _zkv_aclear <array-name>
 # Destroy and re-declare a named associative array (effectively clears it).
 _zkv_aclear() {
   unset "$1"
   typeset -gA "$1"
 }
 
-# Deep-copy a named associative array (_src → _dst), replacing _dst entirely.
+# _zkv_acopy <dst-array-name> <src-array-name>
+# Deep-copy a named associative array, replacing the destination entirely.
 _zkv_acopy() {
   local _dst="$1" _src="$2"
   _zkv_aclear "$_dst"
@@ -176,12 +185,14 @@ _zkv_acopy() {
   done
 }
 
+# _zkv_tx_active <handle>
 # Return true (0) when a transaction is active on the given handle.
 _zkv_tx_active() {
   local _r="_zkv_tx_${1}[active]"
   (( ${(P)_r} ))
 }
 
+# _zkv_state_dirty <handle>
 # Return true (0) when the store's dirty flag is set (unsaved changes exist).
 _zkv_state_dirty() {
   local _r="_zkv_state_${1}[dirty]"
@@ -223,8 +234,8 @@ _z::kv::epoch() {
 }
 
 # _z::kv::structure_of <type-string>
-# Maps a user-visible type name to one of the five _ZKV_STRUCT_* constants.
-# Anything not explicitly listed is treated as a string.
+# Sets REPLY to one of the five _ZKV_STRUCT_* constants for a user-visible
+# type name.  Anything not explicitly listed is treated as a string.
 _z::kv::structure_of() {
   case "$1" in
     list)  REPLY="$_ZKV_STRUCT_LIST"  ;;
@@ -304,19 +315,20 @@ _z::kv::require_string_key() {
 
 # =============================================================================
 # ENCODING
-#
+# =============================================================================
 # Values are stored in flat strings delimited by _ZKV_SEP / _ZKV_RECSEP.
 # Any byte that collides with a delimiter must be escaped before storage and
 # unescaped on retrieval.  The escape sentinel itself is escaped first so that
 # the remaining substitutions are unambiguous.
-# =============================================================================
 
 # _z::kv::encode_value <raw>
 # Escapes all delimiter and special bytes in a value; result in REPLY.
+# The escape sentinel is substituted first so that no later rule can re-escape
+# its output.
 _z::kv::encode_value() {
   local _ev_v="$1"
 
-  _ev_v="${_ev_v//${_ZKV_ESC}/${_ZKV_ESC}e}"   # escape sentinel → \e  (must be first)
+  _ev_v="${_ev_v//${_ZKV_ESC}/${_ZKV_ESC}e}"   # sentinel → \e (first)
   _ev_v="${_ev_v//$'\\'/${_ZKV_ESC}b}"           # literal backslash → \b
   _ev_v="${_ev_v//$'\n'/${_ZKV_ESC}n}"           # newline → \n
   _ev_v="${_ev_v//|/${_ZKV_ESC}p}"               # pipe → \p
@@ -345,7 +357,7 @@ _z::kv::decode_value() {
   _dv_v="${_dv_v//${_ZKV_ESC}p/|}"                 # \p → |
   _dv_v="${_dv_v//${_ZKV_ESC}n/$_dv_nl}"           # \n → newline
   _dv_v="${_dv_v//${_ZKV_ESC}b/\\}"                # \b → backslash
-  _dv_v="${_dv_v//${_ZKV_ESC}e/${_ZKV_ESC}}"       # \e → escape sentinel (must be last)
+  _dv_v="${_dv_v//${_ZKV_ESC}e/${_ZKV_ESC}}"       # \e → sentinel (last)
 
   REPLY="$_dv_v"
 }
@@ -393,12 +405,11 @@ _z::kv::split_decoded() {
 
 # =============================================================================
 # TYPE RESERVATION
-#
+# =============================================================================
 # Every key has exactly one structure (string/list/set/zset/hash).  Attempting
 # to use a key with a different structure is a type collision and is rejected.
 # During a transaction the check is performed against the tx-buffer metadata
 # first, then the live metadata.
-# =============================================================================
 
 # _z::kv::reserve_type <handle> <key> <new-type>
 # Registers <new-type> for <key>, or verifies it matches the existing type.
@@ -415,7 +426,8 @@ _z::kv::reserve_type() {
     local _rt_tx_meta="_zkv_txbuf_meta_${_rt_handle}"
     local _rt_tx_del="_zkv_txbuf_del_${_rt_handle}"
 
-    # Key was deleted in this transaction — safe to re-register with any type.
+    # Key was deleted in this transaction — safe to re-register with any
+    # type.
     if _zkv_ahas "$_rt_tx_del" "$_rt_key"; then
       _zkv_aset "$_rt_tx_meta" "$_rt_key" "$_rt_new"
       return 0
@@ -566,8 +578,8 @@ _z::kv::reap_key() {
       ;;
 
     hash)
-      # Hash fields are stored as composite keys: encoded_key + RECSEP + encoded_field.
-      # We must scan and delete all fields belonging to this key.
+      # Hash fields are stored as composite keys (encoded_key + RECSEP +
+      # encoded_field), so every field of this key must be scanned out.
       local _hashes_n="_zkv_hashes_${_rk_handle}"
       local _ekey _prefix _hk
 
@@ -625,7 +637,8 @@ _z::kv::trigger_watchers() {
               handler "$_tw_handler" key "$_tw_key" rc "$_tw_rc"
           fi
         else
-          # Handler was unset after registration — warn once, not on every key event.
+          # Handler was unset after registration — warn once, not on every
+          # key event.
           zlog::once "zkv-watcher-missing-${_tw_handler}" warn \
             "zkv: watcher handler no longer defined" \
             handler "$_tw_handler" pattern "$_tw_pattern"
@@ -785,6 +798,8 @@ _z::kv::tx_resolve_read() {
 # z::kv::open <name> [options]
 # Opens (or no-ops if already open) a named store and initialises all
 # associated maps, counters, and configuration.
+# Sets REPLY to <name>.  Returns Z_ERR_INPUT when <name> is empty or not a
+# valid identifier, or when an option value fails validation.
 #
 # Options:
 #   --max-key-length   <1..1048576>    (default: 256)
@@ -972,6 +987,8 @@ z::kv::close() {
 # Stores a scalar value.  Validates handle, key, and value length.
 # Inside a transaction the write is buffered; outside it fires watchers and
 # triggers auto-persist.
+# Returns Z_ERR_INPUT when the value exceeds max_value_length or <type> is
+# not a string-category type, and Z_ERR_PERM on a type collision.
 z::kv::set() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1022,7 +1039,8 @@ z::kv::set() {
     esac
   done
 
-  # Reject non-string structures — callers must use the typed helpers (lpush, etc.).
+  # Reject non-string structures — callers must use the typed helpers such
+  # as lpush or sadd.
   local _vstruct
   _z::kv::structure_of "$value_type"
   _vstruct="$REPLY"
@@ -1135,6 +1153,7 @@ z::kv::get() {
 # z::kv::del <handle> <key>
 # Deletes a key and all associated data.  Inside a transaction the deletion is
 # staged; outside it fires watchers and triggers auto-persist.
+# Returns Z_ERR_NOTFOUND when the key does not exist outside a transaction.
 z::kv::del() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1187,7 +1206,9 @@ z::kv::del() {
 }
 
 # z::kv::exists <handle> <key>
-# Returns 0 if the key exists and has not expired, 1 otherwise.
+# Returns 0 if the key exists and has not expired, 1 if it is absent or
+# expired.  An unknown handle or an invalid key propagates Z_ERR_NOTFOUND /
+# Z_ERR_INPUT rather than a plain 1.
 z::kv::exists() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1344,7 +1365,8 @@ z::kv::get_array() {
 
 # _z::kv::_ttl_args_for <handle> <key>
 # Populates REPLY_ARGS with "--ttl <remaining>" if the key has an active TTL,
-# or leaves it empty.  Used by incr/decr/append to preserve TTL across rewrites.
+# or leaves it empty.  Used by incr/decr/append to preserve the TTL across
+# rewrites.  Clobbers REPLY as a side effect of calling z::kv::ttl.
 _z::kv::_ttl_args_for() {
   local _h="$1" _k="$2"
 
@@ -1357,8 +1379,10 @@ _z::kv::_ttl_args_for() {
 }
 
 # z::kv::incr <handle> <key> [<amount>]
-# Atomically increments a numeric key by <amount> (default: 1).
-# Creates the key at 0 if it does not exist.  Result in REPLY.
+# Atomically increments a numeric key by <amount> (default: 1), creating the
+# key at 0 if it does not exist.  Preserves any remaining TTL and sets REPLY
+# to the new value.  Returns Z_ERR_INPUT when <amount> or the stored value is
+# not an integer.
 z::kv::incr() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1480,9 +1504,10 @@ z::kv::ttl() {
   return 0
 }
 
-# z::kv::expire <handle> <key> <ttl-seconds>
+# z::kv::expire <handle> <key> [<ttl-seconds>]
 # Sets or removes the TTL on an existing key.
-# A TTL of 0 or negative removes the expiry (makes the key persistent).
+# A TTL of 0 or negative (the default) removes the expiry, making the key
+# persistent.  Returns Z_ERR_NOTFOUND when the key does not exist.
 z::kv::expire() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1730,7 +1755,8 @@ z::kv::cas() {
 
 # z::kv::begin <handle>
 # Opens a transaction.  All subsequent writes are buffered until commit or
-# rollback.  Nested transactions are not supported.
+# rollback.  Nested transactions are not supported: a second call while one
+# is already active returns Z_ERR_PERM.
 z::kv::begin() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1944,6 +1970,8 @@ z::kv::rollback() {
 # z::kv::tx <handle> <callback> [<args> ...]
 # Convenience wrapper: begins a transaction, calls <callback> with the handle
 # and any extra args, then commits on success or rolls back on non-zero return.
+# Propagates the callback's exit code after a rollback, and Z_ERR_NOTFOUND
+# when <callback> is not a defined function.
 z::kv::tx() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1983,6 +2011,8 @@ z::kv::tx() {
 # z::kv::save <handle> <file>
 # Serialises the entire store to <file> using an atomic write (temp file +
 # rename).  Expired keys are skipped.  Format version is written in the header.
+# Returns Z_ERR_PERM when the target directory is not writable and
+# Z_ERR_GENERAL when the temp write or the rename fails.
 z::kv::save() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -1993,7 +2023,8 @@ z::kv::save() {
   z::ensure::nonempty    "$file" "file"                  || return $Z_ERR_INPUT
   z::ensure::path::writable "${file:h}" "persist directory" || return $Z_ERR_PERM
 
-  # Temp file includes PID and epoch to avoid collisions across concurrent saves.
+  # Temp file includes PID and epoch to avoid collisions across concurrent
+  # saves.
   _z::kv::epoch || return $?
   local tmp="${file}.zkv.tmp.${$}.${REPLY}"
 
@@ -2188,6 +2219,8 @@ z::kv::flush() {
 # version, then replays M/S/L/T/Z/H records.  Pass --clear to wipe the store
 # before loading.  auto_persist is suppressed during the load to avoid
 # triggering a save for every key restored.
+# Returns Z_ERR_NOTFOUND when <file> is unreadable and Z_ERR_GENERAL when the
+# header version is unparsable or newer than ZKV_PERSIST_FORMAT_VERSION.
 z::kv::load() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2362,7 +2395,8 @@ z::kv::load() {
 
         _zkv_aset "$_hashes_n" "$key" "$value"
 
-        # Ensure the parent key has a metadata entry even if its M record was absent.
+        # Ensure the parent key has a metadata entry even when its M record
+        # was absent.
         local parent_enc="${key%%${_ZKV_RECSEP}*}"
         _z::kv::decode_value "$parent_enc"
         local parent_key="$REPLY"
@@ -2486,8 +2520,8 @@ z::kv::lock() {
 }
 
 # z::kv::unlock <handle> <lock-name> [<owner>]
-# Releases a named lock.  Fails with Z_ERR_PERM if the caller's
-# <owner> does not match the recorded owner.
+# Releases a named lock.  Returns Z_ERR_NOTFOUND when no such lock is held
+# and Z_ERR_PERM when <owner> does not match the recorded owner.
 z::kv::unlock() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2519,10 +2553,12 @@ z::kv::unlock() {
   return 0
 }
 
-# z::kv::lock_wait <handle> <lock-name> [<ttl>] [<attempts>] [<interval>] [<owner>]
+# z::kv::lock_wait <handle> <lock-name> [ttl] [attempts] [interval] [owner]
 # Retries z::kv::lock up to <attempts> times (default: 3) with <interval>
 # seconds between attempts (default: 1).  Uses zselect for sub-second sleep
 # when zsh/zselect is available; falls back to the external sleep command.
+# Returns Z_ERR_INPUT on a malformed interval and Z_ERR_PERM once every
+# attempt has failed.
 z::kv::lock_wait() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2573,6 +2609,7 @@ z::kv::lock_wait() {
 # Registers <handler-function> to be called whenever a key matching
 # <glob-pattern> is written or deleted.  Multiple handlers per pattern are
 # stored as a separator-delimited list.
+# Returns Z_ERR_NOTFOUND when <handler-function> is not defined.
 z::kv::watch() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2607,7 +2644,7 @@ z::kv::watch() {
 
 # z::kv::unwatch <handle> <glob-pattern> [<handler-function>]
 # Removes a specific handler from a pattern, or all handlers if no handler
-# is specified.
+# is specified.  Returns Z_ERR_NOTFOUND when the pattern has no handlers.
 z::kv::unwatch() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2652,7 +2689,9 @@ z::kv::unwatch() {
 # =============================================================================
 
 # z::kv::lpush <handle> <key> <value>
-# Prepends <value> to the list at <key>.
+# Prepends <value> to the list at <key>, creating the list if needed.
+# Fires an "lpush" watcher event.  Returns Z_ERR_INPUT on an empty <value>
+# and Z_ERR_PERM when <key> already holds another structure.
 z::kv::lpush() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2683,7 +2722,9 @@ z::kv::lpush() {
 }
 
 # z::kv::rpush <handle> <key> <value>
-# Appends <value> to the list at <key>.
+# Appends <value> to the list at <key>, creating the list if needed.
+# Fires an "rpush" watcher event.  Returns Z_ERR_INPUT on an empty <value>
+# and Z_ERR_PERM when <key> already holds another structure.
 z::kv::rpush() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2714,7 +2755,8 @@ z::kv::rpush() {
 }
 
 # z::kv::lpop <handle> <key>
-# Removes and returns the first element of the list; result in REPLY.
+# Removes the first element of the list and sets REPLY to it.
+# Returns Z_ERR_NOTFOUND when the list is absent or empty.
 z::kv::lpop() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2754,7 +2796,8 @@ z::kv::lpop() {
 }
 
 # z::kv::rpop <handle> <key>
-# Removes and returns the last element of the list; result in REPLY.
+# Removes the last element of the list and sets REPLY to it.
+# Returns Z_ERR_NOTFOUND when the list is absent or empty.
 z::kv::rpop() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2863,7 +2906,9 @@ z::kv::llen() {
 }
 
 # z::kv::lindex <handle> <key> [<index>]
-# Returns the element at 0-based <index> (negative counts from end) via REPLY.
+# Sets REPLY to the element at 0-based <index> (negative counts from the end,
+# default 0).  Returns Z_ERR_NOTFOUND when the list is absent or the index is
+# out of range.
 z::kv::lindex() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2902,7 +2947,9 @@ z::kv::lindex() {
 }
 
 # z::kv::lset <handle> <key> <index> <value>
-# Replaces the element at 0-based <index> with <value>.
+# Replaces the element at 0-based <index> (negative counts from the end) with
+# <value>.  Returns Z_ERR_NOTFOUND when the list is absent and Z_ERR_INPUT
+# when <value> is empty or the index is out of range.
 z::kv::lset() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2950,8 +2997,9 @@ z::kv::lset() {
 # =============================================================================
 
 # z::kv::sadd <handle> <key> <value>
-# Adds <value> to the set at <key>.
-# Returns Z_ERR_PERM if <value> is already a member.
+# Adds <value> to the set at <key> and fires an "sadd" watcher event.
+# Returns Z_ERR_PERM if <value> is already a member or <key> already holds
+# another structure, and Z_ERR_INPUT on an empty <value>.
 z::kv::sadd() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -2973,7 +3021,8 @@ z::kv::sadd() {
   _z::kv::split_decoded "$existing"
   members=( "${reply[@]}" )
 
-  # (Ie) flag: case-sensitive exact-match index; non-zero means already present.
+  # (Ie) flag: case-sensitive exact-match index; non-zero means the member
+  # is already present.
   (( ${members[(Ie)$value]} )) && return $Z_ERR_PERM
 
   members+=( "$value" )
@@ -2988,7 +3037,8 @@ z::kv::sadd() {
 }
 
 # z::kv::srem <handle> <key> <value>
-# Removes <value> from the set at <key>.
+# Removes <value> from the set at <key>, deleting the set once it is empty.
+# Returns Z_ERR_NOTFOUND when the set is absent or <value> is not a member.
 z::kv::srem() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3035,7 +3085,9 @@ z::kv::srem() {
 }
 
 # z::kv::sismember <handle> <key> <value>
-# Returns 0 if <value> is a member of the set, 1 otherwise.
+# Returns 0 if <value> is a member of the set, 1 if it is not.  An unknown
+# handle or an invalid key propagates Z_ERR_NOTFOUND / Z_ERR_INPUT, and an
+# empty <value> returns Z_ERR_INPUT.
 z::kv::sismember() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3284,17 +3336,17 @@ z::kv::sdiff() {
 
 # =============================================================================
 # SORTED SETS (ZSETS)
-#
-# Members are stored as packed entries: a zero-padded 19-digit integer sort key
-# (derived from the float score shifted into unsigned space) followed by the
-# canonical float string and the member name, all separated by _ZKV_RECSEP.
-# Lexicographic sort of the packed entries produces score order.
 # =============================================================================
+# Members are stored as packed entries: a zero-padded 19-digit integer sort
+# key (derived from the float score shifted into unsigned space) followed by
+# the canonical float string and the member name, all separated by
+# _ZKV_RECSEP.  Lexicographic sort of the packed entries produces score order.
 
 # _z::kv::zscore_pack <score>
 # Converts a float score to a 19-digit zero-padded sort key (REPLY) and a
 # canonical 6-decimal-place float string (REPLY2).
-# Score range: -999999999999.999999 .. +999999999999.999999
+# Returns Z_ERR_INPUT, with both channels cleared, when <score> is unparsable
+# or outside -999999999999.999999 .. +999999999999.999999.
 _z::kv::zscore_pack() {
   emulate -L zsh
   setopt typesetsilent
@@ -3329,7 +3381,8 @@ _z::kv::zscore_pack() {
 }
 
 # _z::kv::zentry_pack <score> <member>
-# Builds a full packed entry string: sort-key + RECSEP + canon-score + RECSEP + member.
+# Sets REPLY to a full packed entry: sort-key + RECSEP + canon-score +
+# RECSEP + member.  Propagates Z_ERR_INPUT from _z::kv::zscore_pack.
 _z::kv::zentry_pack() {
   local score_raw="$1" member="$2"
 
@@ -3364,7 +3417,9 @@ _z::kv::zentry_packkey() {
 }
 
 # z::kv::zadd <handle> <key> <score> <member>
-# Adds or updates <member> with <score> in the sorted set at <key>.
+# Adds or updates <member> with <score> in the sorted set at <key> and fires
+# a "zadd" watcher event.  Returns Z_ERR_INPUT on an empty <member> or an
+# unrepresentable <score>, and Z_ERR_PERM on a type collision.
 z::kv::zadd() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3415,7 +3470,8 @@ z::kv::zadd() {
 }
 
 # z::kv::zscore <handle> <key> <member>
-# Returns the score of <member> in the sorted set via REPLY.
+# Sets REPLY to the canonical score of <member> in the sorted set.
+# Returns Z_ERR_NOTFOUND when the set or the member is absent.
 z::kv::zscore() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3456,8 +3512,9 @@ z::kv::zscore() {
 }
 
 # z::kv::zrank <handle> <key> <member> [<reverse>]
-# Returns the 0-based rank of <member> in score order via REPLY.
-# Pass reverse=1 for descending order.
+# Sets REPLY to the 0-based rank of <member> in score order; pass reverse=1
+# for descending order.  Returns Z_ERR_NOTFOUND when the set or the member
+# is absent.
 z::kv::zrank() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3485,7 +3542,8 @@ z::kv::zrank() {
   _z::kv::split_decoded "$existing"
   items=( "${reply[@]}" )
 
-  # (@o) = ascending lexicographic sort of packed entries → ascending score order.
+  # (@o) = ascending lexicographic sort of packed entries, which is also
+  # ascending score order.
   sorted=( "${(@o)items}" )
   (( reverse )) && sorted=( "${(@O)sorted}" )
 
@@ -3619,7 +3677,9 @@ z::kv::zrange_withscores() {
 }
 
 # z::kv::zrangebyscore <handle> <key> <min> <max>
-# Returns members whose scores fall within [min, max] (inclusive) in the reply array.
+# Populates the reply array with the members whose scores fall within
+# [min, max], inclusive.  Returns Z_ERR_INPUT when either bound is not a
+# representable score.
 z::kv::zrangebyscore() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3672,7 +3732,8 @@ z::kv::zrangebyscore() {
 }
 
 # z::kv::zrem <handle> <key> <member>
-# Removes <member> from the sorted set at <key>.
+# Removes <member> from the sorted set at <key>, deleting the set once it is
+# empty.  Returns Z_ERR_NOTFOUND when the set or the member is absent.
 z::kv::zrem() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3754,9 +3815,9 @@ z::kv::zcard() {
 # =============================================================================
 
 # _z::kv::hash_compose <key> <field>
-# Builds the composite hash-map key: encoded_key + RECSEP + encoded_field.
-# This allows all fields of a hash to be stored in a single flat associative
-# array with a scannable prefix.
+# Sets REPLY to the composite hash-map key: encoded_key + RECSEP +
+# encoded_field.  This allows all fields of a hash to be stored in a single
+# flat associative array with a scannable prefix.
 _z::kv::hash_compose() {
   local k="$1" f="$2"
 
@@ -3770,7 +3831,9 @@ _z::kv::hash_compose() {
 }
 
 # z::kv::hset <handle> <key> <field> <value>
-# Sets a single field in the hash at <key>.
+# Sets a single field in the hash at <key> and fires an "hset" watcher event.
+# Returns Z_ERR_INPUT on an empty <field> and Z_ERR_PERM when <key> already
+# holds another structure.
 z::kv::hset() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3798,7 +3861,8 @@ z::kv::hset() {
 }
 
 # z::kv::hmset <handle> <key> <field> <value> [<field> <value> ...]
-# Sets multiple fields in the hash at <key> (requires an even field-value count).
+# Sets multiple fields in the hash at <key>.  Returns Z_ERR_INPUT when the
+# field-value arguments do not come in pairs.
 z::kv::hmset() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3824,7 +3888,8 @@ z::kv::hmset() {
 }
 
 # z::kv::hget <handle> <key> <field>
-# Returns the value of <field> in the hash via REPLY.
+# Sets REPLY to the value of <field> in the hash.
+# Returns Z_ERR_NOTFOUND when the field is absent.
 z::kv::hget() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3916,7 +3981,10 @@ z::kv::hgetall() {
 }
 
 # z::kv::hdel <handle> <key> <field>
-# Deletes a single field from the hash at <key>.
+# Deletes a single field from the hash at <key>.  Inside a transaction the
+# hash's remaining fields are first copied into the tx-buffer so that the
+# commit sees the whole hash.  Returns Z_ERR_NOTFOUND when the field is
+# absent.
 z::kv::hdel() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -3970,7 +4038,9 @@ z::kv::hdel() {
 }
 
 # z::kv::hexists <handle> <key> <field>
-# Returns 0 if <field> exists in the hash, 1 otherwise.
+# Returns 0 if <field> exists in the hash, 1 if it does not.  An unknown
+# handle or an invalid key propagates Z_ERR_NOTFOUND / Z_ERR_INPUT, and an
+# empty <field> returns Z_ERR_INPUT.
 z::kv::hexists() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4053,8 +4123,10 @@ z::kv::hlen() {
 }
 
 # z::kv::hincrby <handle> <key> <field> [<amount>]
-# Increments the integer value of <field> by <amount> (default: 1).
-# Creates the field at 0 if it does not exist.  Result in REPLY.
+# Increments the integer value of <field> by <amount> (default: 1), creating
+# the field at 0 if it does not exist.  Sets REPLY to the new value.
+# Returns Z_ERR_INPUT when <amount> or the stored field value is not an
+# integer.
 z::kv::hincrby() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4090,9 +4162,9 @@ z::kv::hincrby() {
 # =============================================================================
 
 # z::kv::snapshot_create <handle> [<label>]
-# Creates a named point-in-time snapshot of the entire store.
-# If the snapshot cap (max_snapshots) is reached, the oldest snapshot is
-# evicted automatically.  Returns the snapshot ID via REPLY.
+# Creates a named point-in-time snapshot of the entire store, labelled
+# "snapshot" by default.  If the snapshot cap (max_snapshots) is reached, the
+# oldest snapshot is evicted automatically.  Sets REPLY to the snapshot ID.
 z::kv::snapshot_create() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4163,6 +4235,7 @@ z::kv::snapshot_create() {
 
 # z::kv::snapshot_restore <handle> <snapshot-id>
 # Replaces the live store contents with the data from the specified snapshot.
+# Returns Z_ERR_NOTFOUND when <snapshot-id> is unknown.
 z::kv::snapshot_restore() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4249,6 +4322,7 @@ z::kv::snapshot_list() {
 
 # z::kv::snapshot_delete <handle> <snapshot-id>
 # Deletes a snapshot and frees all associated per-snapshot maps.
+# Returns Z_ERR_NOTFOUND when <snapshot-id> is unknown.
 z::kv::snapshot_delete() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4289,7 +4363,9 @@ z::kv::snapshot_delete() {
 
 # z::kv::batch <handle>
 # Reads a command script from stdin and executes each line as a store
-# operation inside a single transaction.  Rolls back on any failure.
+# operation inside a single transaction.  Blank lines and # comments are
+# skipped.  Any failed or unrecognised command rolls the whole transaction
+# back and returns Z_ERR_GENERAL.
 #
 # Supported commands (one per line, shell-quoted):
 #   set    <key> <value>
@@ -4577,8 +4653,10 @@ _z::kv::_copy_key_data() {
 }
 
 # z::kv::rename <handle> <old-key> <new-key>
-# Renames <old-key> to <new-key>, replacing any existing <new-key>.
-# No-ops if old == new.
+# Renames <old-key> to <new-key>, replacing any existing <new-key> and
+# carrying the TTL across.  No-ops if old == new.  Fires "rename_from" and
+# "rename_to" watcher events.  Returns Z_ERR_NOTFOUND when <old-key> is
+# absent.
 z::kv::rename() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4611,7 +4689,9 @@ z::kv::rename() {
 }
 
 # z::kv::copy <handle> <src-key> <dst-key>
-# Copies <src-key> to <dst-key>, replacing any existing <dst-key>.
+# Copies <src-key> to <dst-key>, replacing any existing <dst-key> and
+# carrying the TTL across.  Fires a "copy" watcher event.
+# Returns Z_ERR_NOTFOUND when <src-key> is absent.
 z::kv::copy() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4642,7 +4722,8 @@ z::kv::copy() {
 # =============================================================================
 
 # z::kv::randomkey <handle>
-# Returns a uniformly random live key via REPLY.
+# Sets REPLY to a uniformly random live key.
+# Returns Z_ERR_NOTFOUND when the store holds no live keys.
 z::kv::randomkey() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -4731,8 +4812,10 @@ z::kv::scan() {
 # =============================================================================
 
 # z::kv::config <handle> <key> <value>
-# Updates a single configuration parameter for an open store.
-# Validates the value against the parameter's constraints before applying.
+# Updates a single configuration parameter for an open store, validating
+# <value> against that parameter's constraints first.
+# Returns Z_ERR_NOTFOUND for an unrecognised <key>, Z_ERR_INPUT for a value
+# outside the allowed range, and Z_ERR_PERM for an unwritable persist_file.
 z::kv::config() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst
@@ -5093,6 +5176,7 @@ z::kv::memory() {
 
 # z::kv::info <handle> <key>
 # Prints structure, type, TTL, and size/length information for a single key.
+# Returns Z_ERR_NOTFOUND when the key is absent.
 z::kv::info() {
   emulate -L zsh
   setopt extendedglob warncreateglobal typesetsilent noshortloops nopromptsubst

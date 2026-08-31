@@ -1,0 +1,15 @@
+# Ordered part list for the z module.
+#
+# Format: <part-file>  [<section title used in the bundle>]
+# The first entry is the head part: it carries the module banner and is
+# emitted verbatim, so it takes no title. Every later part becomes a major
+# section in the assembled file, in this order.
+
+header.zsh
+debug.zsh    DEBUGGING — TRACING, PROFILING, ASSERTIONS
+cache.zsh    CACHE — PROCESS-SCOPED KEY/VALUE WITH OPTIONAL TTL
+sys.zsh      SYSTEM — PLATFORM DETECTION, INTERRUPTS, FATAL EXITS
+config.zsh   CONFIGURATION — BACKED BY THE zkv `config` STORE
+help.zsh     HELP SYSTEM
+event.zsh    EVENT BUS INTEGRATION — zbus
+init.zsh     INITIALIZATION

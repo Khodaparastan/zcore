@@ -1,0 +1,224 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# zbundle — Assemble split-source modules into single-file modules
+# =============================================================================
+# Description:  Concatenates the part files of a module into the single-file
+#               module at the repository root. The parts under lib/<module>/
+#               are canonical and hand-edited; the root file is a generated
+#               artifact and must not be edited directly.
+#
+#               Ordering comes from lib/<module>/parts, a manifest of
+#               "<part-file> [<bundle section title>]" lines. The first part
+#               is the head: it carries the module banner and is emitted
+#               verbatim. Every later part contributes a major section
+#               divider built from its manifest title, followed by its body
+#               with its own part banner stripped.
+#
+# Usage:        bin/zbundle                 # rebuild every split module
+#               bin/zbundle z zkv           # rebuild the named modules
+#               bin/zbundle --check         # verify without writing
+#               make bundle
+#
+#               --check regenerates into memory and reports any module whose
+#               root file has drifted from its parts, exiting non-zero. Use
+#               it in CI to catch edits made to a generated file.
+#
+# Public API:   none — standalone script
+# Private API:  bundle::*
+#
+# Requires:     zsh 5.x only; sources no framework module
+#
+# Version:      0.6.0
+# License:      MIT
+# =============================================================================
+
+emulate -L zsh
+setopt extendedglob typesetsilent
+
+typeset -gr BUNDLE_ROOT="${0:A:h:h}"
+typeset -gr BUNDLE_RULE="# $(printf '=%.0s' {1..77})"
+
+# bundle::die <message>
+# Report a fatal error on stderr and exit 1.
+bundle::die() {
+  print -u2 -r -- "zbundle: $1"
+  exit 1
+}
+
+# bundle::manifest <module>
+# Read lib/<module>/parts into the `reply` array as "<file>\t<title>" records,
+# dropping comments and blank lines. Returns 1 when the manifest is missing.
+bundle::manifest() {
+  local module="$1"
+  local file="${BUNDLE_ROOT}/lib/${module}/parts"
+  [[ -r $file ]] || return 1
+
+  reply=()
+  local line part title
+  while IFS= read -r line; do
+    [[ $line == [[:space:]]#'#'* ]] && continue
+    [[ -z ${line//[[:space:]]/} ]] && continue
+    part="${line%%[[:space:]]*}"
+    title="${line#$part}"
+    # Strip the leading separator run; a head part carries no title.
+    title="${title##[[:space:]]##}"
+    reply+=( "${part}"$'\t'"${title}" )
+  done < "$file"
+
+  (( ${#reply} )) || bundle::die "empty manifest: lib/${module}/parts"
+  return 0
+}
+
+# bundle::strip_banner <file>
+# Emit a part's body: everything after its banner's closing rule, less the
+# single blank line that separates banner from body. The part's shebang and
+# banner never reach the bundle — the head part supplies the module banner.
+bundle::strip_banner() {
+  local file="$1"
+  local -a lines
+  lines=( "${(@f)$(<$file)}" )
+
+  # The banner is the third rule: open, under-title, close.
+  typeset -i seen=0 start=0 i
+  for (( i = 1; i <= ${#lines}; i++ )); do
+    if [[ ${lines[i]} == '# '=## ]]; then
+      (( seen += 1 ))
+      if (( seen == 3 )); then
+        start=i
+        break
+      fi
+    fi
+  done
+  (( start )) || bundle::die "no banner found in ${file}"
+
+  # Exactly one blank line separates banner from body. Skip it and keep
+  # everything after verbatim, including a further blank that belongs to the
+  # body itself.
+  [[ -z ${lines[start+1]//[[:space:]]/} ]] \
+    || bundle::die "${file}: banner must be followed by a blank line"
+
+  print -rl -- "${lines[@]:$(( start + 1 ))}"
+}
+
+# bundle::trim_trailing
+# Drop trailing blank lines from stdin, so the caller controls the exact
+# separation between parts.
+bundle::trim_trailing() {
+  local -a lines
+  lines=( "${(@f)$(cat)}" )
+  typeset -i last=${#lines}
+  while (( last > 0 )) && [[ -z ${lines[last]//[[:space:]]/} ]]; do
+    (( last -= 1 ))
+  done
+  (( last )) && print -rl -- "${lines[@]:0:$last}"
+}
+
+# bundle::assemble <module>
+# Write the assembled module to stdout.
+bundle::assemble() {
+  local module="$1"
+  local dir="${BUNDLE_ROOT}/lib/${module}"
+
+  bundle::manifest "$module" || bundle::die "no manifest: lib/${module}/parts"
+  local -a manifest=( "${reply[@]}" )
+
+  local record part title
+  typeset -i n=0
+  for record in "${manifest[@]}"; do
+    part="${record%%$'\t'*}"
+    title="${record#*$'\t'}"
+    [[ -r ${dir}/${part} ]] || bundle::die "missing part: lib/${module}/${part}"
+    (( n += 1 ))
+
+    if (( n == 1 )); then
+      # Head part: emitted whole, with the generated-file notice inserted
+      # directly below its banner.
+      bundle::head_with_notice "${dir}/${part}" "$module" | bundle::trim_trailing
+      continue
+    fi
+
+    [[ -n $title ]] \
+      || bundle::die "lib/${module}/parts: '${part}' needs a section title"
+
+    print
+    print
+    print -r -- "$BUNDLE_RULE"
+    print -r -- "# ${title}"
+    print -r -- "$BUNDLE_RULE"
+    bundle::strip_banner "${dir}/${part}" | bundle::trim_trailing
+  done
+}
+
+# bundle::head_with_notice <file> <module>
+# Emit the head part, inserting the do-not-edit notice after its banner.
+bundle::head_with_notice() {
+  local file="$1" module="$2"
+  local -a lines
+  lines=( "${(@f)$(<$file)}" )
+
+  typeset -i seen=0 close=0 i
+  for (( i = 1; i <= ${#lines}; i++ )); do
+    if [[ ${lines[i]} == '# '=## ]]; then
+      (( seen += 1 ))
+      if (( seen == 3 )); then
+        close=i
+        break
+      fi
+    fi
+  done
+  (( close )) || bundle::die "no banner found in ${file}"
+
+  print -rl -- "${lines[@]:0:$close}"
+  print -r -- "#"
+  print -r -- "# Generated by bin/zbundle from lib/${module}/ — do not edit."
+  print -r -- "# Edit the parts listed in lib/${module}/parts, then run \`make bundle\`."
+  print -rl -- "${lines[@]:$close}"
+}
+
+# bundle::modules
+# List every module that has a parts manifest, in `reply`.
+bundle::modules() {
+  reply=()
+  local dir
+  for dir in "${BUNDLE_ROOT}"/lib/*/parts(N); do
+    reply+=( "${${dir:h}:t}" )
+  done
+}
+
+typeset -i check_only=0 rc=0
+typeset -a targets=()
+typeset arg
+for arg in "$@"; do
+  case "$arg" in
+    --check) check_only=1 ;;
+    -*)      bundle::die "unknown option: $arg" ;;
+    *)       targets+=( "$arg" ) ;;
+  esac
+done
+
+if (( ! ${#targets} )); then
+  bundle::modules
+  targets=( "${reply[@]}" )
+  (( ${#targets} )) || bundle::die "no split modules found under lib/"
+fi
+
+typeset module out target
+for module in "${targets[@]}"; do
+  target="${BUNDLE_ROOT}/${module}"
+  out="$(bundle::assemble "$module")"
+
+  if (( check_only )); then
+    if [[ -r $target ]] && [[ $out == "$(<$target)" ]]; then
+      print -r -- "✓ ${module} — bundle matches lib/${module}/"
+    else
+      print -r -- "✗ ${module} — root file has drifted from lib/${module}/"
+      rc=1
+    fi
+    continue
+  fi
+
+  print -r -- "$out" > "$target"
+  print -r -- "✓ ${module} — $(wc -l < "$target" | tr -d ' ') lines from lib/${module}/"
+done
+
+exit $rc
