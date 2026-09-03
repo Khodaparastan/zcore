@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "ports": {"preview": 3000, "additional": {}},
+  "scripts": {
+    "setup": {
+      "enabled": true,
+      "command": "command -v zsh >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq zsh); command -v git-lfs >/dev/null 2>&1 || sudo apt-get install -y -qq git-lfs"
+    },
+    "run": {"enabled": true, "command": null},
+    "archive": {"enabled": true, "command": null},
+    "check": {"enabled": true, "command": null}
+  },
+  "mcpServers": []
+}
