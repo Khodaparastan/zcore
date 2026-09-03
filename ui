@@ -1437,12 +1437,14 @@ z::progress::finish() {
   __z::progress::theme 100
   if [[ -n $_zprog_t_ok ]]; then
     if [[ -n $summary ]]; then
-      printf '\e[K%s%s %s%s %s%s\n' \
-        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_bold" "$label" "$_zprog_t_reset" \
+      printf '\e[K%s%s%s %s%s%s %s%s%s\n' \
+        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_reset" \
+        "$_zprog_t_bold" "$label" "$_zprog_t_reset" \
         "$_zprog_t_meta" "$summary" "$_zprog_t_reset" >&2
     else
-      printf '\e[K%s%s %s%s\n' \
-        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_bold" "$label" "$_zprog_t_reset" >&2
+      printf '\e[K%s%s%s %s%s%s\n' \
+        "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_reset" \
+        "$_zprog_t_bold" "$label" "$_zprog_t_reset" >&2
     fi
   else
     printf '\e[K%s %s%s\n' "$_zui_glyphs_ok" "$label" "${summary:+ · ${summary}}" >&2
@@ -1506,24 +1508,26 @@ z::progress::spinner() {
 
   __z::progress::theme 0
   if [[ -n $_zprog_t_dim ]]; then
-    printf '\r\e[K%s%s%s%s %s%s%s' \
+    printf '\r\e[K%s%s%s%s%s%s%s %s%s%s' \
       "$_zprog_t_frame" "$_zui_glyphs_frame_l" "$_zprog_t_active" "${frames[_z_progress_spinner_idx]}" \
-      "$_zprog_t_frame" "$_zui_glyphs_frame_r}${_zprog_t_reset} " \
+      "$_zprog_t_frame" "$_zui_glyphs_frame_r" "$_zprog_t_reset" \
       "$_zprog_t_meta" "$message" "$_zprog_t_reset" >&2
   else
-    printf '\r\e[K%s %s %s' "${frames[_z_progress_spinner_idx]}" "$message" >&2
+    printf '\r\e[K%s %s' "${frames[_z_progress_spinner_idx]}" "$message" >&2
   fi
   return 0
 }
 
 # z::progress::__spinner_tick
-# Redraw the spinner and reschedule itself 0.08 s later while
+# Redraw the spinner and reschedule itself one second later while
 # _zprog_spinner_active is set; the sched chain ends as soon as it clears.
+# sched accepts integer seconds only, so 1 s is the finest representable
+# cadence without backgrounding a worker.
 z::progress::__spinner_tick() {
   emulate -L zsh
   (( _zprog_spinner_active )) || return 0
   z::progress::spinner "$_zprog_spinner_msg"
-  sched +0.08 z::progress::__spinner_tick
+  sched +1 z::progress::__spinner_tick
 }
 
 # z::progress::spinner_start [message]
@@ -1535,7 +1539,7 @@ z::progress::spinner_start() {
   _zprog_spinner_msg="${1:-Working...}"
   typeset -gi _zprog_spinner_active=1
   z::progress::spinner "$_zprog_spinner_msg"
-  sched +0.08 z::progress::__spinner_tick
+  sched +1 z::progress::__spinner_tick
   return 0
 }
 
@@ -1561,7 +1565,7 @@ z::progress::spinner_done() {
 
   __z::progress::theme 100
   if [[ -n $_zprog_t_ok ]]; then
-    printf '%s%s%s %s%s\n' \
+    printf '%s%s%s %s%s%s\n' \
       "$_zprog_t_ok" "$_zui_glyphs_ok" "$_zprog_t_reset" \
       "$_zprog_t_meta" "$message" "$_zprog_t_reset" >&2
   else
