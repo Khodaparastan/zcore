@@ -617,11 +617,14 @@ _z::kv::trigger_watchers() {
   _zkv_alen "$_tw_wat"
   (( REPLY == 0 )) && return 0
 
-  local _tw_pattern _tw_hlist _tw_handler _tw_rc
+  local _tw_pattern _tw_pat _tw_hlist _tw_handler _tw_rc
   local -a _tw_handlers
 
   for _tw_pattern in "${(@Pk)_tw_wat}"; do
-    if [[ $_tw_key == ${~_tw_pattern} ]]; then
+    # Patterns are stored (b)-escaped so an all-matching "*" cannot parse
+    # as an array slice; undo the escaping before globbing against it.
+    _tw_pat="${(Q)_tw_pattern}"
+    if [[ $_tw_key == ${~_tw_pat} ]]; then
       _zkv_aget "$_tw_wat" "$_tw_pattern"
       _tw_hlist="$REPLY"
       _tw_handlers=( "${(@ps:$_ZKV_SEP:)_tw_hlist}" )
@@ -2630,15 +2633,19 @@ z::kv::watch() {
   local _wat_n="_zkv_watchers_${handle}"
   local existing=""
 
-  if _zkv_ahas "$_wat_n" "$pattern"; then
-    _zkv_aget "$_wat_n" "$pattern"
+  # Store the pattern (b)-escaped: a bare "*" or "@" pattern would otherwise
+  # parse as an associative-array slice in the typeset declaration.
+  local _pat="${(b)pattern}"
+
+  if _zkv_ahas "$_wat_n" "$_pat"; then
+    _zkv_aget "$_wat_n" "$_pat"
     existing="$REPLY"
   fi
 
   if [[ -n $existing ]]; then
-    _zkv_aset "$_wat_n" "$pattern" "${existing}${_ZKV_SEP}${handler}"
+    _zkv_aset "$_wat_n" "$_pat" "${existing}${_ZKV_SEP}${handler}"
   else
-    _zkv_aset "$_wat_n" "$pattern" "$handler"
+    _zkv_aset "$_wat_n" "$_pat" "$handler"
   fi
 
   return 0
@@ -2657,17 +2664,18 @@ z::kv::unwatch() {
   z::ensure::nonempty  "$pattern" "pattern" || return $Z_ERR_INPUT
 
   local _wat_n="_zkv_watchers_${handle}"
+  local _pat="${(b)pattern}"
 
   if [[ -z $handler ]]; then
-    _zkv_adel "$_wat_n" "$pattern"
+    _zkv_adel "$_wat_n" "$_pat"
     return 0
   fi
 
-  if ! _zkv_ahas "$_wat_n" "$pattern"; then
+  if ! _zkv_ahas "$_wat_n" "$_pat"; then
     return $Z_ERR_NOTFOUND
   fi
 
-  _zkv_aget "$_wat_n" "$pattern"
+  _zkv_aget "$_wat_n" "$_pat"
   local existing="$REPLY"
 
   [[ -z $existing ]] && return $Z_ERR_NOTFOUND
@@ -2677,9 +2685,9 @@ z::kv::unwatch() {
   handlers=( "${(@)handlers:#$handler}" )   # remove the target handler
 
   if (( ${#handlers} > 0 )); then
-    _zkv_aset "$_wat_n" "$pattern" "${(pj:$_ZKV_SEP:)handlers}"
+    _zkv_aset "$_wat_n" "$_pat" "${(pj:$_ZKV_SEP:)handlers}"
   else
-    _zkv_adel "$_wat_n" "$pattern"
+    _zkv_adel "$_wat_n" "$_pat"
   fi
 
   return 0
@@ -4848,7 +4856,7 @@ z::kv::scan() {
   local k
 
   # Collect all matching live keys in a stable (sorted) order.
-  for k in "${(@ko)_meta_n}"; do
+  for k in "${(@Pko)_meta_n}"; do
     _z::kv::check_ttl "$handle" "$k" || continue
     [[ $k == ${~pattern} ]] && matching+=( "$k" )
   done
